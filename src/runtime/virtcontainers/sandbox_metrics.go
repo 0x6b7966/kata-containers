@@ -6,6 +6,8 @@
 package virtcontainers
 
 import (
+	"context"
+
 	mutils "github.com/kata-containers/kata-containers/src/runtime/pkg/utils"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 	"github.com/prometheus/client_golang/prometheus"
@@ -14,8 +16,10 @@ import (
 
 const namespaceHypervisor = "kata_hypervisor"
 const namespaceKatashim = "kata_shim"
+const namespaceVirtiofsd = "kata_virtiofsd"
 
 var (
+	// hypervisor
 	hypervisorThreads = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespaceHypervisor,
 		Name:      "threads",
@@ -60,7 +64,8 @@ var (
 		Help:      "Open FDs for hypervisor.",
 	})
 
-	agentRpcDurationsHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	// agent
+	agentRPCDurationsHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespaceKatashim,
 		Name:      "agent_rpc_durations_histogram_milliseconds",
 		Help:      "RPC latency distributions.",
@@ -68,21 +73,66 @@ var (
 	},
 		[]string{"action"},
 	)
+
+	// virtiofsd
+	virtiofsdThreads = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespaceVirtiofsd,
+		Name:      "threads",
+		Help:      "Virtiofsd process threads.",
+	})
+
+	virtiofsdProcStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespaceVirtiofsd,
+		Name:      "proc_status",
+		Help:      "Virtiofsd process status.",
+	},
+		[]string{"item"},
+	)
+
+	virtiofsdProcStat = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespaceVirtiofsd,
+		Name:      "proc_stat",
+		Help:      "Virtiofsd process statistics.",
+	},
+		[]string{"item"},
+	)
+
+	virtiofsdIOStat = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespaceVirtiofsd,
+		Name:      "io_stat",
+		Help:      "Process IO statistics.",
+	},
+		[]string{"item"},
+	)
+
+	virtiofsdOpenFDs = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespaceVirtiofsd,
+		Name:      "fds",
+		Help:      "Open FDs for virtiofsd.",
+	})
 )
 
 func RegisterMetrics() {
+	// hypervisor
 	prometheus.MustRegister(hypervisorThreads)
 	prometheus.MustRegister(hypervisorProcStatus)
 	prometheus.MustRegister(hypervisorProcStat)
 	prometheus.MustRegister(hypervisorNetdev)
 	prometheus.MustRegister(hypervisorIOStat)
 	prometheus.MustRegister(hypervisorOpenFDs)
-	prometheus.MustRegister(agentRpcDurationsHistogram)
+	// agent
+	prometheus.MustRegister(agentRPCDurationsHistogram)
+	// virtiofsd
+	prometheus.MustRegister(virtiofsdThreads)
+	prometheus.MustRegister(virtiofsdProcStatus)
+	prometheus.MustRegister(virtiofsdProcStat)
+	prometheus.MustRegister(virtiofsdIOStat)
+	prometheus.MustRegister(virtiofsdOpenFDs)
 }
 
 // UpdateRuntimeMetrics update shim/hypervisor's metrics
 func (s *Sandbox) UpdateRuntimeMetrics() error {
-	pids := s.hypervisor.getPids()
+	pids := s.hypervisor.GetPids()
 	if len(pids) == 0 {
 		return nil
 	}
@@ -123,11 +173,53 @@ func (s *Sandbox) UpdateRuntimeMetrics() error {
 		mutils.SetGaugeVecProcIO(hypervisorIOStat, ioStat)
 	}
 
+	// virtiofs metrics
+	err = s.UpdateVirtiofsdMetrics()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func (s *Sandbox) GetAgentMetrics() (string, error) {
-	r, err := s.agent.getAgentMetrics(&grpc.GetMetricsRequest{})
+func (s *Sandbox) UpdateVirtiofsdMetrics() error {
+	vfsPid := s.hypervisor.GetVirtioFsPid()
+	if vfsPid == nil {
+		// virtiofsd is not mandatory for a VMM.
+		return nil
+	}
+
+	proc, err := procfs.NewProc(*vfsPid)
+	if err != nil {
+		return err
+	}
+
+	// process FDs
+	if fds, err := proc.FileDescriptorsLen(); err == nil {
+		virtiofsdOpenFDs.Set(float64(fds))
+	}
+
+	// process statistics
+	if procStat, err := proc.Stat(); err == nil {
+		virtiofsdThreads.Set(float64(procStat.NumThreads))
+		mutils.SetGaugeVecProcStat(virtiofsdProcStat, procStat)
+	}
+
+	// process status
+	if procStatus, err := proc.NewStatus(); err == nil {
+		mutils.SetGaugeVecProcStatus(virtiofsdProcStatus, procStatus)
+	}
+
+	// process IO statistics
+	if ioStat, err := proc.IO(); err == nil {
+		mutils.SetGaugeVecProcIO(virtiofsdIOStat, ioStat)
+	}
+
+	return nil
+}
+
+func (s *Sandbox) GetAgentMetrics(ctx context.Context) (string, error) {
+	r, err := s.agent.getAgentMetrics(ctx, &grpc.GetMetricsRequest{})
 	if err != nil {
 		return "", err
 	}

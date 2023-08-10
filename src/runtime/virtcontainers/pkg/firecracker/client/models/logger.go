@@ -6,30 +6,27 @@ package models
 // Editing this file might prove futile when you re-run the swagger generate command
 
 import (
+	"context"
 	"encoding/json"
 
-	strfmt "github.com/go-openapi/strfmt"
-
 	"github.com/go-openapi/errors"
+	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
 	"github.com/go-openapi/validate"
 )
 
 // Logger Describes the configuration option for the logging capability.
+//
 // swagger:model Logger
 type Logger struct {
 
-	// Set the level.
+	// Set the level. The possible values are case-insensitive.
 	// Enum: [Error Warning Info Debug]
 	Level *string `json:"level,omitempty"`
 
-	// The named pipe for the human readable log output.
+	// Path to the named pipe or file for the human readable log output.
 	// Required: true
-	LogFifo *string `json:"log_fifo"`
-
-	// The named pipe where the JSON-formatted metrics will be flushed.
-	// Required: true
-	MetricsFifo *string `json:"metrics_fifo"`
+	LogPath *string `json:"log_path"`
 
 	// Whether or not to output the level in the logs.
 	ShowLevel *bool `json:"show_level,omitempty"`
@@ -46,11 +43,7 @@ func (m *Logger) Validate(formats strfmt.Registry) error {
 		res = append(res, err)
 	}
 
-	if err := m.validateLogFifo(formats); err != nil {
-		res = append(res, err)
-	}
-
-	if err := m.validateMetricsFifo(formats); err != nil {
+	if err := m.validateLogPath(formats); err != nil {
 		res = append(res, err)
 	}
 
@@ -89,14 +82,13 @@ const (
 
 // prop value enum
 func (m *Logger) validateLevelEnum(path, location string, value string) error {
-	if err := validate.Enum(path, location, value, loggerTypeLevelPropEnum); err != nil {
+	if err := validate.EnumCase(path, location, value, loggerTypeLevelPropEnum, true); err != nil {
 		return err
 	}
 	return nil
 }
 
 func (m *Logger) validateLevel(formats strfmt.Registry) error {
-
 	if swag.IsZero(m.Level) { // not required
 		return nil
 	}
@@ -109,21 +101,17 @@ func (m *Logger) validateLevel(formats strfmt.Registry) error {
 	return nil
 }
 
-func (m *Logger) validateLogFifo(formats strfmt.Registry) error {
+func (m *Logger) validateLogPath(formats strfmt.Registry) error {
 
-	if err := validate.Required("log_fifo", "body", m.LogFifo); err != nil {
+	if err := validate.Required("log_path", "body", m.LogPath); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (m *Logger) validateMetricsFifo(formats strfmt.Registry) error {
-
-	if err := validate.Required("metrics_fifo", "body", m.MetricsFifo); err != nil {
-		return err
-	}
-
+// ContextValidate validates this logger based on context it is used
+func (m *Logger) ContextValidate(ctx context.Context, formats strfmt.Registry) error {
 	return nil
 }
 

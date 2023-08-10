@@ -9,7 +9,7 @@ ROOTFS_BUILDER := $(MK_DIR)/rootfs-builder/rootfs.sh
 INITRD_BUILDER := $(MK_DIR)/initrd-builder/initrd_builder.sh
 IMAGE_BUILDER  := $(MK_DIR)/image-builder/image_builder.sh
 
-DISTRO                := centos
+DISTRO                ?= ubuntu
 BUILD_METHOD          := distro
 BUILD_METHOD_LIST     := distro dracut
 AGENT_INIT            ?= no
@@ -52,6 +52,12 @@ ifeq (dracut,$(BUILD_METHOD))
     DRACUT_OPTIONS += --no-kernel
   endif
 
+  ifeq (no,$(AGENT_INIT))
+    AGENT_PATH := $(DRACUT_OVERLAY_DIR)/usr/bin/kata-agent
+  else
+    AGENT_PATH := $(DRACUT_OVERLAY_DIR)/sbin/init
+  endif
+
   ifeq (,$(DRACUT_OVERLAY_DIR))
     $(error DRACUT_OVERLAY_DIR cannot be empty)
   endif
@@ -79,6 +85,9 @@ endif
 
 ################################################################################
 
+.PHONY: all
+all: image initrd
+
 rootfs-%: $(ROOTFS_BUILD_DEST)/.%$(ROOTFS_MARKER_SUFFIX)
 	@ # DONT remove. This is not cancellation rule.
 
@@ -91,11 +100,13 @@ $(ROOTFS_BUILD_DEST)/.%$(ROOTFS_MARKER_SUFFIX):: rootfs-builder/%
 # extract it in a local folder.
 # Notes:
 # - assuming a not compressed initrd.
+ifeq (dracut,$(BUILD_METHOD))
 .PRECIOUS: $(ROOTFS_BUILD_DEST)/.dracut$(ROOTFS_MARKER_SUFFIX)
 $(ROOTFS_BUILD_DEST)/.dracut$(ROOTFS_MARKER_SUFFIX): $(TARGET_INITRD)
 	mkdir -p $(TARGET_ROOTFS)
 	(cd $(TARGET_ROOTFS); cat $< | cpio --extract --preserve-modification-time --make-directories)
 	@touch $@
+endif
 
 image-%: $(IMAGES_BUILD_DEST)/kata-containers-image-%.img
 	@ # DONT remove. This is not cancellation rule.
@@ -110,9 +121,6 @@ initrd-%: $(IMAGES_BUILD_DEST)/kata-containers-initrd-%.img
 .PRECIOUS: $(IMAGES_BUILD_DEST)/kata-containers-initrd-%.img
 $(IMAGES_BUILD_DEST)/kata-containers-initrd-%.img: rootfs-%
 	$(call silent_run,Creating initrd image for $*,$(INITRD_BUILDER) -o $@ $(ROOTFS_BUILD_DEST)/$*_rootfs)
-
-.PHONY: all
-all: image initrd
 
 .PHONY: rootfs
 rootfs: $(TARGET_ROOTFS_MARKER)
@@ -133,6 +141,7 @@ $(TARGET_INITRD): $(TARGET_ROOTFS_MARKER)
 else
 $(TARGET_INITRD): $(DRACUT_OVERLAY_DIR)
 	@echo Creating initrd image based on the host OS using dracut
+	$(DRACUT_DIR)/add_libs.sh $(AGENT_PATH) > $(DRACUT_CONF_DIR)/15-extra-libs.conf
 	dracut $(DRACUT_OPTIONS) --include $< / $@ $(DRACUT_KVERSION)
 endif
 
@@ -175,7 +184,6 @@ SCRIPTS += image-builder/image_builder.sh
 SCRIPTS += initrd-builder/initrd_builder.sh
 
 HELPER_FILES :=
-HELPER_FILES += rootfs-builder/versions.txt
 HELPER_FILES += scripts/lib.sh
 HELPER_FILES += image-builder/nsdax.gpl.c
 
@@ -195,7 +203,7 @@ install-scripts:
 	@$(foreach f,$(SCRIPTS),$(call INSTALL_SCRIPT,$f,$(INSTALL_DIR)))
 	@echo "Installing helper files"
 	@$(foreach f,$(HELPER_FILES),$(call INSTALL_FILE,$f,$(INSTALL_DIR)))
-	@echo "Installing installing config files"
+	@echo "Installing config files"
 	@$(foreach f,$(DIST_CONFIGS),$(call INSTALL_FILE,$f,$(INSTALL_DIR)))
 
 .PHONY: clean

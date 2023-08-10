@@ -22,33 +22,33 @@ use crate::cgroups::Manager as CgroupManager;
 use crate::container::DEFAULT_DEVICES;
 use anyhow::{anyhow, Context, Result};
 use libc::{self, pid_t};
-use nix::errno::Errno;
 use oci::{
-    LinuxBlockIO, LinuxCPU, LinuxDevice, LinuxDeviceCgroup, LinuxHugepageLimit, LinuxMemory,
+    LinuxBlockIo, LinuxCpu, LinuxDevice, LinuxDeviceCgroup, LinuxHugepageLimit, LinuxMemory,
     LinuxNetwork, LinuxPids, LinuxResources,
 };
 
-use protobuf::{CachedSize, RepeatedField, SingularPtrField, UnknownFields};
+use protobuf::MessageField;
 use protocols::agent::{
     BlkioStats, BlkioStatsEntry, CgroupStats, CpuStats, CpuUsage, HugetlbStats, MemoryData,
     MemoryStats, PidsStats, ThrottlingData,
 };
+use std::any::Any;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-// Convenience macro to obtain the scope logger
-macro_rules! sl {
-    () => {
-        slog_scope::logger().new(o!("subsystem" => "cgroups"))
-    };
+const GUEST_CPUS_PATH: &str = "/sys/devices/system/cpu/online";
+
+// Convenience function to obtain the scope logger.
+fn sl() -> slog::Logger {
+    slog_scope::logger().new(o!("subsystem" => "cgroups"))
 }
 
 macro_rules! get_controller_or_return_singular_none {
     ($cg:ident) => {
         match $cg.controller_of() {
             Some(c) => c,
-            None => return SingularPtrField::none(),
+            None => return MessageField::none(),
         }
     };
 }
@@ -74,13 +74,13 @@ macro_rules! set_resource {
 
 impl CgroupManager for Manager {
     fn apply(&self, pid: pid_t) -> Result<()> {
-        self.cgroup.add_task(CgroupPid::from(pid as u64))?;
+        self.cgroup.add_task_by_tgid(CgroupPid::from(pid as u64))?;
         Ok(())
     }
 
     fn set(&self, r: &LinuxResources, update: bool) -> Result<()> {
         info!(
-            sl!(),
+            sl(),
             "cgroup manager set resources for container. Resources input {:?}", r
         );
 
@@ -118,7 +118,7 @@ impl CgroupManager for Manager {
 
         // set devices resources
         set_devices_resources(&self.cgroup, &r.devices, res);
-        info!(sl!(), "resources after processed {:?}", res);
+        info!(sl(), "resources after processed {:?}", res);
 
         // apply resources
         self.cgroup.apply(res)?;
@@ -132,11 +132,10 @@ impl CgroupManager for Manager {
 
         let throttling_data = get_cpu_stats(&self.cgroup);
 
-        let cpu_stats = SingularPtrField::some(CpuStats {
+        let cpu_stats = MessageField::some(CpuStats {
             cpu_usage,
             throttling_data,
-            unknown_fields: UnknownFields::default(),
-            cached_size: CachedSize::default(),
+            ..Default::default()
         });
 
         // Memorystats
@@ -158,8 +157,7 @@ impl CgroupManager for Manager {
             pids_stats,
             blkio_stats,
             hugetlb_stats,
-            unknown_fields: UnknownFields::default(),
-            cached_size: CachedSize::default(),
+            ..Default::default()
         })
     }
 
@@ -173,7 +171,7 @@ impl CgroupManager for Manager {
                 freezer_controller.freeze()?;
             }
             _ => {
-                return Err(nix::Error::Sys(Errno::EINVAL).into());
+                return Err(anyhow!("Invalid FreezerState"));
             }
         }
 
@@ -192,6 +190,83 @@ impl CgroupManager for Manager {
 
         Ok(result)
     }
+
+    fn update_cpuset_path(&self, guest_cpuset: &str, container_cpuset: &str) -> Result<()> {
+        if guest_cpuset.is_empty() {
+            return Ok(());
+        }
+        info!(sl(), "update_cpuset_path to: {}", guest_cpuset);
+
+        let h = cgroups::hierarchies::auto();
+        let root_cg = h.root_control_group();
+
+        let root_cpuset_controller: &CpuSetController = root_cg.controller_of().unwrap();
+        let path = root_cpuset_controller.path();
+        let root_path = Path::new(path);
+        info!(sl(), "root cpuset path: {:?}", &path);
+
+        let container_cpuset_controller: &CpuSetController = self.cgroup.controller_of().unwrap();
+        let path = container_cpuset_controller.path();
+        let container_path = Path::new(path);
+        info!(sl(), "container cpuset path: {:?}", &path);
+
+        let mut paths = vec![];
+        for ancestor in container_path.ancestors() {
+            if ancestor == root_path {
+                break;
+            }
+            paths.push(ancestor);
+        }
+        info!(sl(), "parent paths to update cpuset: {:?}", &paths);
+
+        let mut i = paths.len();
+        loop {
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+
+            // remove cgroup root from path
+            let r_path = &paths[i]
+                .to_str()
+                .unwrap()
+                .trim_start_matches(root_path.to_str().unwrap());
+            info!(sl(), "updating cpuset for parent path {:?}", &r_path);
+            let cg = new_cgroup(cgroups::hierarchies::auto(), r_path)?;
+            let cpuset_controller: &CpuSetController = cg.controller_of().unwrap();
+            cpuset_controller.set_cpus(guest_cpuset)?;
+        }
+
+        if !container_cpuset.is_empty() {
+            info!(
+                sl(),
+                "updating cpuset for container path: {:?} cpuset: {}",
+                &container_path,
+                container_cpuset
+            );
+            container_cpuset_controller.set_cpus(container_cpuset)?;
+        }
+
+        Ok(())
+    }
+
+    fn get_cgroup_path(&self, cg: &str) -> Result<String> {
+        if cgroups::hierarchies::is_cgroup2_unified_mode() {
+            let cg_path = format!("/sys/fs/cgroup/{}", self.cpath);
+            return Ok(cg_path);
+        }
+
+        // for cgroup v1
+        Ok(self.paths.get(cg).map(|s| s.to_string()).unwrap())
+    }
+
+    fn as_any(&self) -> Result<&dyn Any> {
+        Ok(self)
+    }
+
+    fn name(&self) -> &str {
+        "cgroupfs"
+    }
 }
 
 fn set_network_resources(
@@ -199,7 +274,7 @@ fn set_network_resources(
     network: &LinuxNetwork,
     res: &mut cgroups::Resources,
 ) {
-    info!(sl!(), "cgroup manager set network");
+    info!(sl(), "cgroup manager set network");
 
     // set classid
     // description can be found at https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v1/net_cls.html
@@ -226,23 +301,23 @@ fn set_devices_resources(
     device_resources: &[LinuxDeviceCgroup],
     res: &mut cgroups::Resources,
 ) {
-    info!(sl!(), "cgroup manager set devices");
+    info!(sl(), "cgroup manager set devices");
     let mut devices = vec![];
 
     for d in device_resources.iter() {
-        if let Some(dev) = linux_device_group_to_cgroup_device(&d) {
+        if let Some(dev) = linux_device_group_to_cgroup_device(d) {
             devices.push(dev);
         }
     }
 
     for d in DEFAULT_DEVICES.iter() {
-        if let Some(dev) = linux_device_to_cgroup_device(&d) {
+        if let Some(dev) = linux_device_to_cgroup_device(d) {
             devices.push(dev);
         }
     }
 
     for d in DEFAULT_ALLOWED_DEVICES.iter() {
-        if let Some(dev) = linux_device_group_to_cgroup_device(&d) {
+        if let Some(dev) = linux_device_group_to_cgroup_device(d) {
             devices.push(dev);
         }
     }
@@ -251,29 +326,38 @@ fn set_devices_resources(
 }
 
 fn set_hugepages_resources(
-    _cg: &cgroups::Cgroup,
+    cg: &cgroups::Cgroup,
     hugepage_limits: &[LinuxHugepageLimit],
     res: &mut cgroups::Resources,
 ) {
-    info!(sl!(), "cgroup manager set hugepage");
+    info!(sl(), "cgroup manager set hugepage");
     let mut limits = vec![];
+    let hugetlb_controller = cg.controller_of::<HugeTlbController>();
 
     for l in hugepage_limits.iter() {
-        let hr = HugePageResource {
-            size: l.page_size.clone(),
-            limit: l.limit,
-        };
-        limits.push(hr);
+        if hugetlb_controller.is_some() && hugetlb_controller.unwrap().size_supported(&l.page_size)
+        {
+            let hr = HugePageResource {
+                size: l.page_size.clone(),
+                limit: l.limit,
+            };
+            limits.push(hr);
+        } else {
+            warn!(
+                sl(),
+                "{} page size support cannot be verified, dropping requested limit", l.page_size
+            );
+        }
     }
     res.hugepages.limits = limits;
 }
 
 fn set_block_io_resources(
     _cg: &cgroups::Cgroup,
-    blkio: &LinuxBlockIO,
+    blkio: &LinuxBlockIo,
     res: &mut cgroups::Resources,
 ) {
-    info!(sl!(), "cgroup manager set block io");
+    info!(sl(), "cgroup manager set block io");
 
     res.blkio.weight = blkio.weight;
     res.blkio.leaf_weight = blkio.leaf_weight;
@@ -300,14 +384,14 @@ fn set_block_io_resources(
         build_blk_io_device_throttle_resource(&blkio.throttle_write_iops_device);
 }
 
-fn set_cpu_resources(cg: &cgroups::Cgroup, cpu: &LinuxCPU) -> Result<()> {
-    info!(sl!(), "cgroup manager set cpu");
+fn set_cpu_resources(cg: &cgroups::Cgroup, cpu: &LinuxCpu) -> Result<()> {
+    info!(sl(), "cgroup manager set cpu");
 
     let cpuset_controller: &CpuSetController = cg.controller_of().unwrap();
 
     if !cpu.cpus.is_empty() {
         if let Err(e) = cpuset_controller.set_cpus(&cpu.cpus) {
-            warn!(sl!(), "write cpuset failed: {:?}", e);
+            warn!(sl(), "write cpuset failed: {:?}", e);
         }
     }
 
@@ -338,7 +422,7 @@ fn set_cpu_resources(cg: &cgroups::Cgroup, cpu: &LinuxCPU) -> Result<()> {
 }
 
 fn set_memory_resources(cg: &cgroups::Cgroup, memory: &LinuxMemory, update: bool) -> Result<()> {
-    info!(sl!(), "cgroup manager set memory");
+    info!(sl(), "cgroup manager set memory");
     let mem_controller: &MemController = cg.controller_of().unwrap();
 
     if !update {
@@ -347,14 +431,34 @@ fn set_memory_resources(cg: &cgroups::Cgroup, memory: &LinuxMemory, update: bool
         mem_controller.set_kmem_limit(-1)?;
     }
 
-    set_resource!(mem_controller, set_limit, memory, limit);
-    set_resource!(mem_controller, set_soft_limit, memory, reservation);
-    set_resource!(mem_controller, set_kmem_limit, memory, kernel);
-    set_resource!(mem_controller, set_tcp_limit, memory, kernel_tcp);
+    // If the memory update is set to -1 we should also
+    // set swap to -1, it means unlimited memory.
+    let mut swap = memory.swap.unwrap_or(0);
+    if memory.limit == Some(-1) {
+        swap = -1;
+    }
 
-    if let Some(swap) = memory.swap {
-        // set memory swap
-        let swap = if cg.v2() {
+    if memory.limit.is_some() && swap != 0 {
+        let memstat = get_memory_stats(cg)
+            .into_option()
+            .ok_or_else(|| anyhow!("failed to get the cgroup memory stats"))?;
+        let memusage = memstat.usage();
+
+        // When update memory limit, the kernel would check the current memory limit
+        // set against the new swap setting, if the current memory limit is large than
+        // the new swap, then set limit first, otherwise the kernel would complain and
+        // refused to set; on the other hand, if the current memory limit is smaller than
+        // the new swap, then we should set the swap first and then set the memor limit.
+        if swap == -1 || memusage.limit() < swap as u64 {
+            mem_controller.set_memswap_limit(swap)?;
+            set_resource!(mem_controller, set_limit, memory, limit);
+        } else {
+            set_resource!(mem_controller, set_limit, memory, limit);
+            mem_controller.set_memswap_limit(swap)?;
+        }
+    } else {
+        set_resource!(mem_controller, set_limit, memory, limit);
+        swap = if cg.v2() {
             convert_memory_swap_to_v2_value(swap, memory.limit.unwrap_or(0))?
         } else {
             swap
@@ -364,9 +468,13 @@ fn set_memory_resources(cg: &cgroups::Cgroup, memory: &LinuxMemory, update: bool
         }
     }
 
+    set_resource!(mem_controller, set_soft_limit, memory, reservation);
+    set_resource!(mem_controller, set_kmem_limit, memory, kernel);
+    set_resource!(mem_controller, set_tcp_limit, memory, kernel_tcp);
+
     if let Some(swappiness) = memory.swappiness {
         if (0..=100).contains(&swappiness) {
-            mem_controller.set_swappiness(swappiness as u64)?;
+            mem_controller.set_swappiness(swappiness)?;
         } else {
             return Err(anyhow!(
                 "invalid value:{}. valid memory swappiness range is 0-100",
@@ -383,7 +491,7 @@ fn set_memory_resources(cg: &cgroups::Cgroup, memory: &LinuxMemory, update: bool
 }
 
 fn set_pids_resources(cg: &cgroups::Cgroup, pids: &LinuxPids) -> Result<()> {
-    info!(sl!(), "cgroup manager set pids");
+    info!(sl(), "cgroup manager set pids");
     let pid_controller: &PidController = cg.controller_of().unwrap();
     let v = if pids.limit > 0 {
         MaxValue::Value(pids.limit)
@@ -487,112 +595,97 @@ lazy_static! {
     };
 
     pub static ref DEFAULT_ALLOWED_DEVICES: Vec<LinuxDeviceCgroup> = {
-        let mut v = Vec::new();
+        vec![
+            // all mknod to all char devices
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(WILDCARD),
+                minor: Some(WILDCARD),
+                access: "m".to_string(),
+            },
 
-        // all mknod to all char devices
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(WILDCARD),
-            minor: Some(WILDCARD),
-            access: "m".to_string(),
-        });
+            // all mknod to all block devices
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "b".to_string(),
+                major: Some(WILDCARD),
+                minor: Some(WILDCARD),
+                access: "m".to_string(),
+            },
 
-        // all mknod to all block devices
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "b".to_string(),
-            major: Some(WILDCARD),
-            minor: Some(WILDCARD),
-            access: "m".to_string(),
-        });
+            // all read/write/mknod to char device /dev/console
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(5),
+                minor: Some(1),
+                access: "rwm".to_string(),
+            },
 
-        // all read/write/mknod to char device /dev/console
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(5),
-            minor: Some(1),
-            access: "rwm".to_string(),
-        });
+            // all read/write/mknod to char device /dev/pts/<N>
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(136),
+                minor: Some(WILDCARD),
+                access: "rwm".to_string(),
+            },
 
-        // all read/write/mknod to char device /dev/pts/<N>
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(136),
-            minor: Some(WILDCARD),
-            access: "rwm".to_string(),
-        });
+            // all read/write/mknod to char device /dev/ptmx
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(5),
+                minor: Some(2),
+                access: "rwm".to_string(),
+            },
 
-        // all read/write/mknod to char device /dev/ptmx
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(5),
-            minor: Some(2),
-            access: "rwm".to_string(),
-        });
-
-        // all read/write/mknod to char device /dev/net/tun
-        v.push(LinuxDeviceCgroup {
-            allow: true,
-            r#type: "c".to_string(),
-            major: Some(10),
-            minor: Some(200),
-            access: "rwm".to_string(),
-        });
-
-        v
+            // all read/write/mknod to char device /dev/net/tun
+            LinuxDeviceCgroup {
+                allow: true,
+                r#type: "c".to_string(),
+                major: Some(10),
+                minor: Some(200),
+                access: "rwm".to_string(),
+            },
+        ]
     };
 }
 
-fn get_cpu_stats(cg: &cgroups::Cgroup) -> SingularPtrField<ThrottlingData> {
+fn get_cpu_stats(cg: &cgroups::Cgroup) -> MessageField<ThrottlingData> {
     let cpu_controller: &CpuController = get_controller_or_return_singular_none!(cg);
     let stat = cpu_controller.cpu().stat;
     let h = lines_to_map(&stat);
 
-    SingularPtrField::some(ThrottlingData {
+    MessageField::some(ThrottlingData {
         periods: *h.get("nr_periods").unwrap_or(&0),
         throttled_periods: *h.get("nr_throttled").unwrap_or(&0),
         throttled_time: *h.get("throttled_time").unwrap_or(&0),
-        unknown_fields: UnknownFields::default(),
-        cached_size: CachedSize::default(),
+        ..Default::default()
     })
 }
 
-fn get_cpuacct_stats(cg: &cgroups::Cgroup) -> SingularPtrField<CpuUsage> {
+fn get_cpuacct_stats(cg: &cgroups::Cgroup) -> MessageField<CpuUsage> {
     if let Some(cpuacct_controller) = cg.controller_of::<CpuAcctController>() {
         let cpuacct = cpuacct_controller.cpuacct();
 
         let h = lines_to_map(&cpuacct.stat);
         let usage_in_usermode =
-            (((*h.get("user").unwrap() * NANO_PER_SECOND) as f64) / *CLOCK_TICKS) as u64;
+            (((*h.get("user").unwrap_or(&0) * NANO_PER_SECOND) as f64) / *CLOCK_TICKS) as u64;
         let usage_in_kernelmode =
-            (((*h.get("system").unwrap() * NANO_PER_SECOND) as f64) / *CLOCK_TICKS) as u64;
+            (((*h.get("system").unwrap_or(&0) * NANO_PER_SECOND) as f64) / *CLOCK_TICKS) as u64;
 
         let total_usage = cpuacct.usage;
 
         let percpu_usage = line_to_vec(&cpuacct.usage_percpu);
 
-        return SingularPtrField::some(CpuUsage {
+        return MessageField::some(CpuUsage {
             total_usage,
             percpu_usage,
             usage_in_kernelmode,
             usage_in_usermode,
-            unknown_fields: UnknownFields::default(),
-            cached_size: CachedSize::default(),
-        });
-    }
-
-    if cg.v2() {
-        return SingularPtrField::some(CpuUsage {
-            total_usage: 0,
-            percpu_usage: vec![],
-            usage_in_kernelmode: 0,
-            usage_in_usermode: 0,
-            unknown_fields: UnknownFields::default(),
-            cached_size: CachedSize::default(),
+            ..Default::default()
         });
     }
 
@@ -600,22 +693,21 @@ fn get_cpuacct_stats(cg: &cgroups::Cgroup) -> SingularPtrField<CpuUsage> {
     let cpu_controller: &CpuController = get_controller_or_return_singular_none!(cg);
     let stat = cpu_controller.cpu().stat;
     let h = lines_to_map(&stat);
-    let usage_in_usermode = *h.get("user_usec").unwrap();
-    let usage_in_kernelmode = *h.get("system_usec").unwrap();
-    let total_usage = *h.get("usage_usec").unwrap();
+    let usage_in_usermode = *h.get("user_usec").unwrap_or(&0);
+    let usage_in_kernelmode = *h.get("system_usec").unwrap_or(&0);
+    let total_usage = *h.get("usage_usec").unwrap_or(&0);
     let percpu_usage = vec![];
 
-    SingularPtrField::some(CpuUsage {
+    MessageField::some(CpuUsage {
         total_usage,
         percpu_usage,
         usage_in_kernelmode,
         usage_in_usermode,
-        unknown_fields: UnknownFields::default(),
-        cached_size: CachedSize::default(),
+        ..Default::default()
     })
 }
 
-fn get_memory_stats(cg: &cgroups::Cgroup) -> SingularPtrField<MemoryStats> {
+fn get_memory_stats(cg: &cgroups::Cgroup) -> MessageField<MemoryStats> {
     let memory_controller: &MemController = get_controller_or_return_singular_none!(cg);
 
     // cache from memory stat
@@ -626,53 +718,49 @@ fn get_memory_stats(cg: &cgroups::Cgroup) -> SingularPtrField<MemoryStats> {
     let value = memory.use_hierarchy;
     let use_hierarchy = value == 1;
 
-    // gte memory datas
-    let usage = SingularPtrField::some(MemoryData {
+    // get memory data
+    let usage = MessageField::some(MemoryData {
         usage: memory.usage_in_bytes,
         max_usage: memory.max_usage_in_bytes,
         failcnt: memory.fail_cnt,
         limit: memory.limit_in_bytes as u64,
-        unknown_fields: UnknownFields::default(),
-        cached_size: CachedSize::default(),
+        ..Default::default()
     });
 
     // get swap usage
     let memswap = memory_controller.memswap();
 
-    let swap_usage = SingularPtrField::some(MemoryData {
+    let swap_usage = MessageField::some(MemoryData {
         usage: memswap.usage_in_bytes,
         max_usage: memswap.max_usage_in_bytes,
         failcnt: memswap.fail_cnt,
         limit: memswap.limit_in_bytes as u64,
-        unknown_fields: UnknownFields::default(),
-        cached_size: CachedSize::default(),
+        ..Default::default()
     });
 
     // get kernel usage
     let kmem_stat = memory_controller.kmem_stat();
 
-    let kernel_usage = SingularPtrField::some(MemoryData {
+    let kernel_usage = MessageField::some(MemoryData {
         usage: kmem_stat.usage_in_bytes,
         max_usage: kmem_stat.max_usage_in_bytes,
         failcnt: kmem_stat.fail_cnt,
         limit: kmem_stat.limit_in_bytes as u64,
-        unknown_fields: UnknownFields::default(),
-        cached_size: CachedSize::default(),
+        ..Default::default()
     });
 
-    SingularPtrField::some(MemoryStats {
+    MessageField::some(MemoryStats {
         cache,
         usage,
         swap_usage,
         kernel_usage,
         use_hierarchy,
         stats: memory.stat.raw,
-        unknown_fields: UnknownFields::default(),
-        cached_size: CachedSize::default(),
+        ..Default::default()
     })
 }
 
-fn get_pids_stats(cg: &cgroups::Cgroup) -> SingularPtrField<PidsStats> {
+fn get_pids_stats(cg: &cgroups::Cgroup) -> MessageField<PidsStats> {
     let pid_controller: &PidController = get_controller_or_return_singular_none!(cg);
 
     let current = pid_controller.get_pid_current().unwrap_or(0);
@@ -686,11 +774,10 @@ fn get_pids_stats(cg: &cgroups::Cgroup) -> SingularPtrField<PidsStats> {
         },
     } as u64;
 
-    SingularPtrField::some(PidsStats {
+    MessageField::some(PidsStats {
         current,
         limit,
-        unknown_fields: UnknownFields::default(),
-        cached_size: CachedSize::default(),
+        ..Default::default()
     })
 }
 
@@ -726,8 +813,8 @@ https://github.com/opencontainers/runc/blob/a5847db387ae28c0ca4ebe4beee1a76900c8
     Total 0
 */
 
-fn get_blkio_stat_blkiodata(blkiodata: &[BlkIoData]) -> RepeatedField<BlkioStatsEntry> {
-    let mut m = RepeatedField::new();
+fn get_blkio_stat_blkiodata(blkiodata: &[BlkIoData]) -> Vec<BlkioStatsEntry> {
+    let mut m = Vec::new();
     if blkiodata.is_empty() {
         return m;
     }
@@ -740,16 +827,15 @@ fn get_blkio_stat_blkiodata(blkiodata: &[BlkIoData]) -> RepeatedField<BlkioStats
             minor: d.minor as u64,
             op: op.clone(),
             value: d.data,
-            unknown_fields: UnknownFields::default(),
-            cached_size: CachedSize::default(),
+            ..Default::default()
         });
     }
 
     m
 }
 
-fn get_blkio_stat_ioservice(services: &[IoService]) -> RepeatedField<BlkioStatsEntry> {
-    let mut m = RepeatedField::new();
+fn get_blkio_stat_ioservice(services: &[IoService]) -> Vec<BlkioStatsEntry> {
+    let mut m = Vec::new();
 
     if services.is_empty() {
         return m;
@@ -773,17 +859,16 @@ fn build_blkio_stats_entry(major: i16, minor: i16, op: &str, value: u64) -> Blki
         minor: minor as u64,
         op: op.to_string(),
         value,
-        unknown_fields: UnknownFields::default(),
-        cached_size: CachedSize::default(),
+        ..Default::default()
     }
 }
 
-fn get_blkio_stats_v2(cg: &cgroups::Cgroup) -> SingularPtrField<BlkioStats> {
+fn get_blkio_stats_v2(cg: &cgroups::Cgroup) -> MessageField<BlkioStats> {
     let blkio_controller: &BlkIoController = get_controller_or_return_singular_none!(cg);
     let blkio = blkio_controller.blkio();
 
     let mut resp = BlkioStats::new();
-    let mut blkio_stats = RepeatedField::new();
+    let mut blkio_stats = Vec::new();
 
     let stat = blkio.io_stat;
     for s in stat {
@@ -799,12 +884,12 @@ fn get_blkio_stats_v2(cg: &cgroups::Cgroup) -> SingularPtrField<BlkioStats> {
 
     resp.io_service_bytes_recursive = blkio_stats;
 
-    SingularPtrField::some(resp)
+    MessageField::some(resp)
 }
 
-fn get_blkio_stats(cg: &cgroups::Cgroup) -> SingularPtrField<BlkioStats> {
+fn get_blkio_stats(cg: &cgroups::Cgroup) -> MessageField<BlkioStats> {
     if cg.v2() {
-        return get_blkio_stats_v2(&cg);
+        return get_blkio_stats_v2(cg);
     }
 
     let blkio_controller: &BlkIoController = get_controller_or_return_singular_none!(cg);
@@ -835,7 +920,7 @@ fn get_blkio_stats(cg: &cgroups::Cgroup) -> SingularPtrField<BlkioStats> {
         m.sectors_recursive = get_blkio_stat_blkiodata(&blkio.sectors_recursive);
     }
 
-    SingularPtrField::some(m)
+    MessageField::some(m)
 }
 
 fn get_hugetlb_stats(cg: &cgroups::Cgroup) -> HashMap<String, HugetlbStats> {
@@ -859,8 +944,7 @@ fn get_hugetlb_stats(cg: &cgroups::Cgroup) -> HashMap<String, HugetlbStats> {
                 usage,
                 max_usage,
                 failcnt,
-                unknown_fields: UnknownFields::default(),
-                cached_size: CachedSize::default(),
+                ..Default::default()
             },
         );
     }
@@ -876,35 +960,28 @@ pub fn get_paths() -> Result<HashMap<String, String>> {
     for l in fs::read_to_string(PATHS)?.lines() {
         let fl: Vec<&str> = l.split(':').collect();
         if fl.len() != 3 {
-            info!(sl!(), "Corrupted cgroup data!");
+            info!(sl(), "Corrupted cgroup data!");
             continue;
         }
 
         let keys: Vec<&str> = fl[1].split(',').collect();
         for key in &keys {
-            // this is a workaround, cgroup file are using `name=systemd`,
-            // but if file system the name is `systemd`
-            if *key == "name=systemd" {
-                m.insert("systemd".to_string(), fl[2].to_string());
-            } else {
-                m.insert(key.to_string(), fl[2].to_string());
-            }
+            m.insert(key.to_string(), fl[2].to_string());
         }
     }
     Ok(m)
 }
 
-pub fn get_mounts() -> Result<HashMap<String, String>> {
+pub fn get_mounts(paths: &HashMap<String, String>) -> Result<HashMap<String, String>> {
     let mut m = HashMap::new();
-    let paths = get_paths()?;
 
     for l in fs::read_to_string(MOUNTS)?.lines() {
-        let p: Vec<&str> = l.split(" - ").collect();
+        let p: Vec<&str> = l.splitn(2, " - ").collect();
         let pre: Vec<&str> = p[0].split(' ').collect();
         let post: Vec<&str> = p[1].split(' ').collect();
 
         if post.len() != 3 {
-            warn!(sl!(), "mountinfo corrupted!");
+            warn!(sl(), "can't parse {} line {:?}", MOUNTS, l);
             continue;
         }
 
@@ -924,9 +1001,9 @@ pub fn get_mounts() -> Result<HashMap<String, String>> {
     Ok(m)
 }
 
-fn new_cgroup(h: Box<dyn cgroups::Hierarchy>, path: &str) -> Cgroup {
+fn new_cgroup(h: Box<dyn cgroups::Hierarchy>, path: &str) -> Result<Cgroup> {
     let valid_path = path.trim_start_matches('/').to_string();
-    cgroups::Cgroup::new(h, valid_path.as_str())
+    cgroups::Cgroup::new(h, valid_path.as_str()).map_err(anyhow::Error::from)
 }
 
 impl Manager {
@@ -934,7 +1011,7 @@ impl Manager {
         let mut m = HashMap::new();
 
         let paths = get_paths()?;
-        let mounts = get_mounts()?;
+        let mounts = get_mounts(&paths)?;
 
         for key in paths.keys() {
             let mnt = mounts.get(key);
@@ -948,102 +1025,22 @@ impl Manager {
             m.insert(key.to_string(), p);
         }
 
+        let cg = new_cgroup(cgroups::hierarchies::auto(), cpath)?;
+
         Ok(Self {
             paths: m,
             mounts,
             // rels: paths,
             cpath: cpath.to_string(),
-            cgroup: new_cgroup(cgroups::hierarchies::auto(), cpath),
+            cgroup: cg,
         })
-    }
-
-    pub fn update_cpuset_path(&self, guest_cpuset: &str, container_cpuset: &str) -> Result<()> {
-        if guest_cpuset.is_empty() {
-            return Ok(());
-        }
-        info!(sl!(), "update_cpuset_path to: {}", guest_cpuset);
-
-        let h = cgroups::hierarchies::auto();
-        let root_cg = h.root_control_group();
-
-        let root_cpuset_controller: &CpuSetController = root_cg.controller_of().unwrap();
-        let path = root_cpuset_controller.path();
-        let root_path = Path::new(path);
-        info!(sl!(), "root cpuset path: {:?}", &path);
-
-        let container_cpuset_controller: &CpuSetController = self.cgroup.controller_of().unwrap();
-        let path = container_cpuset_controller.path();
-        let container_path = Path::new(path);
-        info!(sl!(), "container cpuset path: {:?}", &path);
-
-        let mut paths = vec![];
-        for ancestor in container_path.ancestors() {
-            if ancestor == root_path {
-                break;
-            }
-            paths.push(ancestor);
-        }
-        info!(sl!(), "parent paths to update cpuset: {:?}", &paths);
-
-        let mut i = paths.len();
-        loop {
-            if i == 0 {
-                break;
-            }
-            i -= 1;
-
-            // remove cgroup root from path
-            let r_path = &paths[i]
-                .to_str()
-                .unwrap()
-                .trim_start_matches(root_path.to_str().unwrap());
-            info!(sl!(), "updating cpuset for parent path {:?}", &r_path);
-            let cg = new_cgroup(cgroups::hierarchies::auto(), &r_path);
-            let cpuset_controller: &CpuSetController = cg.controller_of().unwrap();
-            cpuset_controller.set_cpus(guest_cpuset)?;
-        }
-
-        if !container_cpuset.is_empty() {
-            info!(
-                sl!(),
-                "updating cpuset for container path: {:?} cpuset: {}",
-                &container_path,
-                container_cpuset
-            );
-            container_cpuset_controller.set_cpus(container_cpuset)?;
-        }
-
-        Ok(())
-    }
-
-    pub fn get_cg_path(&self, cg: &str) -> Option<String> {
-        if cgroups::hierarchies::is_cgroup2_unified_mode() {
-            let cg_path = format!("/sys/fs/cgroup/{}", self.cpath);
-            return Some(cg_path);
-        }
-
-        // for cgroup v1
-        self.paths.get(cg).map(|s| s.to_string())
     }
 }
 
+// get the guest's online cpus.
 pub fn get_guest_cpuset() -> Result<String> {
-    // for cgroup v2
-    if cgroups::hierarchies::is_cgroup2_unified_mode() {
-        let c = fs::read_to_string("/sys/fs/cgroup/cpuset.cpus.effective")?;
-        return Ok(c);
-    }
-
-    // for cgroup v1
-    let m = get_mounts()?;
-    if m.get("cpuset").is_none() {
-        warn!(sl!(), "no cpuset cgroup!");
-        return Err(nix::Error::Sys(Errno::ENOENT).into());
-    }
-
-    let p = format!("{}/cpuset.cpus", m.get("cpuset").unwrap());
-    let c = fs::read_to_string(p.as_str())?;
-    Ok(c)
+    let c = fs::read_to_string(GUEST_CPUS_PATH)?;
+    Ok(c.trim().to_string())
 }
 
 // Since the OCI spec is designed for cgroup v1, in some cases

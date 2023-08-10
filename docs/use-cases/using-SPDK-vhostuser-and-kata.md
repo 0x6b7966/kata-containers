@@ -1,13 +1,6 @@
-# Setup to run SPDK vhost-user devices with Kata Containers and Docker*
+# Setup to run SPDK vhost-user devices with Kata Containers
 
-- [SPDK vhost-user target overview](#spdk-vhost-user-target-overview)
-- [Install and setup SPDK vhost-user target](#install-and-setup-spdk-vhost-user-target)
-  - [Get source code and build SPDK](#get-source-code-and-build-spdk)
-  - [Run SPDK vhost-user target](#run-spdk-vhost-user-target)
-- [Host setup for vhost-user devices](#host-setup-for-vhost-user-devices)
-- [Launch a Kata container with SPDK vhost-user block device](#launch-a-kata-container-with-spdk-vhost-user-block-device)
-
-> **NOTE:** This guide only applies to QEMU, since the vhost-user storage
+> **Note:** This guide only applies to QEMU, since the vhost-user storage
 > device is only available for QEMU now. The enablement work on other
 > hypervisors is still ongoing.
 
@@ -111,7 +104,7 @@ devices:
 
 - `vhost-user-blk`
 - `vhost-user-scsi`
-- `vhost-user-nvme`
+- `vhost-user-nvme` (deprecated from SPDK 21.07 release)
 
 For more information, visit [SPDK](https://spdk.io) and [SPDK vhost-user target](https://spdk.io/doc/vhost.html).
 
@@ -204,11 +197,6 @@ vhost_user_store_path = "<Path of the base directory for vhost-user device>"
 > under `[hypervisor.qemu]` section.
 
 
-For the subdirectories of `vhost_user_store_path`: `block` is used for block
-device; `block/sockets` is where we expect UNIX domain sockets for vhost-user
-block devices to live; `block/devices` is where simulated block device nodes
-for vhost-user block devices are created.
-
 For the subdirectories of `vhost_user_store_path`:
 -  `block` is used for block device;
 -  `block/sockets` is where we expect UNIX domain sockets for vhost-user
@@ -229,26 +217,43 @@ minor `0` should be created for it, in order to be recognized by Kata runtime:
 $ sudo mknod /var/run/kata-containers/vhost-user/block/devices/vhostblk0 b 241 0
 ```
 
-> **Note:** The enablement of vhost-user block device in Kata containers
-> is supported by Kata Containers `1.11.0-alpha1` or newer.
-> Make sure you have updated your Kata containers before evaluation.
-
 ## Launch a Kata container with SPDK vhost-user block device
 
-To use `vhost-user-blk` device, use Docker to pass a host `vhost-user-blk`
-device to the container. In docker, `--device=HOST-DIR:CONTAINER-DIR` is used
+To use `vhost-user-blk` device, use `ctr` to pass a host `vhost-user-blk`
+device to the container. In your `config.json`, you should use `devices`
 to pass a host device to the container.
 
-For example:
+For example (only `vhost-user-blk` listed):
+
+```json
+{
+  "linux": {
+    "devices": [
+      {
+        "path": "/dev/vda",
+        "type": "b",
+        "major": 241,
+        "minor": 0,
+        "fileMode": 420,
+        "uid": 0,
+        "gid": 0
+      }
+    ]
+  }
+}
+```
+
+With `rootfs` provisioned under `bundle` directory, you can run your SPDK container:
 
 ```bash
-$ sudo docker run --runtime kata-runtime --device=/var/run/kata-containers/vhost-user/block/devices/vhostblk0:/dev/vda -it busybox sh
+$ sudo ctr run -d --runtime io.containerd.run.kata.v2 --config bundle/config.json spdk_container
 ```
 
 Example of performing I/O operations on the `vhost-user-blk` device inside
 container:
 
 ```
+$ sudo ctr t exec --exec-id 1 -t spdk_container sh
 / # ls -l /dev/vda
 brw-r--r--    1 root     root      254,   0 Jan 20 03:54 /dev/vda
 / # dd if=/dev/vda of=/tmp/ddtest bs=4k count=20

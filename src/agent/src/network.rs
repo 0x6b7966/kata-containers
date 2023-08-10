@@ -5,30 +5,23 @@
 
 use anyhow::{anyhow, Result};
 use nix::mount::{self, MsFlags};
-use protocols::types::{Interface, Route};
 use slog::Logger;
-use std::collections::HashMap;
 use std::fs;
+use std::path;
 
 const KATA_GUEST_SANDBOX_DNS_FILE: &str = "/run/kata-containers/sandbox/resolv.conf";
 const GUEST_DNS_FILE: &str = "/etc/resolv.conf";
 
-// Network fully describes a sandbox network with its interfaces, routes and dns
+// Network describes a sandbox network, includings its dns
 // related information.
 #[derive(Debug, Default)]
 pub struct Network {
-    ifaces: HashMap<String, Interface>,
-    routes: Vec<Route>,
     dns: Vec<String>,
 }
 
 impl Network {
     pub fn new() -> Network {
-        Network {
-            ifaces: HashMap::new(),
-            routes: Vec::new(),
-            dns: Vec::new(),
-        }
+        Network { dns: Vec::new() }
     }
 
     pub fn set_dns(&mut self, dns: String) {
@@ -36,7 +29,7 @@ impl Network {
     }
 }
 
-pub fn setup_guest_dns(logger: Logger, dns_list: Vec<String>) -> Result<()> {
+pub fn setup_guest_dns(logger: Logger, dns_list: &[String]) -> Result<()> {
     do_setup_guest_dns(
         logger,
         dns_list,
@@ -45,7 +38,7 @@ pub fn setup_guest_dns(logger: Logger, dns_list: Vec<String>) -> Result<()> {
     )
 }
 
-fn do_setup_guest_dns(logger: Logger, dns_list: Vec<String>, src: &str, dst: &str) -> Result<()> {
+fn do_setup_guest_dns(logger: Logger, dns_list: &[String], src: &str, dst: &str) -> Result<()> {
     let logger = logger.new(o!( "subsystem" => "network"));
 
     if dns_list.is_empty() {
@@ -72,7 +65,13 @@ fn do_setup_guest_dns(logger: Logger, dns_list: Vec<String>, src: &str, dst: &st
         .map(|x| x.trim())
         .collect::<Vec<&str>>()
         .join("\n");
-    fs::write(src, &content)?;
+
+    // make sure the src file's parent path exist.
+    let file_path = path::Path::new(src);
+    if let Some(p) = file_path.parent() {
+        fs::create_dir_all(p)?;
+    }
+    fs::write(src, content)?;
 
     // bind mount to /etc/resolv.conf
     mount::mount(Some(src), dst, Some("bind"), MsFlags::MS_BIND, None::<&str>)
@@ -84,11 +83,11 @@ fn do_setup_guest_dns(logger: Logger, dns_list: Vec<String>, src: &str, dst: &st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skip_if_not_root;
     use nix::mount;
     use std::fs::File;
     use std::io::Write;
     use tempfile::tempdir;
+    use test_utils::skip_if_not_root;
 
     #[test]
     fn test_setup_guest_dns() {
@@ -125,18 +124,13 @@ mod tests {
             .expect("failed to write file contents");
 
         // call do_setup_guest_dns
-        let result = do_setup_guest_dns(logger, dns.clone(), src_filename, dst_filename);
+        let result = do_setup_guest_dns(logger, &dns, src_filename, dst_filename);
 
-        assert_eq!(
-            true,
-            result.is_ok(),
-            "result should be ok, but {:?}",
-            result
-        );
+        assert!(result.is_ok(), "result should be ok, but {:?}", result);
 
         // get content of /etc/resolv.conf
         let content = fs::read_to_string(dst_filename);
-        assert_eq!(true, content.is_ok());
+        assert!(content.is_ok());
         let content = content.unwrap();
 
         let expected_dns: Vec<&str> = content.split('\n').collect();

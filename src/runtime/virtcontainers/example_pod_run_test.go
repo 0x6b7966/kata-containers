@@ -64,14 +64,14 @@ func Example_createAndStartSandbox() {
 	}
 
 	// Create the sandbox
-	s, err := vc.CreateSandbox(context.Background(), sandboxConfig, nil)
+	s, err := vc.CreateSandbox(context.Background(), sandboxConfig, nil, nil)
 	if err != nil {
 		fmt.Printf("Could not create sandbox: %s", err)
 		return
 	}
 
 	// Start the sandbox
-	err = s.Start()
+	err = s.Start(context.Background())
 	if err != nil {
 		fmt.Printf("Could not start sandbox: %s", err)
 	}

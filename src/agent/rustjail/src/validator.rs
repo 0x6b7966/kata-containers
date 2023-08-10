@@ -4,18 +4,16 @@
 //
 
 use crate::container::Config;
-use anyhow::{anyhow, Context, Error, Result};
-use nix::errno::Errno;
-use oci::{Linux, LinuxIDMapping, LinuxNamespace, Spec};
+use anyhow::{anyhow, Context, Result};
+use oci::{Linux, LinuxIdMapping, LinuxNamespace, Spec};
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Component, PathBuf};
 
-fn einval() -> Error {
-    anyhow!(nix::Error::from_errno(Errno::EINVAL))
-}
-
 fn get_linux(oci: &Spec) -> Result<&Linux> {
-    oci.linux.as_ref().ok_or_else(einval)
+    oci.linux
+        .as_ref()
+        .ok_or_else(|| anyhow!("Unable to get Linux section from Spec"))
 }
 
 fn contain_namespace(nses: &[LinuxNamespace], key: &str) -> bool {
@@ -28,21 +26,14 @@ fn contain_namespace(nses: &[LinuxNamespace], key: &str) -> bool {
     false
 }
 
-fn get_namespace_path(nses: &[LinuxNamespace], key: &str) -> Result<String> {
-    for ns in nses {
-        if ns.r#type.as_str() == key {
-            return Ok(ns.path.clone());
-        }
-    }
-
-    Err(einval())
-}
-
 fn rootfs(root: &str) -> Result<()> {
     let path = PathBuf::from(root);
     // not absolute path or not exists
     if !path.exists() || !path.is_absolute() {
-        return Err(einval());
+        return Err(anyhow!(
+            "Path from {:?} does not exist or is not absolute",
+            root
+        ));
     }
 
     // symbolic link? ..?
@@ -60,7 +51,7 @@ fn rootfs(root: &str) -> Result<()> {
         if let Some(v) = c.as_os_str().to_str() {
             stack.push(v.to_string());
         } else {
-            return Err(einval());
+            return Err(anyhow!("Invalid path component (unable to convert to str)"));
         }
     }
 
@@ -69,10 +60,13 @@ fn rootfs(root: &str) -> Result<()> {
         cleaned.push(e);
     }
 
-    let canon = path.canonicalize().context("canonicalize")?;
+    let canon = path.canonicalize().context("failed to canonicalize path")?;
     if cleaned != canon {
         // There is symbolic in path
-        return Err(einval());
+        return Err(anyhow!(
+            "There may be illegal symbols in the path name. Cleaned ({:?}) and canonicalized ({:?}) paths do not match",
+            cleaned,
+            canon));
     }
 
     Ok(())
@@ -85,7 +79,7 @@ fn hostname(oci: &Spec) -> Result<()> {
 
     let linux = get_linux(oci)?;
     if !contain_namespace(&linux.namespaces, "uts") {
-        return Err(einval());
+        return Err(anyhow!("Linux namespace does not contain uts"));
     }
 
     Ok(())
@@ -93,28 +87,43 @@ fn hostname(oci: &Spec) -> Result<()> {
 
 fn security(oci: &Spec) -> Result<()> {
     let linux = get_linux(oci)?;
+    let label_pattern = r".*_u:.*_r:.*_t:s[0-9]|1[0-5].*";
+    let label_regex = Regex::new(label_pattern)?;
+
+    if let Some(ref process) = oci.process {
+        if !process.selinux_label.is_empty() && !label_regex.is_match(&process.selinux_label) {
+            return Err(anyhow!(
+                "SELinux label for the process is invalid format: {}",
+                &process.selinux_label
+            ));
+        }
+    }
+    if !linux.mount_label.is_empty() && !label_regex.is_match(&linux.mount_label) {
+        return Err(anyhow!(
+            "SELinux label for the mount is invalid format: {}",
+            &linux.mount_label
+        ));
+    }
 
     if linux.masked_paths.is_empty() && linux.readonly_paths.is_empty() {
         return Ok(());
     }
 
     if !contain_namespace(&linux.namespaces, "mount") {
-        return Err(einval());
+        return Err(anyhow!("Linux namespace does not contain mount"));
     }
-
-    // don't care about selinux at present
 
     Ok(())
 }
 
-fn idmapping(maps: &[LinuxIDMapping]) -> Result<()> {
+fn idmapping(maps: &[LinuxIdMapping]) -> Result<()> {
     for map in maps {
         if map.size > 0 {
             return Ok(());
         }
     }
 
-    Err(einval())
+    Err(anyhow!("No idmap has size > 0"))
 }
 
 fn usernamespace(oci: &Spec) -> Result<()> {
@@ -132,7 +141,7 @@ fn usernamespace(oci: &Spec) -> Result<()> {
     } else {
         // no user namespace but idmap
         if !linux.uid_mappings.is_empty() || !linux.gid_mappings.is_empty() {
-            return Err(einval());
+            return Err(anyhow!("No user namespace, but uid or gid mapping exists"));
         }
     }
 
@@ -166,31 +175,6 @@ lazy_static! {
     };
 }
 
-fn check_host_ns(path: &str) -> Result<()> {
-    let cpath = PathBuf::from(path);
-    let hpath = PathBuf::from("/proc/self/ns/net");
-
-    let real_hpath = hpath
-        .read_link()
-        .context(format!("read link {:?}", hpath))?;
-    let meta = cpath
-        .symlink_metadata()
-        .context(format!("symlink metadata {:?}", cpath))?;
-    let file_type = meta.file_type();
-
-    if !file_type.is_symlink() {
-        return Ok(());
-    }
-    let real_cpath = cpath
-        .read_link()
-        .context(format!("read link {:?}", cpath))?;
-    if real_cpath == real_hpath {
-        return Err(einval());
-    }
-
-    Ok(())
-}
-
 fn sysctl(oci: &Spec) -> Result<()> {
     let linux = get_linux(oci)?;
 
@@ -199,7 +183,7 @@ fn sysctl(oci: &Spec) -> Result<()> {
             if contain_namespace(&linux.namespaces, "ipc") {
                 continue;
             } else {
-                return Err(einval());
+                return Err(anyhow!("Linux namespace does not contain ipc"));
             }
         }
 
@@ -214,11 +198,11 @@ fn sysctl(oci: &Spec) -> Result<()> {
             }
 
             if key == "kernel.hostname" {
-                return Err(einval());
+                return Err(anyhow!("Kernel hostname specfied in Spec"));
             }
         }
 
-        return Err(einval());
+        return Err(anyhow!("Sysctl config contains invalid settings"));
     }
     Ok(())
 }
@@ -227,18 +211,19 @@ fn rootless_euid_mapping(oci: &Spec) -> Result<()> {
     let linux = get_linux(oci)?;
 
     if !contain_namespace(&linux.namespaces, "user") {
-        return Err(einval());
+        return Err(anyhow!("Linux namespace is missing user"));
     }
 
     if linux.uid_mappings.is_empty() || linux.gid_mappings.is_empty() {
-        // rootless containers requires at least one UID/GID mapping
-        return Err(einval());
+        return Err(anyhow!(
+            "Rootless containers require at least one UID/GID mapping"
+        ));
     }
 
     Ok(())
 }
 
-fn has_idmapping(maps: &[LinuxIDMapping], id: u32) -> bool {
+fn has_idmapping(maps: &[LinuxIdMapping], id: u32) -> bool {
     for map in maps {
         if id >= map.container_id && id < map.container_id + map.size {
             return true;
@@ -256,7 +241,7 @@ fn rootless_euid_mount(oci: &Spec) -> Result<()> {
                 let fields: Vec<&str> = opt.split('=').collect();
 
                 if fields.len() != 2 {
-                    return Err(einval());
+                    return Err(anyhow!("Options has invalid field: {:?}", fields));
                 }
 
                 let id = fields[1]
@@ -265,11 +250,11 @@ fn rootless_euid_mount(oci: &Spec) -> Result<()> {
                     .context(format!("parse field {}", &fields[1]))?;
 
                 if opt.starts_with("uid=") && !has_idmapping(&linux.uid_mappings, id) {
-                    return Err(einval());
+                    return Err(anyhow!("uid of {} does not have a valid mapping", id));
                 }
 
                 if opt.starts_with("gid=") && !has_idmapping(&linux.gid_mappings, id) {
-                    return Err(einval());
+                    return Err(anyhow!("gid of {} does not have a valid mapping", id));
                 }
             }
         }
@@ -285,15 +270,18 @@ fn rootless_euid(oci: &Spec) -> Result<()> {
 
 pub fn validate(conf: &Config) -> Result<()> {
     lazy_static::initialize(&SYSCTLS);
-    let oci = conf.spec.as_ref().ok_or_else(einval)?;
+    let oci = conf
+        .spec
+        .as_ref()
+        .ok_or_else(|| anyhow!("Invalid config spec"))?;
 
     if oci.linux.is_none() {
-        return Err(einval());
+        return Err(anyhow!("oci Linux is none"));
     }
 
     let root = match oci.root.as_ref() {
         Some(v) => v.path.as_str(),
-        None => return Err(einval()),
+        None => return Err(anyhow!("oci root is none")),
     };
 
     rootfs(root).context("rootfs")?;
@@ -301,7 +289,7 @@ pub fn validate(conf: &Config) -> Result<()> {
     security(oci).context("security")?;
     usernamespace(oci).context("usernamespace")?;
     cgroupnamespace(oci).context("cgroupnamespace")?;
-    sysctl(&oci).context("sysctl")?;
+    sysctl(oci).context("sysctl")?;
 
     if conf.rootless_euid {
         rootless_euid(oci).context("rootless euid")?;
@@ -313,7 +301,7 @@ pub fn validate(conf: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oci::Mount;
+    use oci::{Mount, Process};
 
     #[test]
     fn test_namespace() {
@@ -334,19 +322,6 @@ mod tests {
         assert_eq!(contain_namespace(&namespaces, ""), false);
         assert_eq!(contain_namespace(&namespaces, "Net"), false);
         assert_eq!(contain_namespace(&namespaces, "ipc"), false);
-
-        assert_eq!(
-            get_namespace_path(&namespaces, "net").unwrap(),
-            "/sys/cgroups/net"
-        );
-        assert_eq!(
-            get_namespace_path(&namespaces, "uts").unwrap(),
-            "/sys/cgroups/uts"
-        );
-
-        get_namespace_path(&namespaces, "").unwrap_err();
-        get_namespace_path(&namespaces, "Uts").unwrap_err();
-        get_namespace_path(&namespaces, "ipc").unwrap_err();
     }
 
     #[test]
@@ -429,6 +404,29 @@ mod tests {
         ];
         spec.linux = Some(linux);
         security(&spec).unwrap();
+
+        // SELinux
+        let valid_label = "system_u:system_r:container_t:s0:c123,c456";
+        let mut process = Process::default();
+        process.selinux_label = valid_label.to_string();
+        spec.process = Some(process);
+        security(&spec).unwrap();
+
+        let mut linux = Linux::default();
+        linux.mount_label = valid_label.to_string();
+        spec.linux = Some(linux);
+        security(&spec).unwrap();
+
+        let invalid_label = "system_u:system_r:container_t";
+        let mut process = Process::default();
+        process.selinux_label = invalid_label.to_string();
+        spec.process = Some(process);
+        security(&spec).unwrap_err();
+
+        let mut linux = Linux::default();
+        linux.mount_label = invalid_label.to_string();
+        spec.linux = Some(linux);
+        security(&spec).unwrap_err();
     }
 
     #[test]
@@ -441,7 +439,7 @@ mod tests {
         usernamespace(&spec).unwrap();
 
         let mut linux = Linux::default();
-        linux.uid_mappings = vec![LinuxIDMapping {
+        linux.uid_mappings = vec![LinuxIdMapping {
             container_id: 0,
             host_id: 1000,
             size: 0,
@@ -450,7 +448,7 @@ mod tests {
         usernamespace(&spec).unwrap_err();
 
         let mut linux = Linux::default();
-        linux.uid_mappings = vec![LinuxIDMapping {
+        linux.uid_mappings = vec![LinuxIdMapping {
             container_id: 0,
             host_id: 1000,
             size: 100,
@@ -497,12 +495,12 @@ mod tests {
                 path: "/sys/cgroups/user".to_owned(),
             },
         ];
-        linux.uid_mappings = vec![LinuxIDMapping {
+        linux.uid_mappings = vec![LinuxIdMapping {
             container_id: 0,
             host_id: 1000,
             size: 1000,
         }];
-        linux.gid_mappings = vec![LinuxIDMapping {
+        linux.gid_mappings = vec![LinuxIdMapping {
             container_id: 0,
             host_id: 1000,
             size: 1000,
@@ -526,12 +524,6 @@ mod tests {
             }),
         ];
         rootless_euid(&spec).unwrap();
-    }
-
-    #[test]
-    fn test_check_host_ns() {
-        check_host_ns("/proc/self/ns/net").unwrap_err();
-        check_host_ns("/proc/sys/net/ipv4/tcp_sack").unwrap();
     }
 
     #[test]

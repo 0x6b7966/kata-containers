@@ -10,10 +10,9 @@ import (
 	"io"
 
 	"github.com/go-openapi/runtime"
+	"github.com/go-openapi/strfmt"
 
-	strfmt "github.com/go-openapi/strfmt"
-
-	models "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/models"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/models"
 )
 
 // GetMmdsReader is a Reader for the GetMmds structure.
@@ -24,21 +23,18 @@ type GetMmdsReader struct {
 // ReadResponse reads a server response into the received o.
 func (o *GetMmdsReader) ReadResponse(response runtime.ClientResponse, consumer runtime.Consumer) (interface{}, error) {
 	switch response.Code() {
-
 	case 200:
 		result := NewGetMmdsOK()
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
 			return nil, err
 		}
 		return result, nil
-
-	case 400:
-		result := NewGetMmdsBadRequest()
+	case 404:
+		result := NewGetMmdsNotFound()
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
 			return nil, err
 		}
 		return nil, result
-
 	default:
 		result := NewGetMmdsDefault(response.Code())
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
@@ -56,7 +52,7 @@ func NewGetMmdsOK() *GetMmdsOK {
 	return &GetMmdsOK{}
 }
 
-/*GetMmdsOK handles this case with default header values.
+/* GetMmdsOK describes a response with status code 200, with default header values.
 
 The MMDS data store JSON.
 */
@@ -66,6 +62,9 @@ type GetMmdsOK struct {
 
 func (o *GetMmdsOK) Error() string {
 	return fmt.Sprintf("[GET /mmds][%d] getMmdsOK  %+v", 200, o.Payload)
+}
+func (o *GetMmdsOK) GetPayload() interface{} {
+	return o.Payload
 }
 
 func (o *GetMmdsOK) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {
@@ -78,24 +77,27 @@ func (o *GetMmdsOK) readResponse(response runtime.ClientResponse, consumer runti
 	return nil
 }
 
-// NewGetMmdsBadRequest creates a GetMmdsBadRequest with default headers values
-func NewGetMmdsBadRequest() *GetMmdsBadRequest {
-	return &GetMmdsBadRequest{}
+// NewGetMmdsNotFound creates a GetMmdsNotFound with default headers values
+func NewGetMmdsNotFound() *GetMmdsNotFound {
+	return &GetMmdsNotFound{}
 }
 
-/*GetMmdsBadRequest handles this case with default header values.
+/* GetMmdsNotFound describes a response with status code 404, with default header values.
 
-Cannot get the MMDS data store due to bad input.
+The MMDS data store content can not be found.
 */
-type GetMmdsBadRequest struct {
+type GetMmdsNotFound struct {
 	Payload *models.Error
 }
 
-func (o *GetMmdsBadRequest) Error() string {
-	return fmt.Sprintf("[GET /mmds][%d] getMmdsBadRequest  %+v", 400, o.Payload)
+func (o *GetMmdsNotFound) Error() string {
+	return fmt.Sprintf("[GET /mmds][%d] getMmdsNotFound  %+v", 404, o.Payload)
+}
+func (o *GetMmdsNotFound) GetPayload() *models.Error {
+	return o.Payload
 }
 
-func (o *GetMmdsBadRequest) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {
+func (o *GetMmdsNotFound) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {
 
 	o.Payload = new(models.Error)
 
@@ -114,7 +116,7 @@ func NewGetMmdsDefault(code int) *GetMmdsDefault {
 	}
 }
 
-/*GetMmdsDefault handles this case with default header values.
+/* GetMmdsDefault describes a response with status code -1, with default header values.
 
 Internal server error
 */
@@ -130,7 +132,10 @@ func (o *GetMmdsDefault) Code() int {
 }
 
 func (o *GetMmdsDefault) Error() string {
-	return fmt.Sprintf("[GET /mmds][%d] GetMmds default  %+v", o._statusCode, o.Payload)
+	return fmt.Sprintf("[GET /mmds][%d] getMmds default  %+v", o._statusCode, o.Payload)
+}
+func (o *GetMmdsDefault) GetPayload() *models.Error {
+	return o.Payload
 }
 
 func (o *GetMmdsDefault) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {

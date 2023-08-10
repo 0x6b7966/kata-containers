@@ -8,7 +8,9 @@ package virtcontainers
 import (
 	"errors"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
+	devconfig "github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	hv "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
 	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
@@ -33,8 +35,8 @@ func (s *Sandbox) dumpState(ss *persistapi.SandboxState, cs map[string]persistap
 	ss.GuestMemoryBlockSizeMB = s.state.GuestMemoryBlockSizeMB
 	ss.GuestMemoryHotplugProbe = s.state.GuestMemoryHotplugProbe
 	ss.State = string(s.state.State)
-	ss.CgroupPath = s.state.CgroupPath
-	ss.CgroupPaths = s.state.CgroupPaths
+	ss.SandboxCgroupPath = s.state.SandboxCgroupPath
+	ss.OverheadCgroupPath = s.state.OverheadCgroupPath
 
 	for id, cont := range s.containers {
 		state := persistapi.ContainerState{}
@@ -59,12 +61,12 @@ func (s *Sandbox) dumpState(ss *persistapi.SandboxState, cs map[string]persistap
 }
 
 func (s *Sandbox) dumpHypervisor(ss *persistapi.SandboxState) {
-	ss.HypervisorState = s.hypervisor.save()
+	ss.HypervisorState = s.hypervisor.Save()
 	// BlockIndexMap will be moved from sandbox state to hypervisor state later
 	ss.HypervisorState.BlockIndexMap = s.state.BlockIndexMap
 }
 
-func deviceToDeviceState(devices []api.Device) (dss []persistapi.DeviceState) {
+func deviceToDeviceState(devices []api.Device) (dss []devconfig.DeviceState) {
 	for _, dev := range devices {
 		dss = append(dss, dev.Save())
 	}
@@ -163,11 +165,10 @@ func (s *Sandbox) dumpAgent(ss *persistapi.SandboxState) {
 
 func (s *Sandbox) dumpNetwork(ss *persistapi.SandboxState) {
 	ss.Network = persistapi.NetworkInfo{
-		NetNsPath:    s.networkNS.NetNsPath,
-		NetmonPID:    s.networkNS.NetmonPID,
-		NetNsCreated: s.networkNS.NetNsCreated,
+		NetworkID:      s.network.NetworkID(),
+		NetworkCreated: s.network.NetworkCreated(),
 	}
-	for _, e := range s.networkNS.Endpoints {
+	for _, e := range s.network.Endpoints() {
 		ss.Network.Endpoints = append(ss.Network.Endpoints, e.save())
 	}
 }
@@ -177,9 +178,9 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 	ss.Config = persistapi.SandboxConfig{
 		HypervisorType: string(sconfig.HypervisorType),
 		NetworkConfig: persistapi.NetworkConfig{
-			NetNSPath:         sconfig.NetworkConfig.NetNSPath,
-			NetNsCreated:      sconfig.NetworkConfig.NetNsCreated,
-			DisableNewNetNs:   sconfig.NetworkConfig.DisableNewNetNs,
+			NetworkID:         sconfig.NetworkConfig.NetworkID,
+			NetworkCreated:    sconfig.NetworkConfig.NetworkCreated,
+			DisableNewNetwork: sconfig.NetworkConfig.DisableNewNetwork,
 			InterworkingModel: int(sconfig.NetworkConfig.InterworkingModel),
 		},
 
@@ -188,8 +189,11 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 		SystemdCgroup:       sconfig.SystemdCgroup,
 		SandboxCgroupOnly:   sconfig.SandboxCgroupOnly,
 		DisableGuestSeccomp: sconfig.DisableGuestSeccomp,
-		Cgroups:             sconfig.Cgroups,
+		EnableVCPUsPinning:  sconfig.EnableVCPUsPinning,
+		GuestSeLinuxLabel:   sconfig.GuestSeLinuxLabel,
 	}
+
+	ss.Config.SandboxBindMounts = append(ss.Config.SandboxBindMounts, sconfig.SandboxBindMounts...)
 
 	for _, e := range sconfig.Experimental {
 		ss.Config.Experimental = append(ss.Config.Experimental, e.Name)
@@ -222,6 +226,7 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 		MemoryPath:              sconfig.HypervisorConfig.MemoryPath,
 		DevicesStatePath:        sconfig.HypervisorConfig.DevicesStatePath,
 		EntropySource:           sconfig.HypervisorConfig.EntropySource,
+		EntropySourceList:       sconfig.HypervisorConfig.EntropySourceList,
 		SharedFS:                sconfig.HypervisorConfig.SharedFS,
 		VirtioFSDaemon:          sconfig.HypervisorConfig.VirtioFSDaemon,
 		VirtioFSDaemonList:      sconfig.HypervisorConfig.VirtioFSDaemonList,
@@ -237,16 +242,13 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 		HugePages:               sconfig.HypervisorConfig.HugePages,
 		FileBackedMemRootDir:    sconfig.HypervisorConfig.FileBackedMemRootDir,
 		FileBackedMemRootList:   sconfig.HypervisorConfig.FileBackedMemRootList,
-		Realtime:                sconfig.HypervisorConfig.Realtime,
-		Mlock:                   sconfig.HypervisorConfig.Mlock,
 		DisableNestingChecks:    sconfig.HypervisorConfig.DisableNestingChecks,
 		DisableImageNvdimm:      sconfig.HypervisorConfig.DisableImageNvdimm,
-		HotplugVFIOOnRootBus:    sconfig.HypervisorConfig.HotplugVFIOOnRootBus,
-		PCIeRootPort:            sconfig.HypervisorConfig.PCIeRootPort,
 		BootToBeTemplate:        sconfig.HypervisorConfig.BootToBeTemplate,
 		BootFromTemplate:        sconfig.HypervisorConfig.BootFromTemplate,
 		DisableVhostNet:         sconfig.HypervisorConfig.DisableVhostNet,
 		EnableVhostUserStore:    sconfig.HypervisorConfig.EnableVhostUserStore,
+		SeccompSandbox:          sconfig.HypervisorConfig.SeccompSandbox,
 		VhostUserStorePath:      sconfig.HypervisorConfig.VhostUserStorePath,
 		VhostUserStorePathList:  sconfig.HypervisorConfig.VhostUserStorePathList,
 		GuestHookPath:           sconfig.HypervisorConfig.GuestHookPath,
@@ -287,7 +289,7 @@ func (s *Sandbox) Save() error {
 	s.dumpNetwork(&ss)
 	s.dumpConfig(&ss)
 
-	if err := s.newStore.ToDisk(ss, cs); err != nil {
+	if err := s.store.ToDisk(ss, cs); err != nil {
 		return err
 	}
 
@@ -299,8 +301,8 @@ func (s *Sandbox) loadState(ss persistapi.SandboxState) {
 	s.state.GuestMemoryBlockSizeMB = ss.GuestMemoryBlockSizeMB
 	s.state.BlockIndexMap = ss.HypervisorState.BlockIndexMap
 	s.state.State = types.StateString(ss.State)
-	s.state.CgroupPath = ss.CgroupPath
-	s.state.CgroupPaths = ss.CgroupPaths
+	s.state.SandboxCgroupPath = ss.SandboxCgroupPath
+	s.state.OverheadCgroupPath = ss.OverheadCgroupPath
 	s.state.GuestMemoryHotplugProbe = ss.GuestMemoryHotplugProbe
 }
 
@@ -313,8 +315,8 @@ func (c *Container) loadContState(cs persistapi.ContainerState) {
 	}
 }
 
-func (s *Sandbox) loadHypervisor(hs persistapi.HypervisorState) {
-	s.hypervisor.load(hs)
+func (s *Sandbox) loadHypervisor(hs hv.HypervisorState) {
+	s.hypervisor.Load(hs)
 }
 
 func (s *Sandbox) loadAgent(as persistapi.AgentState) {
@@ -323,7 +325,7 @@ func (s *Sandbox) loadAgent(as persistapi.AgentState) {
 	}
 }
 
-func (s *Sandbox) loadDevices(devStates []persistapi.DeviceState) {
+func (s *Sandbox) loadDevices(devStates []devconfig.DeviceState) {
 	s.devManager.LoadDevices(devStates)
 }
 
@@ -363,41 +365,12 @@ func (c *Container) loadContProcess(cs persistapi.ContainerState) {
 }
 
 func (s *Sandbox) loadNetwork(netInfo persistapi.NetworkInfo) {
-	s.networkNS = NetworkNamespace{
-		NetNsPath:    netInfo.NetNsPath,
-		NetmonPID:    netInfo.NetmonPID,
-		NetNsCreated: netInfo.NetNsCreated,
-	}
-
-	for _, e := range netInfo.Endpoints {
-		var ep Endpoint
-		switch EndpointType(e.Type) {
-		case PhysicalEndpointType:
-			ep = &PhysicalEndpoint{}
-		case VethEndpointType:
-			ep = &VethEndpoint{}
-		case VhostUserEndpointType:
-			ep = &VhostUserEndpoint{}
-		case BridgedMacvlanEndpointType:
-			ep = &BridgedMacvlanEndpoint{}
-		case MacvtapEndpointType:
-			ep = &MacvtapEndpoint{}
-		case TapEndpointType:
-			ep = &TapEndpoint{}
-		case IPVlanEndpointType:
-			ep = &IPVlanEndpoint{}
-		default:
-			s.Logger().WithField("endpoint-type", e.Type).Error("unknown endpoint type")
-			continue
-		}
-		ep.load(e)
-		s.networkNS.Endpoints = append(s.networkNS.Endpoints, ep)
-	}
+	s.network = LoadNetwork(netInfo)
 }
 
 // Restore will restore sandbox data from persist file on disk
 func (s *Sandbox) Restore() error {
-	ss, _, err := s.newStore.FromDisk(s.id)
+	ss, _, err := s.store.FromDisk(s.id)
 	if err != nil {
 		return err
 	}
@@ -412,7 +385,7 @@ func (s *Sandbox) Restore() error {
 
 // Restore will restore container data from persist file on disk
 func (c *Container) Restore() error {
-	_, css, err := c.sandbox.newStore.FromDisk(c.sandbox.id)
+	_, css, err := c.sandbox.store.FromDisk(c.sandbox.id)
 	if err != nil {
 		return err
 	}
@@ -445,9 +418,9 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 		ID:             id,
 		HypervisorType: HypervisorType(savedConf.HypervisorType),
 		NetworkConfig: NetworkConfig{
-			NetNSPath:         savedConf.NetworkConfig.NetNSPath,
-			NetNsCreated:      savedConf.NetworkConfig.NetNsCreated,
-			DisableNewNetNs:   savedConf.NetworkConfig.DisableNewNetNs,
+			NetworkID:         savedConf.NetworkConfig.NetworkID,
+			NetworkCreated:    savedConf.NetworkConfig.NetworkCreated,
+			DisableNewNetwork: savedConf.NetworkConfig.DisableNewNetwork,
 			InterworkingModel: NetInterworkingModel(savedConf.NetworkConfig.InterworkingModel),
 		},
 
@@ -456,8 +429,10 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 		SystemdCgroup:       savedConf.SystemdCgroup,
 		SandboxCgroupOnly:   savedConf.SandboxCgroupOnly,
 		DisableGuestSeccomp: savedConf.DisableGuestSeccomp,
-		Cgroups:             savedConf.Cgroups,
+		EnableVCPUsPinning:  savedConf.EnableVCPUsPinning,
+		GuestSeLinuxLabel:   savedConf.GuestSeLinuxLabel,
 	}
+	sconfig.SandboxBindMounts = append(sconfig.SandboxBindMounts, savedConf.SandboxBindMounts...)
 
 	for _, name := range savedConf.Experimental {
 		sconfig.Experimental = append(sconfig.Experimental, *exp.Get(name))
@@ -491,6 +466,7 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 		MemoryPath:              hconf.MemoryPath,
 		DevicesStatePath:        hconf.DevicesStatePath,
 		EntropySource:           hconf.EntropySource,
+		EntropySourceList:       hconf.EntropySourceList,
 		SharedFS:                hconf.SharedFS,
 		VirtioFSDaemon:          hconf.VirtioFSDaemon,
 		VirtioFSDaemonList:      hconf.VirtioFSDaemonList,
@@ -506,12 +482,10 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 		HugePages:               hconf.HugePages,
 		FileBackedMemRootDir:    hconf.FileBackedMemRootDir,
 		FileBackedMemRootList:   hconf.FileBackedMemRootList,
-		Realtime:                hconf.Realtime,
-		Mlock:                   hconf.Mlock,
 		DisableNestingChecks:    hconf.DisableNestingChecks,
 		DisableImageNvdimm:      hconf.DisableImageNvdimm,
-		HotplugVFIOOnRootBus:    hconf.HotplugVFIOOnRootBus,
-		PCIeRootPort:            hconf.PCIeRootPort,
+		HotPlugVFIO:             hconf.HotPlugVFIO,
+		ColdPlugVFIO:            hconf.ColdPlugVFIO,
 		BootToBeTemplate:        hconf.BootToBeTemplate,
 		BootFromTemplate:        hconf.BootFromTemplate,
 		DisableVhostNet:         hconf.DisableVhostNet,

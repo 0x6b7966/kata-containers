@@ -5,12 +5,15 @@
 
 # Intel x86-64 settings
 
-MACHINETYPE := pc
+MACHINETYPE := q35
 KERNELPARAMS :=
 MACHINEACCELERATORS :=
 CPUFEATURES := pmu=off
 
 QEMUCMD := qemu-system-x86_64
+QEMUTDXCMD := qemu-system-x86_64-tdx-experimental
+QEMUSNPCMD := qemu-system-x86_64-snp-experimental
+TDXCPUFEATURES := -vmx-rdseed-exit,pmu=off
 
 # Firecracker binary name
 FCCMD := firecracker

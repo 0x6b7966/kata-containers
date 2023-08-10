@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2019 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -11,7 +13,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/stretchr/testify/assert"
@@ -77,19 +79,19 @@ func TestAcrnCapabilities(t *testing.T) {
 		arch: &acrnArchBase{},
 	}
 
-	caps := a.capabilities()
+	caps := a.Capabilities(a.ctx)
 	assert.True(caps.IsBlockDeviceSupported())
 	assert.True(caps.IsBlockDeviceHotplugSupported())
 }
 
-func testAcrnAddDevice(t *testing.T, devInfo interface{}, devType deviceType, expected []Device) {
+func testAcrnAddDevice(t *testing.T, devInfo interface{}, devType DeviceType, expected []Device) {
 	assert := assert.New(t)
 	a := &Acrn{
 		ctx:  context.Background(),
 		arch: &acrnArchBase{},
 	}
 
-	err := a.addDevice(devInfo, devType)
+	err := a.AddDevice(context.Background(), devInfo, devType)
 	assert.NoError(err)
 	assert.Exactly(a.acrnConfig.Devices, expected)
 }
@@ -112,7 +114,7 @@ func TestAcrnAddDeviceSerialPortDev(t *testing.T) {
 		Name:     name,
 	}
 
-	testAcrnAddDevice(t, socket, serialPortDev, expectedOut)
+	testAcrnAddDevice(t, socket, SerialPortDev, expectedOut)
 }
 
 func TestAcrnAddDeviceBlockDev(t *testing.T) {
@@ -131,7 +133,7 @@ func TestAcrnAddDeviceBlockDev(t *testing.T) {
 		Index: index,
 	}
 
-	testAcrnAddDevice(t, drive, blockDev, expectedOut)
+	testAcrnAddDevice(t, drive, BlockDev, expectedOut)
 }
 
 func TestAcrnHotplugUnsupportedDeviceType(t *testing.T) {
@@ -144,7 +146,7 @@ func TestAcrnHotplugUnsupportedDeviceType(t *testing.T) {
 		config: acrnConfig,
 	}
 
-	_, err := a.hotplugAddDevice(&memoryDevice{0, 128, uint64(0), false}, fsDev)
+	_, err := a.HotplugAddDevice(a.ctx, &MemoryDevice{0, 128, uint64(0), false}, FsDev)
 	assert.Error(err)
 }
 
@@ -199,19 +201,23 @@ func TestAcrnGetSandboxConsole(t *testing.T) {
 	assert.NoError(err)
 
 	a := &Acrn{
-		ctx:   context.Background(),
+		ctx: context.Background(),
+		config: HypervisorConfig{
+			VMStorePath:  store.RunVMStoragePath(),
+			RunStorePath: store.RunStoragePath(),
+		},
 		store: store,
 	}
 	sandboxID := "testSandboxID"
-	expected := filepath.Join(a.store.RunVMStoragePath(), sandboxID, consoleSocket)
+	expected := filepath.Join(store.RunVMStoragePath(), sandboxID, consoleSocket)
 
-	proto, result, err := a.getSandboxConsole(sandboxID)
+	proto, result, err := a.GetVMConsole(a.ctx, sandboxID)
 	assert.NoError(err)
 	assert.Equal(result, expected)
 	assert.Equal(proto, consoleProtoUnix)
 }
 
-func TestAcrnCreateSandbox(t *testing.T) {
+func TestAcrnCreateVM(t *testing.T) {
 	assert := assert.New(t)
 	acrnConfig := newAcrnConfig()
 	store, err := persist.GetDriver()
@@ -219,6 +225,10 @@ func TestAcrnCreateSandbox(t *testing.T) {
 
 	a := &Acrn{
 		store: store,
+		config: HypervisorConfig{
+			VMStorePath:  store.RunVMStoragePath(),
+			RunStorePath: store.RunStoragePath(),
+		},
 	}
 
 	sandbox := &Sandbox{
@@ -232,10 +242,10 @@ func TestAcrnCreateSandbox(t *testing.T) {
 
 	a.sandbox = sandbox
 
-	//set PID to 1 to ignore hypercall to get UUID and set a random UUID
 	a.state.PID = 1
-	a.state.UUID = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"
-	err = a.createSandbox(context.Background(), sandbox.id, NetworkNamespace{}, &sandbox.config.HypervisorConfig)
+	network, err := NewNetwork()
+	assert.NoError(err)
+	err = a.CreateVM(context.Background(), sandbox.id, network, &sandbox.config.HypervisorConfig)
 	assert.NoError(err)
 	assert.Exactly(acrnConfig, a.config)
 }
@@ -258,4 +268,19 @@ func TestAcrnMemoryTopology(t *testing.T) {
 	memory, err := a.memoryTopology()
 	assert.NoError(err)
 	assert.Exactly(memory, expectedOut)
+}
+
+func TestAcrnSetConfig(t *testing.T) {
+	assert := assert.New(t)
+
+	config := newAcrnConfig()
+
+	a := &Acrn{}
+
+	assert.Equal(a.config, HypervisorConfig{})
+
+	err := a.setConfig(&config)
+	assert.NoError(err)
+
+	assert.Equal(a.config, config)
 }

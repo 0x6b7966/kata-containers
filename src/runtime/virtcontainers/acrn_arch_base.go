@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2019 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -13,7 +15,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/sirupsen/logrus"
 )
@@ -31,7 +33,7 @@ type acrnArch interface {
 	kernelParameters(debug bool) []Param
 
 	//capabilities returns the capabilities supported by acrn
-	capabilities() types.Capabilities
+	capabilities(config HypervisorConfig) types.Capabilities
 
 	// memoryTopology returns the memory topology using the given amount of memoryMb and hostMemoryMb
 	memoryTopology(memMb uint64) Memory
@@ -52,6 +54,9 @@ type acrnArch interface {
 	// appendSocket appends a socket to devices
 	appendSocket(devices []Device, socket types.Socket) []Device
 
+	// appendVSock appends a vsock PCI to devices
+	appendVSock(devices []Device, vsock types.VSock) []Device
+
 	// appendNetwork appends a endpoint device to devices
 	appendNetwork(devices []Device, endpoint Endpoint) []Device
 
@@ -59,7 +64,7 @@ type acrnArch interface {
 	appendBlockDevice(devices []Device, drive config.BlockDrive) []Device
 
 	// handleImagePath handles the Hypervisor Config image path
-	handleImagePath(config HypervisorConfig)
+	handleImagePath(config HypervisorConfig) error
 }
 
 type acrnArchBase struct {
@@ -138,13 +143,6 @@ var acrnKernelParams = []Param{
 	{"console", "hvc0"},
 	{"log_buf_len", "16M"},
 	{"consoleblank", "0"},
-	{"iommu", "off"},
-	{"i915.avail_planes_per_pipe", "0x070F00"},
-	{"i915.enable_hangcheck", "0"},
-	{"i915.nuclear_pageflip", "1"},
-	{"i915.enable_guc_loading", "0"},
-	{"i915.enable_guc_submission", "0"},
-	{"i915.enable_guc", "0"},
 }
 
 // Device is the acrn device interface.
@@ -190,14 +188,20 @@ type ConsoleDevice struct {
 	// Name of the socket
 	Name string
 
+	//Path to virtio-console backend (can be omitted for pty, tty, stdio)
+	Path string
+
 	//Backend device used for virtio-console
 	Backend ConsoleDeviceBackend
 
 	// PortType marks the port as serial or console port (@)
 	PortType BEPortType
+}
 
-	//Path to virtio-console backend (can be omitted for pty, tty, stdio)
-	Path string
+// VSOCKDevice represents a AF_VSOCK socket.
+type VSOCKDevice struct {
+	//Guest CID assigned by Host.
+	ContextID uint64
 }
 
 // NetDeviceType is a acrn networking device type.
@@ -235,26 +239,24 @@ type BlockDevice struct {
 
 // BridgeDevice represents a acrn bridge device like pci-bridge, pxb, etc.
 type BridgeDevice struct {
-
-	// Function is PCI function. Func can be from 0 to 7
-	Function int
-
 	// Emul is a string describing the type of PCI device e.g. virtio-net
 	Emul string
 
 	// Config is an optional string, depending on the device, that can be
 	// used for configuration
 	Config string
+
+	// Function is PCI function. Func can be from 0 to 7
+	Function int
 }
 
 // LPCDevice represents a acrn LPC device
 type LPCDevice struct {
+	// Emul is a string describing the type of PCI device e.g. virtio-net
+	Emul string
 
 	// Function is PCI function. Func can be from 0 to 7
 	Function int
-
-	// Emul is a string describing the type of PCI device e.g. virtio-net
-	Emul string
 }
 
 // Memory is the guest memory configuration structure.
@@ -280,6 +282,8 @@ type Kernel struct {
 // Config is the acrn configuration structure.
 // It allows for passing custom settings and parameters to the acrn-dm API.
 type Config struct {
+	// Devices is a list of devices for acrn to create and drive.
+	Devices []Device
 
 	// Path is the acrn binary path.
 	Path string
@@ -290,11 +294,8 @@ type Config struct {
 	// Name is the acrn guest name
 	Name string
 
-	// UUID is the acrn process UUID.
-	UUID string
-
-	// Devices is a list of devices for acrn to create and drive.
-	Devices []Device
+	// APICID to identify vCPU that will be assigned for this VM.
+	ApicID string
 
 	// Kernel is the guest kernel configuration.
 	Kernel Kernel
@@ -313,7 +314,7 @@ func MaxAcrnVCPUs() uint32 {
 	return uint32(8)
 }
 
-func newAcrnArch(config HypervisorConfig) acrnArch {
+func newAcrnArch(config HypervisorConfig) (acrnArch, error) {
 	a := &acrnArchBase{
 		path:                 acrnPath,
 		ctlpath:              acrnctlPath,
@@ -322,8 +323,11 @@ func newAcrnArch(config HypervisorConfig) acrnArch {
 		kernelParams:         acrnKernelParams,
 	}
 
-	a.handleImagePath(config)
-	return a
+	if err := a.handleImagePath(config); err != nil {
+		return nil, err
+	}
+
+	return a, nil
 }
 
 func (a *acrnArchBase) acrnPath() (string, error) {
@@ -357,7 +361,7 @@ func (a *acrnArchBase) memoryTopology(memoryMb uint64) Memory {
 	return memory
 }
 
-func (a *acrnArchBase) capabilities() types.Capabilities {
+func (a *acrnArchBase) capabilities(config HypervisorConfig) types.Capabilities {
 	var caps types.Capabilities
 
 	caps.SetBlockDeviceSupport()
@@ -429,6 +433,33 @@ func (netdev NetDevice) AcrnNetdevParam() []string {
 	}
 
 	return deviceParams
+}
+
+const (
+	// MinimalGuestCID is the smallest valid context ID for a guest.
+	MinimalGuestCID uint64 = 3
+
+	// MaxGuestCID is the largest valid context ID for a guest.
+	MaxGuestCID uint64 = 1<<32 - 1
+)
+
+// Valid returns true if the VSOCKDevice structure is valid and complete.
+func (vsock VSOCKDevice) Valid() bool {
+	if vsock.ContextID < MinimalGuestCID || vsock.ContextID > MaxGuestCID {
+		return false
+	}
+
+	return true
+}
+
+// AcrnParams returns the acrn parameters built out of this vsock device.
+func (vsock VSOCKDevice) AcrnParams(slot int, config *Config) []string {
+	var acrnParams []string
+
+	acrnParams = append(acrnParams, "-s")
+	acrnParams = append(acrnParams, fmt.Sprintf("%d,vhost-vsock,cid=%d", slot, uint32(vsock.ContextID)))
+
+	return acrnParams
 }
 
 // Valid returns true if the NetDevice structure is valid and complete.
@@ -546,13 +577,6 @@ func (config *Config) appendDevices() {
 	}
 }
 
-func (config *Config) appendUUID() {
-	if config.UUID != "" {
-		config.acrnParams = append(config.acrnParams, "-U")
-		config.acrnParams = append(config.acrnParams, config.UUID)
-	}
-}
-
 func (config *Config) appendACPI() {
 	if config.ACPIVirt {
 		config.acrnParams = append(config.acrnParams, "-A")
@@ -566,10 +590,20 @@ func (config *Config) appendMemory() {
 	}
 }
 
+func (config *Config) appendCPUAffinity() {
+	if config.ApicID == "" {
+		return
+	}
+
+	config.acrnParams = append(config.acrnParams, "--cpu_affinity")
+	config.acrnParams = append(config.acrnParams, config.ApicID)
+}
+
 func (config *Config) appendKernel() {
 	if config.Kernel.Path == "" {
 		return
 	}
+
 	config.acrnParams = append(config.acrnParams, "-k")
 	config.acrnParams = append(config.acrnParams, config.Kernel.Path)
 
@@ -587,10 +621,10 @@ func (config *Config) appendKernel() {
 // This function writes its log output via logger parameter.
 func LaunchAcrn(config Config, logger *logrus.Entry) (int, string, error) {
 	baselogger = logger
-	config.appendUUID()
 	config.appendACPI()
 	config.appendMemory()
 	config.appendDevices()
+	config.appendCPUAffinity()
 	config.appendKernel()
 	config.appendName()
 
@@ -696,6 +730,15 @@ func (a *acrnArchBase) appendSocket(devices []Device, socket types.Socket) []Dev
 	return devices
 }
 
+func (a *acrnArchBase) appendVSock(devices []Device, vsock types.VSock) []Device {
+	vmsock := VSOCKDevice{
+		ContextID: vsock.ContextID,
+	}
+
+	devices = append(devices, vmsock)
+	return devices
+}
+
 func networkModelToAcrnType(model NetInterworkingModel) NetDeviceType {
 	switch model {
 	case NetXConnectMacVtapModel:
@@ -748,10 +791,11 @@ func (a *acrnArchBase) appendBlockDevice(devices []Device, drive config.BlockDri
 	return devices
 }
 
-func (a *acrnArchBase) handleImagePath(config HypervisorConfig) {
+func (a *acrnArchBase) handleImagePath(config HypervisorConfig) error {
 	if config.ImagePath != "" {
 		a.kernelParams = append(a.kernelParams, acrnKernelRootParams...)
 		a.kernelParamsNonDebug = append(a.kernelParamsNonDebug, acrnKernelParamsSystemdNonDebug...)
 		a.kernelParamsDebug = append(a.kernelParamsDebug, acrnKernelParamsSystemdDebug...)
 	}
+	return nil
 }

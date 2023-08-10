@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright (c) 2018 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
@@ -35,27 +35,27 @@ gen_version_file() {
 		ref="refs/tags/${kata_version}^{}"
 	fi
 
-	qemu_vanilla_branch=$(get_from_kata_deps "assets.hypervisor.qemu.version" "${kata_version}")
+	qemu_vanilla_branch=$(get_from_kata_deps "assets.hypervisor.qemu.version")
 	# Check if qemu.version can be used to get the version and hash, otherwise use qemu.tag
 	qemu_vanilla_ref="refs/heads/${qemu_vanilla_branch}"
 	if ! (git ls-remote --heads "https://github.com/qemu/qemu.git" | grep -q "refs/heads/${qemu_vanilla_branch}"); then
-		qemu_vanilla_branch=$(get_from_kata_deps "assets.hypervisor.qemu.tag" "${kata_version}")
+		qemu_vanilla_branch=$(get_from_kata_deps "assets.hypervisor.qemu.tag")
 		qemu_vanilla_ref="refs/tags/${qemu_vanilla_branch}^{}"
 	fi
 	qemu_vanilla_version=$(curl -s -L "https://raw.githubusercontent.com/qemu/qemu/${qemu_vanilla_branch}/VERSION")
 	qemu_vanilla_hash=$(git ls-remote https://github.com/qemu/qemu.git | grep "${qemu_vanilla_ref}" | awk '{print $1}')
 
-	kernel_version=$(get_from_kata_deps "assets.kernel.version" "${kata_version}")
+	kernel_version=$(get_from_kata_deps "assets.kernel.version")
 	#Remove extra 'v'
 	kernel_version=${kernel_version#v}
 
-	golang_version=$(get_from_kata_deps "languages.golang.meta.newest-version" "${kata_version}")
+	golang_version=$(get_from_kata_deps "languages.golang.meta.newest-version")
 
 	# - is not a valid char for rpmbuild
 	# see https://github.com/semver/semver/issues/145
 	kata_version=$(get_kata_version)
 	kata_version=${kata_version/-/\~}
-	cat > "$versions_txt" <<EOT
+	cat > "$versions_txt" <<EOF
 # This is a generated file from ${script_name}
 
 kata_version=${kata_version}
@@ -70,7 +70,7 @@ kernel_version=${kernel_version}
 
 # Golang
 go_version=${golang_version}
-EOT
+EOF
 }
 
 die() {
@@ -85,7 +85,7 @@ die() {
 
 usage() {
 	exit_code=$"${1:-0}"
-	cat <<EOT
+	cat <<EOF
 Usage:
 ${script_name} [--compare | -h | --help] <kata-branch>
 
@@ -98,7 +98,7 @@ Options:
 --compare         Only compare the kata version at branch <kata-branch> with the
                   one in ${versions_txt} and leave the file untouched.
 --head            Use <kata-branch>'s head to generate the versions file.
-EOT
+EOF
 	exit "${exit_code}"
 }
 

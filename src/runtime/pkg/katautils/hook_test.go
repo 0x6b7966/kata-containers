@@ -12,7 +12,6 @@ import (
 	"testing"
 
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
-	. "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/mock"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 )
@@ -21,15 +20,12 @@ import (
 var testKeyHook = "test-key"
 var testContainerIDHook = "test-container-id"
 var testControllerIDHook = "test-controller-id"
-var testBinHookPath = "/usr/bin/virtcontainers/bin/test/hook"
+var testBinHookPath = "mockhook/hook"
 var testBundlePath = "/test/bundle"
+var mockHookLogFile = "/tmp/mock_hook.log"
 
 func getMockHookBinPath() string {
-	if DefaultMockHookBinPath == "" {
-		return testBinHookPath
-	}
-
-	return DefaultMockHookBinPath
+	return testBinHookPath
 }
 
 func createHook(timeout int) specs.Hook {
@@ -54,34 +50,40 @@ func createWrongHook() specs.Hook {
 	}
 }
 
+func cleanMockHookLogFile() {
+	_ = os.Remove(mockHookLogFile)
+}
+
 func TestRunHook(t *testing.T) {
 	if tc.NotValid(ktu.NeedRoot()) {
 		t.Skip(ktu.TestDisabledNeedRoot)
 	}
 
 	assert := assert.New(t)
+	t.Cleanup(cleanMockHookLogFile)
 
 	ctx := context.Background()
+	spec := specs.Spec{}
 
 	// Run with timeout 0
 	hook := createHook(0)
-	err := runHook(ctx, hook, testSandboxID, testBundlePath)
+	err := runHook(ctx, spec, hook, testSandboxID, testBundlePath)
 	assert.NoError(err)
 
 	// Run with timeout 1
 	hook = createHook(1)
-	err = runHook(ctx, hook, testSandboxID, testBundlePath)
+	err = runHook(ctx, spec, hook, testSandboxID, testBundlePath)
 	assert.NoError(err)
 
 	// Run timeout failure
 	hook = createHook(1)
 	hook.Args = append(hook.Args, "2")
-	err = runHook(ctx, hook, testSandboxID, testBundlePath)
+	err = runHook(ctx, spec, hook, testSandboxID, testBundlePath)
 	assert.Error(err)
 
 	// Failure due to wrong hook
 	hook = createWrongHook()
-	err = runHook(ctx, hook, testSandboxID, testBundlePath)
+	err = runHook(ctx, spec, hook, testSandboxID, testBundlePath)
 	assert.Error(err)
 }
 
@@ -91,6 +93,7 @@ func TestPreStartHooks(t *testing.T) {
 	}
 
 	assert := assert.New(t)
+	t.Cleanup(cleanMockHookLogFile)
 
 	ctx := context.Background()
 
@@ -133,6 +136,7 @@ func TestPostStartHooks(t *testing.T) {
 	}
 
 	assert := assert.New(t)
+	t.Cleanup(cleanMockHookLogFile)
 
 	ctx := context.Background()
 
@@ -177,6 +181,7 @@ func TestPostStopHooks(t *testing.T) {
 	assert := assert.New(t)
 
 	ctx := context.Background()
+	t.Cleanup(cleanMockHookLogFile)
 
 	// Hooks field is nil
 	spec := specs.Spec{}

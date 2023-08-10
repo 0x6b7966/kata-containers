@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -19,20 +20,16 @@
 package shim
 
 import (
-	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"syscall"
 
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/sys/reaper"
 	"github.com/containerd/fifo"
-	"github.com/containerd/typeurl"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -62,26 +59,31 @@ func serveListener(path string) (net.Listener, error) {
 		l, err = net.FileListener(os.NewFile(3, "socket"))
 		path = "[inherited from parent]"
 	} else {
-		if len(path) > 106 {
-			return nil, errors.Errorf("%q: unix socket path too long (> 106)", path)
+		if len(path) > socketPathLimit {
+			return nil, fmt.Errorf("%q: unix socket path too long (> %d)", path, socketPathLimit)
 		}
-		l, err = net.Listen("unix", "\x00"+path)
+		l, err = net.Listen("unix", path)
 	}
 	if err != nil {
 		return nil, err
 	}
-	logrus.WithField("socket", path).Debug("serving api on abstract socket")
+	logrus.WithField("socket", path).Debug("serving api on socket")
 	return l, nil
 }
 
-func handleSignals(logger *logrus.Entry, signals chan os.Signal) error {
+func reap(ctx context.Context, logger *logrus.Entry, signals chan os.Signal) error {
 	logger.Info("starting signal loop")
+
 	for {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case s := <-signals:
+			// Exit signals are handled separately from this loop
+			// They get registered with this channel so that we can ignore such signals for short-running actions (e.g. `delete`)
 			switch s {
 			case unix.SIGCHLD:
-				if err := Reap(); err != nil {
+				if err := reaper.Reap(); err != nil {
 					logger.WithError(err).Error("reap exit status")
 				}
 			case unix.SIGPIPE:
@@ -90,41 +92,22 @@ func handleSignals(logger *logrus.Entry, signals chan os.Signal) error {
 	}
 }
 
-func openLog(ctx context.Context, _ string) (io.Writer, error) {
-	return fifo.OpenFifo(ctx, "log", unix.O_WRONLY, 0700)
+func handleExitSignals(ctx context.Context, logger *logrus.Entry, cancel context.CancelFunc) {
+	ch := make(chan os.Signal, 32)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		select {
+		case s := <-ch:
+			logger.WithField("signal", s).Debugf("Caught exit signal")
+			cancel()
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
-func (l *remoteEventsPublisher) Publish(ctx context.Context, topic string, event events.Event) error {
-	ns, _ := namespaces.Namespace(ctx)
-	encoded, err := typeurl.MarshalAny(event)
-	if err != nil {
-		return err
-	}
-	data, err := encoded.Marshal()
-	if err != nil {
-		return err
-	}
-	cmd := exec.CommandContext(ctx, l.containerdBinaryPath, "--address", l.address, "publish", "--topic", topic, "--namespace", ns)
-	cmd.Stdin = bytes.NewReader(data)
-	if l.noReaper {
-		if err := cmd.Start(); err != nil {
-			return err
-		}
-		if err := cmd.Wait(); err != nil {
-			return errors.Wrap(err, "failed to publish event")
-		}
-		return nil
-	}
-	c, err := Default.Start(cmd)
-	if err != nil {
-		return err
-	}
-	status, err := Default.Wait(cmd, c)
-	if err != nil {
-		return err
-	}
-	if status != 0 {
-		return errors.New("failed to publish event")
-	}
-	return nil
+func openLog(ctx context.Context, _ string) (io.Writer, error) {
+	return fifo.OpenFifoDup2(ctx, "log", unix.O_WRONLY, 0700, int(os.Stderr.Fd()))
 }

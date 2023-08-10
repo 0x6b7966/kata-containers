@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright (c) 2018 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
@@ -26,7 +26,7 @@ trap exit_handler EXIT
 
 usage() {
 	return_code=${1:-}
-	cat <<EOT
+	cat <<EOF
 Usage ${script_name} <previous-release> <new_release>
 
 Args:
@@ -37,7 +37,7 @@ new-release:      new release version that will have the
 Example:
 ./${script_name} 1.2.0 1.2.1 > notes.md
 
-EOT
+EOF
 	exit "${return_code}"
 }
 
@@ -47,20 +47,23 @@ repos=(
 
 get_release_info() {
 
-	docker_version=$(get_from_kata_deps "externals.docker.version" "${new_release}")
+	docker_version=$(get_from_kata_deps "externals.docker.version")
 	crio_version=$(get_from_kata_deps "externals.crio.version")
-	cri_containerd_version=$(get_from_kata_deps "externals.cri-containerd.version" "${new_release}")
-	kubernetes_version=$(get_from_kata_deps "externals.kubernetes.version" "${new_release}")
-	oci_spec_version=$(get_from_kata_deps "specs.oci.version" "${new_release}")
+	containerd_version=$(get_from_kata_deps "externals.containerd.version")
+	kubernetes_version=$(get_from_kata_deps "externals.kubernetes.version")
+	oci_spec_version=$(get_from_kata_deps "specs.oci.version")
+
+	libseccomp_version=$(get_from_kata_deps "externals.libseccomp.version")
+	libseccomp_url=$(get_from_kata_deps "externals.libseccomp.url")
 
 	#Image information
-	image_info=$(get_from_kata_deps "assets.image" "${new_release}")
+	image_info=$(get_from_kata_deps "assets.image")
 
 	# Initrd information
-	initrd_info=$(get_from_kata_deps "assets.initrd" "${new_release}")
+	initrd_info=$(get_from_kata_deps "assets.initrd")
 
-	kernel_version=$(get_from_kata_deps "assets.kernel.version" "${new_release}")
-	kernel_url=$(get_from_kata_deps "assets.kernel.url" "${new_release}")
+	kernel_version=$(get_from_kata_deps "assets.kernel.version")
+	kernel_url=$(get_from_kata_deps "assets.kernel.url")
 
 	kata_kernel_config_version="${new_release}-kernel-config"
 	kata_kernel_config_version="${new_release}-kernel-config"
@@ -78,37 +81,50 @@ changes() {
 }
 
 print_release_notes() {
-	cat <<EOT
+	cat <<EOF
 # Release ${runtime_version}
 
-EOT
+EOF
 
 	for repo in "${repos[@]}"; do
 		git clone -q "https://github.com/${project}/${repo}.git" "${tmp_dir}/${repo}"
 		pushd "${tmp_dir}/${repo}" >>/dev/null
 
-		cat <<EOT
+		cat <<EOF
 ## ${repo} Changes
 $(changes)
 
-EOT
+EOF
 		popd >>/dev/null
 		rm -rf "${tmp_dir}/${repo}"
 	done
 
-	cat <<EOT
+	cat <<EOF
 
 ## Compatibility with CRI-O
 Kata Containers ${runtime_version} is compatible with CRI-O ${crio_version}
 
-## Compatibility with cri-containerd
-Kata Containers ${runtime_version} is compatible with cri-contaienrd ${cri_containerd_version}
+## Compatibility with containerd
+Kata Containers ${runtime_version} is compatible with contaienrd ${containerd_version}
 
 ## OCI Runtime Specification
 Kata Containers ${runtime_version} support the OCI Runtime Specification [${oci_spec_version}][ocispec]
 
 ## Compatibility with Kubernetes
 Kata Containers ${runtime_version} is compatible with Kubernetes ${kubernetes_version}
+
+## Libseccomp Notices
+The \`kata-agent\` binaries inside the Kata Containers images provided with this release are
+statically linked with the following [GNU LGPL-2.1][lgpl-2.1] licensed libseccomp library.
+
+* [\`libseccomp\`][libseccomp]
+
+The \`kata-agent\` uses the libseccomp v${libseccomp_version} which is not modified from the upstream version.
+However, in order to comply with the LGPL-2.1 (§6(a)), we attach the complete source code for the library.
+
+If you want to use the \`kata-agent\` which is not statically linked with the library, you can build
+a custom \`kata-agent\` that does not use the library from sources.
+For the details, please check the [developer guide][custom-agent-doc].
 
 ## Kata Linux Containers image
 Agent version: ${new_release}
@@ -118,6 +134,25 @@ ${image_info}
 
 ### Default Initrd Guest OS:
 ${initrd_info}
+
+## Kata Containers builder images
+The majority of the components of the project were built using containers.  In order to do a step towards
+build reproducibility we publish those container images, and when those are used combined with the version
+of the projects listed as part of the "versions.yaml" file, users can get as close to the environment we
+used to build the release artefacts.
+* Kernel (on all its different flavours): $(get_kernel_image_name)
+* OVMF (on all its different flavours): $(get_ovmf_image_name)
+* QEMU (on all its different flavurs): $(get_qemu_image_name)
+* shim-v2: $(get_shim_v2_image_name)
+* virtiofsd: $(get_virtiofsd_image_name)
+
+The users who want to rebuild the tarballs using exactly the same images can simply use the following environment
+variables:
+* \`KERNEL_CONTAINER_BUILDER\`
+* \`OVMF_CONTAINER_BUILDER\`
+* \`QEMU_CONTAINER_BUILDER\`
+* \`SHIM_V2_CONTAINER_BUILDER\`
+* \`VIRTIOFSD_CONTAINER_BUILDER\`
 
 ## Kata Linux Containers Kernel
 Kata Containers ${runtime_version} suggest to use the Linux kernel [${kernel_version}][kernel]
@@ -136,9 +171,12 @@ More information [Limitations][limitations]
 [kernel-patches]: https://github.com/kata-containers/kata-containers/tree/${new_release}/tools/packaging/kernel/patches
 [kernel-config]: https://github.com/kata-containers/kata-containers/tree/${new_release}/tools/packaging/kernel/configs
 [ocispec]: https://github.com/opencontainers/runtime-spec/releases/tag/${oci_spec_version}
+[libseccomp]: ${libseccomp_url}
+[lgpl-2.1]: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+[custom-agent-doc]: https://github.com/kata-containers/kata-containers/blob/main/docs/Developer-Guide.md#build-a-custom-kata-agent---optional
 [limitations]: https://github.com/kata-containers/kata-containers/blob/${new_release}/docs/Limitations.md
 [installation]: https://github.com/kata-containers/kata-containers/blob/${new_release}/docs/install
-EOT
+EOF
 }
 
 main() {

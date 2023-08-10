@@ -14,8 +14,10 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -28,9 +30,6 @@ var maxUInt uint64 = 1<<32 - 1
 
 func Ioctl(fd uintptr, request, data uintptr) error {
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, request, data); errno != 0 {
-		//uintptr(request)
-		//uintptr(unsafe.Pointer(&arg1)),
-		//); errno != 0 {
 		return os.NewSyscallError("ioctl", fmt.Errorf("%d", int(errno)))
 	}
 
@@ -48,9 +47,8 @@ func Ioctl(fd uintptr, request, data uintptr) error {
 // close vhost file descriptor.
 //
 // Benefits of using random context IDs:
-// - Reduce the probability of a *DoS attack*, since other processes don't know whatis the initial context ID
-//   used by findContextID to find a context ID available
-//
+//   - Reduce the probability of a *DoS attack*, since other processes don't know whatis the initial context ID
+//     used by findContextID to find a context ID available
 func FindContextID() (*os.File, uint64, error) {
 	// context IDs 0x0, 0x1 and 0x2 are reserved, 0x3 is the first context ID usable.
 	var firstContextID uint64 = 0x3
@@ -77,7 +75,6 @@ func FindContextID() (*os.File, uint64, error) {
 		}
 	}
 
-	ioctlVhostVsockSetGuestCid := getIoctlVhostVsockGuestCid()
 	// Last chance to get a free context ID.
 	for cid := contextID - 1; cid >= firstContextID; cid-- {
 		if err = ioctlFunc(vsockFd.Fd(), ioctlVhostVsockSetGuestCid, uintptr(unsafe.Pointer(&cid))); err == nil {
@@ -92,19 +89,19 @@ func FindContextID() (*os.File, uint64, error) {
 const (
 	procMountsFile = "/proc/mounts"
 
-	fieldsPerLine  = 6
-	vfioAPSysfsDir = "vfio_ap"
+	fieldsPerLine = 6
 )
 
 const (
 	procDeviceIndex = iota
 	procPathIndex
 	procTypeIndex
+	procOptionIndex
 )
 
-// GetDevicePathAndFsType gets the device for the mount point and the file system type
-// of the mount.
-func GetDevicePathAndFsType(mountPoint string) (devicePath, fsType string, err error) {
+// GetDevicePathAndFsTypeOptions gets the device for the mount point, the file system type
+// and mount options
+func GetDevicePathAndFsTypeOptions(mountPoint string) (devicePath, fsType string, fsOptions []string, err error) {
 	if mountPoint == "" {
 		err = fmt.Errorf("Mount point cannot be empty")
 		return
@@ -138,19 +135,65 @@ func GetDevicePathAndFsType(mountPoint string) (devicePath, fsType string, err e
 		if mountPoint == fields[procPathIndex] {
 			devicePath = fields[procDeviceIndex]
 			fsType = fields[procTypeIndex]
+			fsOptions = strings.Split(fields[procOptionIndex], ",")
 			return
 		}
 	}
 }
 
-// IsAPVFIOMediatedDevice decides whether a device is a VFIO-AP device
-// by checking for the existence of "vfio_ap" in the path
-func IsAPVFIOMediatedDevice(sysfsdev string) bool {
-	split := strings.Split(sysfsdev, string(os.PathSeparator))
-	for _, el := range split {
-		if el == vfioAPSysfsDir {
-			return true
+func waitProcessUsingPidfd(pid int, timeoutSecs uint, logger *logrus.Entry) (bool, error) {
+	pidfd, err := unix.PidfdOpen(pid, 0)
+
+	if err != nil {
+		if err == unix.ESRCH {
+			return false, nil
+		}
+
+		return true, err
+	}
+
+	defer unix.Close(pidfd)
+	var n int
+
+	maxDelay := time.Duration(timeoutSecs) * time.Second
+	end := time.Now().Add(maxDelay)
+
+	for {
+		remaining := time.Until(end).Milliseconds()
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		n, err = unix.Poll([]unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}, int(remaining))
+		if err != unix.EINTR {
+			break
 		}
 	}
-	return false
+
+	if err != nil || n != 1 {
+		logger.Warnf("process %v still running after waiting %ds", pid, timeoutSecs)
+		return true, err
+	}
+
+	for {
+		err := unix.Waitid(unix.P_PIDFD, pidfd, nil, unix.WEXITED, nil)
+		if err == unix.EINVAL {
+			err = unix.Waitid(unix.P_PID, pid, nil, unix.WEXITED, nil)
+		}
+
+		if err != unix.EINTR {
+			break
+		}
+	}
+	return false, nil
+}
+
+func waitForProcessCompletion(pid int, timeoutSecs uint, logger *logrus.Entry) bool {
+	pidRunning, err := waitProcessUsingPidfd(pid, timeoutSecs, logger)
+
+	if err == unix.ENOSYS {
+		pidRunning = waitProcessUsingWaitLoop(pid, timeoutSecs, logger)
+	}
+
+	return pidRunning
 }

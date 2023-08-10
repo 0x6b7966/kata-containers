@@ -19,12 +19,6 @@
 > - If you decide to proceed and install a Kata Containers release, you can
 >   still check for the latest version of Kata Containers by running
 >   `kata-runtime check --only-list-releases`.
->
-> - These instructions will not work for Fedora 31 and higher since those
->   distribution versions only support cgroups version 2 by default. However,
->   Kata Containers currently requires cgroups version 1 (on the host side). See
->   https://github.com/kata-containers/kata-containers/issues/927 for further
->   details.
 
 ## Install Kata Containers
 
@@ -81,7 +75,7 @@
   - Download the standard `systemd(1)` service file and install to
     `/etc/systemd/system/`:
 
-    - https://raw.githubusercontent.com/containerd/containerd/master/containerd.service
+    - https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
 
     > **Notes:**
     >
@@ -98,12 +92,12 @@
 
     ```toml
     [plugins]
-        [plugins.cri]
-            [plugins.cri.containerd]
-            default_runtime_name = "kata"
-
-            [plugins.cri.containerd.runtimes.kata]
-            runtime_type = "io.containerd.kata.v2"
+      [plugins."io.containerd.grpc.v1.cri"]
+        [plugins."io.containerd.grpc.v1.cri".containerd]
+          default_runtime_name = "kata"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+              runtime_type = "io.containerd.kata.v2"
     ```
 
     > **Note:**

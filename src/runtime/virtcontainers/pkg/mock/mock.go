@@ -8,9 +8,12 @@ package mock
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/url"
+	"os"
+
+	"path"
+	"strings"
 
 	"github.com/containerd/ttrpc"
 	gpb "github.com/gogo/protobuf/types"
@@ -18,18 +21,26 @@ import (
 	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 )
 
-// DefaultMockHookBinPath is populated at link time.
-var DefaultMockHookBinPath string
+const VSockPrefix = "mock://"
 
-var testKataMockHybridVSockURLTempl = "mock://%s/kata-mock-hybrid-vsock.sock"
+var testKataMockHybridVSockURLTempl = VSockPrefix + "%s/kata-mock-hybrid-vsock.sock"
 
 func GenerateKataMockHybridVSock() (string, error) {
-	dir, err := ioutil.TempDir("", "kata-mock-hybrid-vsock-test")
+	dir, err := os.MkdirTemp("", "kata-mock-hybrid-vsock-test")
 	if err != nil {
 		return "", err
 	}
 
 	return fmt.Sprintf(testKataMockHybridVSockURLTempl, dir), nil
+}
+
+func RemoveKataMockHybridVSock(sockAddress string) error {
+	if !strings.HasPrefix(sockAddress, VSockPrefix) {
+		return fmt.Errorf("Invalid socket address: %s", sockAddress)
+	}
+
+	sockPath := strings.TrimPrefix(sockAddress, VSockPrefix)
+	return os.RemoveAll(path.Dir(sockPath))
 }
 
 // HybridVSockTTRPCMock is the ttrpc-based mock hybrid-vsock backend implementation
@@ -110,11 +121,11 @@ func (p *HybridVSockTTRPCMockImp) WaitProcess(ctx context.Context, req *pb.WaitP
 	return &pb.WaitProcessResponse{}, nil
 }
 
-func (p *HybridVSockTTRPCMockImp) ListProcesses(ctx context.Context, req *pb.ListProcessesRequest) (*pb.ListProcessesResponse, error) {
-	return &pb.ListProcessesResponse{}, nil
+func (p *HybridVSockTTRPCMockImp) UpdateContainer(ctx context.Context, req *pb.UpdateContainerRequest) (*gpb.Empty, error) {
+	return emptyResp, nil
 }
 
-func (p *HybridVSockTTRPCMockImp) UpdateContainer(ctx context.Context, req *pb.UpdateContainerRequest) (*gpb.Empty, error) {
+func (p *HybridVSockTTRPCMockImp) UpdateEphemeralMounts(ctx context.Context, req *pb.UpdateEphemeralMountsRequest) (*gpb.Empty, error) {
 	return emptyResp, nil
 }
 
@@ -210,14 +221,6 @@ func (p *HybridVSockTTRPCMockImp) CopyFile(ctx context.Context, req *pb.CopyFile
 	return &gpb.Empty{}, nil
 }
 
-func (p *HybridVSockTTRPCMockImp) StartTracing(ctx context.Context, req *pb.StartTracingRequest) (*gpb.Empty, error) {
-	return &gpb.Empty{}, nil
-}
-
-func (p *HybridVSockTTRPCMockImp) StopTracing(ctx context.Context, req *pb.StopTracingRequest) (*gpb.Empty, error) {
-	return &gpb.Empty{}, nil
-}
-
 func (p *HybridVSockTTRPCMockImp) MemHotplugByProbe(ctx context.Context, req *pb.MemHotplugByProbeRequest) (*gpb.Empty, error) {
 	return &gpb.Empty{}, nil
 }
@@ -228,4 +231,28 @@ func (p *HybridVSockTTRPCMockImp) GetOOMEvent(ctx context.Context, req *pb.GetOO
 
 func (p *HybridVSockTTRPCMockImp) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.Metrics, error) {
 	return &pb.Metrics{}, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) AddSwap(ctx context.Context, req *pb.AddSwapRequest) (*gpb.Empty, error) {
+	return &gpb.Empty{}, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) GetVolumeStats(ctx context.Context, req *pb.VolumeStatsRequest) (*pb.VolumeStatsResponse, error) {
+	return &pb.VolumeStatsResponse{}, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) ResizeVolume(ctx context.Context, req *pb.ResizeVolumeRequest) (*gpb.Empty, error) {
+	return &gpb.Empty{}, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) RemoveStaleVirtiofsShareMounts(ctx context.Context, req *pb.RemoveStaleVirtiofsShareMountsRequest) (*gpb.Empty, error) {
+	return &gpb.Empty{}, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) GetIPTables(ctx context.Context, req *pb.GetIPTablesRequest) (*pb.GetIPTablesResponse, error) {
+	return &pb.GetIPTablesResponse{}, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) SetIPTables(ctx context.Context, req *pb.SetIPTablesRequest) (*pb.SetIPTablesResponse, error) {
+	return &pb.SetIPTablesResponse{}, nil
 }

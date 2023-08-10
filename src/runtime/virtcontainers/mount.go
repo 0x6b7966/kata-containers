@@ -6,16 +6,15 @@
 package virtcontainers
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 
-	merr "github.com/hashicorp/go-multierror"
+	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -23,25 +22,29 @@ import (
 // IPC is used.
 const DefaultShmSize = 65536 * 1024
 
-// Sadly golang/sys doesn't have UmountNoFollow although it's there since Linux 2.6.34
-const UmountNoFollow = 0x8
-
-var rootfsDir = "rootfs"
+const (
+	rootfsDir   = "rootfs"
+	lowerDir    = "lowerdir"
+	upperDir    = "upperdir"
+	workDir     = "workdir"
+	snapshotDir = "snapshotdir"
+)
 
 var systemMountPrefixes = []string{"/proc", "/sys"}
+
+// mountTracingTags defines tags for the trace span
+var mountTracingTags = map[string]string{
+	"source":    "runtime",
+	"package":   "virtcontainers",
+	"subsystem": "mount",
+}
 
 func mountLogger() *logrus.Entry {
 	return virtLog.WithField("subsystem", "mount")
 }
 
-var propagationTypes = map[string]uintptr{
-	"shared":  syscall.MS_SHARED,
-	"private": syscall.MS_PRIVATE,
-	"slave":   syscall.MS_SLAVE,
-	"ubind":   syscall.MS_UNBINDABLE,
-}
-
 func isSystemMount(m string) bool {
+	m = filepath.Clean(m)
 	for _, p := range systemMountPrefixes {
 		if m == p || strings.HasPrefix(m, p+"/") {
 			return true
@@ -52,6 +55,7 @@ func isSystemMount(m string) bool {
 }
 
 func isHostDevice(m string) bool {
+	m = filepath.Clean(m)
 	if m == "/dev" {
 		return true
 	}
@@ -88,9 +92,9 @@ func minor(dev uint64) int {
 }
 
 type device struct {
+	mountPoint string
 	major      int
 	minor      int
-	mountPoint string
 }
 
 var errMountPointNotFound = errors.New("Mount point not found")
@@ -129,8 +133,8 @@ func getDeviceForPath(path string) (device, error) {
 
 	if isHostDevice(path) {
 		// stat.Rdev describes the device that this file (inode) represents.
-		devMajor = major(stat.Rdev)
-		devMinor = minor(stat.Rdev)
+		devMajor = major(uint64(stat.Rdev))
+		devMinor = minor(uint64(stat.Rdev))
 
 		return device{
 			major:      devMajor,
@@ -139,8 +143,8 @@ func getDeviceForPath(path string) (device, error) {
 		}, nil
 	}
 	// stat.Dev points to the underlying device containing the file
-	devMajor = major(stat.Dev)
-	devMinor = minor(stat.Dev)
+	devMajor = major(uint64(stat.Dev))
+	devMinor = minor(uint64(stat.Dev))
 
 	path, err = filepath.Abs(path)
 	if err != nil {
@@ -157,7 +161,7 @@ func getDeviceForPath(path string) (device, error) {
 		}, nil
 	}
 
-	// We get the mount point by recursively peforming stat on the path
+	// We get the mount point by recursively performing stat on the path
 	// The point where the device changes indicates the mountpoint
 	for {
 		if mountPoint == "/" {
@@ -212,108 +216,63 @@ func isDeviceMapper(major, minor int) (bool, error) {
 
 const mountPerm = os.FileMode(0755)
 
-// bindMount bind mounts a source in to a destination. This will
-// do some bookkeeping:
-// * evaluate all symlinks
-// * ensure the source exists
-// * recursively create the destination
-// pgtypes stands for propagation types, which are shared, private, slave, and ubind.
-func bindMount(ctx context.Context, source, destination string, readonly bool, pgtypes string) error {
-	span, _ := trace(ctx, "bindMount")
-	defer span.End()
-
+func evalMountPath(source, destination string) (string, string, error) {
 	if source == "" {
-		return fmt.Errorf("source must be specified")
+		return "", "", fmt.Errorf("source must be specified")
 	}
 	if destination == "" {
-		return fmt.Errorf("destination must be specified")
+		return "", "", fmt.Errorf("destination must be specified")
 	}
 
 	absSource, err := filepath.EvalSymlinks(source)
 	if err != nil {
-		return fmt.Errorf("Could not resolve symlink for source %v", source)
+		return "", "", fmt.Errorf("Could not resolve symlink for source %v", source)
 	}
 
 	if err := ensureDestinationExists(absSource, destination); err != nil {
-		return fmt.Errorf("Could not create destination mount point %v: %v", destination, err)
+		return "", "", fmt.Errorf("Could not create destination mount point %v: %v", destination, err)
 	}
 
-	if err := syscall.Mount(absSource, destination, "bind", syscall.MS_BIND, ""); err != nil {
-		return fmt.Errorf("Could not bind mount %v to %v: %v", absSource, destination, err)
-	}
-
-	if pgtype, exist := propagationTypes[pgtypes]; exist {
-		if err := syscall.Mount("none", destination, "", pgtype, ""); err != nil {
-			return fmt.Errorf("Could not make mount point %v %s: %v", destination, pgtypes, err)
-		}
-	} else {
-		return fmt.Errorf("Wrong propagation type %s", pgtypes)
-	}
-
-	// For readonly bind mounts, we need to remount with the readonly flag.
-	// This is needed as only very recent versions of libmount/util-linux support "bind,ro"
-	if readonly {
-		return syscall.Mount(absSource, destination, "bind", uintptr(syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY), "")
-	}
-
-	return nil
-}
-
-// An existing mount may be remounted by specifying `MS_REMOUNT` in
-// mountflags.
-// This allows you to change the mountflags of an existing mount.
-// The mountflags should match the values used in the original mount() call,
-// except for those parameters that you are trying to change.
-func remount(ctx context.Context, mountflags uintptr, src string) error {
-	absSrc, err := filepath.EvalSymlinks(src)
-	if err != nil {
-		return fmt.Errorf("Could not resolve symlink for %s", src)
-	}
-
-	if err := syscall.Mount(absSrc, absSrc, "", syscall.MS_REMOUNT|mountflags, ""); err != nil {
-		return fmt.Errorf("remount %s failed: %v", absSrc, err)
-	}
-
-	return nil
-}
-
-// remount a mount point as readonly
-func remountRo(ctx context.Context, src string) error {
-	return remount(ctx, syscall.MS_BIND|syscall.MS_RDONLY, src)
-}
-
-// bindMountContainerRootfs bind mounts a container rootfs into a 9pfs shared
-// directory between the guest and the host.
-func bindMountContainerRootfs(ctx context.Context, shareDir, cid, cRootFs string, readonly bool) error {
-	span, _ := trace(ctx, "bindMountContainerRootfs")
-	defer span.End()
-
-	rootfsDest := filepath.Join(shareDir, cid, rootfsDir)
-
-	return bindMount(ctx, cRootFs, rootfsDest, readonly, "private")
+	return absSource, destination, nil
 }
 
 // Mount describes a container mount.
+// nolint: govet
 type Mount struct {
-	Source      string
+	// Source is the source of the mount.
+	Source string
+	// Destination is the destination of the mount (within the container).
 	Destination string
 
 	// Type specifies the type of filesystem to mount.
 	Type string
 
-	// Options list all the mount options of the filesystem.
-	Options []string
-
 	// HostPath used to store host side bind mount path
 	HostPath string
 
-	// ReadOnly specifies if the mount should be read only or not
-	ReadOnly bool
+	// GuestDeviceMount represents the path within the VM that the device
+	// is mounted. Only relevant for block devices. This is tracked in the event
+	// runtime wants to query the agent for mount stats.
+	GuestDeviceMount string
 
 	// BlockDeviceID represents block device that is attached to the
 	// VM in case this mount is a block device file or a directory
 	// backed by a block device.
 	BlockDeviceID string
+
+	// Options list all the mount options of the filesystem.
+	Options []string
+
+	// ReadOnly specifies if the mount should be read only or not
+	ReadOnly bool
+
+	// FSGroup a group ID that the group ownership of the files for the mounted volume
+	// will need to be changed when set.
+	FSGroup *int
+
+	// FSGroupChangePolicy specifies the policy that will be used when applying
+	// group id ownership change for a volume.
+	FSGroupChangePolicy volume.FSGroupChangePolicy
 }
 
 func isSymlink(path string) bool {
@@ -322,48 +281,6 @@ func isSymlink(path string) bool {
 		return false
 	}
 	return stat.Mode()&os.ModeSymlink != 0
-}
-
-func bindUnmountContainerRootfs(ctx context.Context, sharedDir, cID string) error {
-	span, _ := trace(ctx, "bindUnmountContainerRootfs")
-	defer span.End()
-
-	rootfsDest := filepath.Join(sharedDir, cID, rootfsDir)
-	if isSymlink(filepath.Join(sharedDir, cID)) || isSymlink(rootfsDest) {
-		mountLogger().WithField("container", cID).Warnf("container dir is a symlink, malicious guest?")
-		return nil
-	}
-
-	err := syscall.Unmount(rootfsDest, syscall.MNT_DETACH|UmountNoFollow)
-	if err == syscall.ENOENT {
-		mountLogger().WithError(err).WithField("rootfs-dir", rootfsDest).Warn()
-		return nil
-	}
-	if err := syscall.Rmdir(rootfsDest); err != nil {
-		mountLogger().WithError(err).WithField("rootfs-dir", rootfsDest).Warn("Could not remove container rootfs dir")
-	}
-
-	return err
-}
-
-func bindUnmountAllRootfs(ctx context.Context, sharedDir string, sandbox *Sandbox) error {
-	span, _ := trace(ctx, "bindUnmountAllRootfs")
-	defer span.End()
-
-	var errors *merr.Error
-	for _, c := range sandbox.containers {
-		if isSymlink(filepath.Join(sharedDir, c.id)) {
-			mountLogger().WithField("container", c.id).Warnf("container dir is a symlink, malicious guest?")
-			continue
-		}
-		c.unmountHostMounts()
-		if c.state.Fstype == "" {
-			// even if error found, don't break out of loop until all mounts attempted
-			// to be unmounted, and collect all errors
-			errors = merr.Append(errors, bindUnmountContainerRootfs(c.ctx, sharedDir, c.id))
-		}
-	}
-	return errors.ErrorOrNil()
 }
 
 const (
@@ -383,7 +300,9 @@ func IsDockerVolume(path string) bool {
 
 const (
 	// K8sEmptyDir is the k8s specific path for `empty-dir` volumes
-	K8sEmptyDir = "kubernetes.io~empty-dir"
+	K8sEmptyDir  = "kubernetes.io~empty-dir"
+	K8sConfigMap = "kubernetes.io~configmap"
+	K8sSecret    = "kubernetes.io~secret"
 )
 
 // IsEphemeralStorage returns true if the given path
@@ -400,7 +319,7 @@ func IsEphemeralStorage(path string) bool {
 		return false
 	}
 
-	if _, fsType, _ := utils.GetDevicePathAndFsType(path); fsType == "tmpfs" {
+	if _, fsType, _, _ := utils.GetDevicePathAndFsTypeOptions(path); fsType == "tmpfs" {
 		return true
 	}
 
@@ -415,17 +334,100 @@ func Isk8sHostEmptyDir(path string) bool {
 		return false
 	}
 
-	if _, fsType, _ := utils.GetDevicePathAndFsType(path); fsType != "tmpfs" {
+	if _, fsType, _, _ := utils.GetDevicePathAndFsTypeOptions(path); fsType != "tmpfs" {
 		return true
 	}
 	return false
 }
 
-func isEmptyDir(path string) bool {
+func checkKubernetesVolume(path, volumeType string) bool {
 	splitSourceSlice := strings.Split(path, "/")
 	if len(splitSourceSlice) > 1 {
 		storageType := splitSourceSlice[len(splitSourceSlice)-2]
-		if storageType == K8sEmptyDir {
+		if storageType == volumeType {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isEmptyDir(path string) bool {
+	return checkKubernetesVolume(path, K8sEmptyDir)
+}
+
+func isConfigMap(path string) bool {
+	return checkKubernetesVolume(path, K8sConfigMap)
+}
+
+func isSecret(path string) bool {
+	return checkKubernetesVolume(path, K8sSecret)
+}
+
+// countFiles will return the number of files within a given path. If the total number of
+// files observed is greater than limit, break and return -1
+func countFiles(path string, limit int) (numFiles int, err error) {
+
+	// First, Check to see if the path exists
+	file, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return 0, err
+	}
+
+	// Special case if this is just a file, not a directory:
+	if !file.IsDir() {
+		return 1, nil
+	}
+
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			inc, err := countFiles(filepath.Join(path, file.Name()), (limit - numFiles))
+			if err != nil {
+				return numFiles, err
+			}
+			numFiles = numFiles + inc
+		} else {
+			numFiles++
+		}
+		if numFiles > limit {
+			return -1, nil
+		}
+	}
+	return numFiles, nil
+}
+
+func isWatchableMount(path string) bool {
+	if isSecret(path) || isConfigMap(path) {
+		// we have a cap on number of FDs which can be present in mount
+		// to determine if watchable. A similar Check exists within the agent,
+		// which may or may not help handle case where extra files are added to
+		// a mount after the fact
+		count, _ := countFiles(path, 8)
+		if count > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+func HasOption(options []string, option string) bool {
+	for _, o := range options {
+		if o == option {
+			return true
+		}
+	}
+	return false
+}
+
+func HasOptionPrefix(options []string, prefix string) bool {
+	for _, o := range options {
+		if strings.HasPrefix(o, prefix) {
 			return true
 		}
 	}

@@ -6,6 +6,7 @@
 package types
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -18,7 +19,7 @@ func testAddRemoveDevice(t *testing.T, b *Bridge) {
 	// add device
 	devID := "abc123"
 
-	addr, err := b.AddDevice(devID)
+	addr, err := b.AddDevice(context.Background(), devID)
 	assert.NoError(err)
 	if addr < 1 {
 		assert.Fail("address cannot be less than 1")
@@ -36,7 +37,7 @@ func testAddRemoveDevice(t *testing.T, b *Bridge) {
 	for i := uint32(1); i <= b.MaxCapacity; i++ {
 		b.Devices[i] = fmt.Sprintf("%d", i)
 	}
-	addr, err = b.AddDevice(devID)
+	addr, err = b.AddDevice(context.Background(), devID)
 	assert.Error(err)
 	if addr != 0 {
 		assert.Fail("address should be 0")
@@ -95,7 +96,7 @@ func TestNewBridge(t *testing.T) {
 func TestAddRemoveDevicePCI(t *testing.T) {
 
 	// create a pci bridge
-	bridges := []*Bridge{{make(map[uint32]string), "rgb123", 5, PCI, PCIBridgeMaxCapacity}}
+	bridges := []*Bridge{{make(map[uint32]string), "rgb123", PCI, 5, PCIBridgeMaxCapacity}}
 
 	testAddRemoveDevice(t, bridges[0])
 }
@@ -103,7 +104,7 @@ func TestAddRemoveDevicePCI(t *testing.T) {
 func TestAddRemoveDeviceCCW(t *testing.T) {
 
 	// create a CCW bridge
-	bridges := []*Bridge{{make(map[uint32]string), "rgb123", 5, CCW, CCWBridgeMaxCapacity}}
+	bridges := []*Bridge{{make(map[uint32]string), "rgb123", CCW, 5, CCWBridgeMaxCapacity}}
 
 	testAddRemoveDevice(t, bridges[0])
 }

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use protobuf::{CachedSize, SingularPtrField, UnknownFields};
+use protobuf::MessageField;
 
 use crate::cgroups::Manager as CgroupManager;
 use crate::protocols::agent::{BlkioStats, CgroupStats, CpuStats, MemoryStats, PidsStats};
@@ -11,6 +11,7 @@ use anyhow::Result;
 use cgroups::freezer::FreezerState;
 use libc::{self, pid_t};
 use oci::LinuxResources;
+use std::any::Any;
 use std::collections::HashMap;
 use std::string::String;
 
@@ -32,13 +33,12 @@ impl CgroupManager for Manager {
 
     fn get_stats(&self) -> Result<CgroupStats> {
         Ok(CgroupStats {
-            cpu_stats: SingularPtrField::some(CpuStats::default()),
-            memory_stats: SingularPtrField::some(MemoryStats::new()),
-            pids_stats: SingularPtrField::some(PidsStats::new()),
-            blkio_stats: SingularPtrField::some(BlkioStats::new()),
+            cpu_stats: MessageField::some(CpuStats::default()),
+            memory_stats: MessageField::some(MemoryStats::new()),
+            pids_stats: MessageField::some(PidsStats::new()),
+            blkio_stats: MessageField::some(BlkioStats::new()),
             hugetlb_stats: HashMap::new(),
-            unknown_fields: UnknownFields::default(),
-            cached_size: CachedSize::default(),
+            ..Default::default()
         })
     }
 
@@ -53,6 +53,22 @@ impl CgroupManager for Manager {
     fn get_pids(&self) -> Result<Vec<pid_t>> {
         Ok(Vec::new())
     }
+
+    fn update_cpuset_path(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn get_cgroup_path(&self, _: &str) -> Result<String> {
+        Ok("".to_string())
+    }
+
+    fn as_any(&self) -> Result<&dyn Any> {
+        Ok(self)
+    }
+
+    fn name(&self) -> &str {
+        "mock"
+    }
 }
 
 impl Manager {
@@ -62,13 +78,5 @@ impl Manager {
             mounts: HashMap::new(),
             cpath: cpath.to_string(),
         })
-    }
-
-    pub fn update_cpuset_path(&self, _: &str, _: &str) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn get_cg_path(&self, _: &str) -> Option<String> {
-        Some("".to_string())
     }
 }

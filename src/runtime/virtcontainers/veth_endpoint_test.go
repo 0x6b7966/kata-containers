@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -81,6 +83,7 @@ func TestCreateVethNetworkEndpointChooseIfaceName(t *testing.T) {
 }
 
 func TestCreateVethNetworkEndpointInvalidArgs(t *testing.T) {
+	// nolint: govet
 	type endpointValues struct {
 		idx    int
 		ifName string

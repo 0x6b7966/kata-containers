@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -21,10 +20,12 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/drivers"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/manager"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/manager"
+
+	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
@@ -32,15 +33,16 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/mock"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 )
+
+const sysHugepagesDir = "/sys/kernel/mm/hugepages"
 
 var (
 	testBlkDriveFormat     = "testBlkDriveFormat"
 	testBlockDeviceCtrPath = "testBlockDeviceCtrPath"
 	testDevNo              = "testDevNo"
 	testNvdimmID           = "testNvdimmID"
-	testPCIPath, _         = vcTypes.PciPathFromString("04/02")
+	testPCIPath, _         = types.PciPathFromString("04/02")
 	testSCSIAddr           = "testSCSIAddr"
 	testVirtPath           = "testVirtPath"
 )
@@ -50,6 +52,7 @@ func TestKataAgentConnect(t *testing.T) {
 
 	url, err := mock.GenerateKataMockHybridVSock()
 	assert.NoError(err)
+	defer mock.RemoveKataMockHybridVSock(url)
 
 	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
 	err = hybridVSockTTRPCMock.Start(url)
@@ -63,7 +66,7 @@ func TestKataAgentConnect(t *testing.T) {
 		},
 	}
 
-	err = k.connect()
+	err = k.connect(context.Background())
 	assert.NoError(err)
 	assert.NotNil(k.client)
 }
@@ -73,6 +76,7 @@ func TestKataAgentDisconnect(t *testing.T) {
 
 	url, err := mock.GenerateKataMockHybridVSock()
 	assert.NoError(err)
+	defer mock.RemoveKataMockHybridVSock(url)
 
 	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
 	err = hybridVSockTTRPCMock.Start(url)
@@ -86,8 +90,8 @@ func TestKataAgentDisconnect(t *testing.T) {
 		},
 	}
 
-	assert.NoError(k.connect())
-	assert.NoError(k.disconnect())
+	assert.NoError(k.connect(context.Background()))
+	assert.NoError(k.disconnect(context.Background()))
 	assert.Nil(k.client)
 }
 
@@ -110,6 +114,7 @@ func TestKataAgentSendReq(t *testing.T) {
 
 	url, err := mock.GenerateKataMockHybridVSock()
 	assert.NoError(err)
+	defer mock.RemoveKataMockHybridVSock(url)
 
 	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
 	err = hybridVSockTTRPCMock.Start(url)
@@ -123,8 +128,10 @@ func TestKataAgentSendReq(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
+
 	for _, req := range reqList {
-		_, err = k.sendReq(req)
+		_, err = k.sendReq(ctx, req)
 		assert.Nil(err)
 	}
 
@@ -132,59 +139,56 @@ func TestKataAgentSendReq(t *testing.T) {
 	container := &Container{}
 	execid := "processFooBar"
 
-	err = k.startContainer(sandbox, container)
+	err = k.startContainer(ctx, sandbox, container)
 	assert.Nil(err)
 
-	err = k.signalProcess(container, execid, syscall.SIGKILL, true)
+	err = k.signalProcess(ctx, container, execid, syscall.SIGKILL, true)
 	assert.Nil(err)
 
-	err = k.winsizeProcess(container, execid, 100, 200)
+	err = k.winsizeProcess(ctx, container, execid, 100, 200)
 	assert.Nil(err)
 
-	_, err = k.processListContainer(sandbox, Container{}, ProcessListOptions{})
+	err = k.updateContainer(ctx, sandbox, Container{}, specs.LinuxResources{})
 	assert.Nil(err)
 
-	err = k.updateContainer(sandbox, Container{}, specs.LinuxResources{})
+	err = k.pauseContainer(ctx, sandbox, Container{})
 	assert.Nil(err)
 
-	err = k.pauseContainer(sandbox, Container{})
+	err = k.resumeContainer(ctx, sandbox, Container{})
 	assert.Nil(err)
 
-	err = k.resumeContainer(sandbox, Container{})
+	err = k.onlineCPUMem(ctx, 1, true)
 	assert.Nil(err)
 
-	err = k.onlineCPUMem(1, true)
+	_, err = k.statsContainer(ctx, sandbox, Container{})
 	assert.Nil(err)
 
-	_, err = k.statsContainer(sandbox, Container{})
+	err = k.check(ctx)
 	assert.Nil(err)
 
-	err = k.check()
+	_, err = k.waitProcess(ctx, container, execid)
 	assert.Nil(err)
 
-	_, err = k.waitProcess(container, execid)
+	_, err = k.writeProcessStdin(ctx, container, execid, []byte{'c'})
 	assert.Nil(err)
 
-	_, err = k.writeProcessStdin(container, execid, []byte{'c'})
+	err = k.closeProcessStdin(ctx, container, execid)
 	assert.Nil(err)
 
-	err = k.closeProcessStdin(container, execid)
+	_, err = k.readProcessStdout(ctx, container, execid, []byte{})
 	assert.Nil(err)
 
-	_, err = k.readProcessStdout(container, execid, []byte{})
+	_, err = k.readProcessStderr(ctx, container, execid, []byte{})
 	assert.Nil(err)
 
-	_, err = k.readProcessStderr(container, execid, []byte{})
-	assert.Nil(err)
-
-	_, err = k.getOOMEvent()
+	_, err = k.getOOMEvent(ctx)
 	assert.Nil(err)
 }
 
 func TestHandleEphemeralStorage(t *testing.T) {
 	k := kataAgent{}
 	var ociMounts []specs.Mount
-	mountSource := "/tmp/mountPoint"
+	mountSource := t.TempDir()
 
 	mount := specs.Mount{
 		Type:   KataEphemeralDevType,
@@ -192,7 +196,8 @@ func TestHandleEphemeralStorage(t *testing.T) {
 	}
 
 	ociMounts = append(ociMounts, mount)
-	epheStorages := k.handleEphemeralStorage(ociMounts)
+	epheStorages, err := k.handleEphemeralStorage(ociMounts)
+	assert.Nil(t, err)
 
 	epheMountPoint := epheStorages[0].MountPoint
 	expected := filepath.Join(ephemeralPath(), filepath.Base(mountSource))
@@ -203,7 +208,7 @@ func TestHandleEphemeralStorage(t *testing.T) {
 func TestHandleLocalStorage(t *testing.T) {
 	k := kataAgent{}
 	var ociMounts []specs.Mount
-	mountSource := "mountPoint"
+	mountSource := t.TempDir()
 
 	mount := specs.Mount{
 		Type:   KataLocalDevType,
@@ -214,7 +219,7 @@ func TestHandleLocalStorage(t *testing.T) {
 	rootfsSuffix := "rootfs"
 
 	ociMounts = append(ociMounts, mount)
-	localStorages := k.handleLocalStorage(ociMounts, sandboxID, rootfsSuffix)
+	localStorages, _ := k.handleLocalStorage(ociMounts, sandboxID, rootfsSuffix)
 
 	assert.NotNil(t, localStorages)
 	assert.Equal(t, len(localStorages), 1)
@@ -225,8 +230,10 @@ func TestHandleLocalStorage(t *testing.T) {
 }
 
 func TestHandleDeviceBlockVolume(t *testing.T) {
+	var gid = 2000
 	k := kataAgent{}
 
+	// nolint: govet
 	tests := []struct {
 		BlockDeviceDriver string
 		inputMount        Mount
@@ -282,18 +289,6 @@ func TestHandleDeviceBlockVolume(t *testing.T) {
 			},
 		},
 		{
-			BlockDeviceDriver: config.VirtioBlock,
-			inputDev: &drivers.BlockDevice{
-				BlockDrive: &config.BlockDrive{
-					VirtPath: testVirtPath,
-				},
-			},
-			resultVol: &pb.Storage{
-				Driver: kataBlkDevType,
-				Source: testVirtPath,
-			},
-		},
-		{
 			BlockDeviceDriver: config.VirtioMmio,
 			inputDev: &drivers.BlockDevice{
 				BlockDrive: &config.BlockDrive{
@@ -315,6 +310,27 @@ func TestHandleDeviceBlockVolume(t *testing.T) {
 			resultVol: &pb.Storage{
 				Driver: kataSCSIDevType,
 				Source: testSCSIAddr,
+			},
+		},
+		{
+			BlockDeviceDriver: config.VirtioBlock,
+			inputMount: Mount{
+				FSGroup:             &gid,
+				FSGroupChangePolicy: volume.FSGroupChangeOnRootMismatch,
+			},
+			inputDev: &drivers.BlockDevice{
+				BlockDrive: &config.BlockDrive{
+					PCIPath:  testPCIPath,
+					VirtPath: testVirtPath,
+				},
+			},
+			resultVol: &pb.Storage{
+				Driver: kataBlkDevType,
+				Source: testPCIPath.String(),
+				FsGroup: &pb.FSGroup{
+					GroupId:           uint32(gid),
+					GroupChangePolicy: pbTypes.FSGroupChangePolicy_OnRootMismatch,
+				},
 			},
 		},
 	}
@@ -353,11 +369,12 @@ func TestHandleBlockVolume(t *testing.T) {
 	vDestination := "/VhostUserBlk/destination"
 	bDestination := "/DeviceBlock/destination"
 	dDestination := "/DeviceDirectBlock/destination"
-	vPCIPath, err := vcTypes.PciPathFromString("01/02")
+	vPCIPath, err := types.PciPathFromString("01/02")
 	assert.NoError(t, err)
-	bPCIPath, err := vcTypes.PciPathFromString("03/04")
+	bPCIPath, err := types.PciPathFromString("03/04")
 	assert.NoError(t, err)
-	dPCIPath, err := vcTypes.PciPathFromString("04/05")
+	dPCIPath, err := types.PciPathFromString("04/05")
+	assert.NoError(t, err)
 
 	vDev := drivers.NewVhostUserBlkDevice(&config.DeviceInfo{ID: vDevID})
 	bDev := drivers.NewBlockDevice(&config.DeviceInfo{ID: bDevID})
@@ -391,10 +408,10 @@ func TestHandleBlockVolume(t *testing.T) {
 	mounts = append(mounts, vMount, bMount, dMount)
 
 	tmpDir := "/vhost/user/dir"
-	dm := manager.NewDeviceManager(manager.VirtioBlock, true, tmpDir, devices)
+	dm := manager.NewDeviceManager(config.VirtioBlock, true, tmpDir, 0, devices)
 
 	sConfig := SandboxConfig{}
-	sConfig.HypervisorConfig.BlockDeviceDriver = manager.VirtioBlock
+	sConfig.HypervisorConfig.BlockDeviceDriver = config.VirtioBlock
 	sandbox := Sandbox{
 		id:         "100",
 		containers: containers,
@@ -406,24 +423,28 @@ func TestHandleBlockVolume(t *testing.T) {
 	containers[c.id].sandbox = &sandbox
 	containers[c.id].mounts = mounts
 
-	volumeStorages, err := k.handleBlockVolumes(c)
+	vStorage, err := k.createBlkStorageObject(c, vMount)
+	assert.Nil(t, err, "Error while handling block volumes")
+	bStorage, err := k.createBlkStorageObject(c, bMount)
+	assert.Nil(t, err, "Error while handling block volumes")
+	dStorage, err := k.createBlkStorageObject(c, dMount)
 	assert.Nil(t, err, "Error while handling block volumes")
 
-	vStorage := &pb.Storage{
+	vStorageExpected := &pb.Storage{
 		MountPoint: vDestination,
 		Fstype:     "bind",
 		Options:    []string{"bind"},
 		Driver:     kataBlkDevType,
 		Source:     vPCIPath.String(),
 	}
-	bStorage := &pb.Storage{
+	bStorageExpected := &pb.Storage{
 		MountPoint: bDestination,
 		Fstype:     "bind",
 		Options:    []string{"bind"},
 		Driver:     kataBlkDevType,
 		Source:     bPCIPath.String(),
 	}
-	dStorage := &pb.Storage{
+	dStorageExpected := &pb.Storage{
 		MountPoint: dDestination,
 		Fstype:     "ext4",
 		Options:    []string{"ro"},
@@ -431,9 +452,9 @@ func TestHandleBlockVolume(t *testing.T) {
 		Source:     dPCIPath.String(),
 	}
 
-	assert.Equal(t, vStorage, volumeStorages[0], "Error while handle VhostUserBlk type block volume")
-	assert.Equal(t, bStorage, volumeStorages[1], "Error while handle BlockDevice type block volume")
-	assert.Equal(t, dStorage, volumeStorages[2], "Error while handle direct BlockDevice type block volume")
+	assert.Equal(t, vStorage, vStorageExpected, "Error while handle VhostUserBlk type block volume")
+	assert.Equal(t, bStorage, bStorageExpected, "Error while handle BlockDevice type block volume")
+	assert.Equal(t, dStorage, dStorageExpected, "Error while handle direct BlockDevice type block volume")
 }
 
 func TestAppendDevicesEmptyContainerDeviceList(t *testing.T) {
@@ -445,7 +466,7 @@ func TestAppendDevicesEmptyContainerDeviceList(t *testing.T) {
 
 	c := &Container{
 		sandbox: &Sandbox{
-			devManager: manager.NewDeviceManager("virtio-scsi", false, "", nil),
+			devManager: manager.NewDeviceManager("virtio-scsi", false, "", 0, nil),
 		},
 		devices: ctrDevices,
 	}
@@ -478,7 +499,7 @@ func TestAppendDevices(t *testing.T) {
 
 	c := &Container{
 		sandbox: &Sandbox{
-			devManager: manager.NewDeviceManager("virtio-blk", false, "", ctrDevices),
+			devManager: manager.NewDeviceManager("virtio-blk", false, "", 0, ctrDevices),
 			config:     sandboxConfig,
 		},
 	}
@@ -526,7 +547,7 @@ func TestAppendVhostUserBlkDevices(t *testing.T) {
 	testVhostUserStorePath := "/test/vhost/user/store/path"
 	c := &Container{
 		sandbox: &Sandbox{
-			devManager: manager.NewDeviceManager("virtio-blk", true, testVhostUserStorePath, ctrDevices),
+			devManager: manager.NewDeviceManager("virtio-blk", true, testVhostUserStorePath, 0, ctrDevices),
 			config:     sandboxConfig,
 		},
 	}
@@ -549,9 +570,9 @@ func TestAppendVhostUserBlkDevices(t *testing.T) {
 		updatedDevList, expected)
 }
 
-func TestConstraintGRPCSpec(t *testing.T) {
+func TestConstrainGRPCSpec(t *testing.T) {
 	assert := assert.New(t)
-	expectedCgroupPath := "/foo/bar"
+	expectedCgroupPath := "system.slice:foo:bar"
 
 	g := &pb.Spec{
 		Hooks: &pb.Hooks{},
@@ -562,11 +583,11 @@ func TestConstraintGRPCSpec(t *testing.T) {
 			Seccomp: &pb.LinuxSeccomp{},
 			Namespaces: []pb.LinuxNamespace{
 				{
-					Type: specs.NetworkNamespace,
+					Type: string(specs.NetworkNamespace),
 					Path: "/abc/123",
 				},
 				{
-					Type: specs.MountNamespace,
+					Type: string(specs.MountNamespace),
 					Path: "/abc/123",
 				},
 			},
@@ -597,31 +618,31 @@ func TestConstraintGRPCSpec(t *testing.T) {
 	}
 
 	k := kataAgent{}
-	k.constraintGRPCSpec(g, true)
+	k.constrainGRPCSpec(g, true, true, "", true)
 
-	// check nil fields
+	// Check nil fields
 	assert.Nil(g.Hooks)
 	assert.NotNil(g.Linux.Seccomp)
 	assert.Nil(g.Linux.Resources.Devices)
 	assert.NotNil(g.Linux.Resources.Memory)
 	assert.Nil(g.Linux.Resources.Pids)
 	assert.Nil(g.Linux.Resources.BlockIO)
-	assert.Nil(g.Linux.Resources.HugepageLimits)
+	assert.Len(g.Linux.Resources.HugepageLimits, 0)
 	assert.Nil(g.Linux.Resources.Network)
 	assert.NotNil(g.Linux.Resources.CPU)
 	assert.Equal(g.Process.SelinuxLabel, "")
 
-	// check namespaces
+	// Check namespaces
 	assert.Len(g.Linux.Namespaces, 1)
 	assert.Empty(g.Linux.Namespaces[0].Path)
 
-	// check mounts
+	// Check mounts
 	assert.Len(g.Mounts, 1)
 
-	// check cgroup path
+	// Check cgroup path
 	assert.Equal(expectedCgroupPath, g.Linux.CgroupsPath)
 
-	// check Linux devices
+	// Check Linux devices
 	assert.Empty(g.Linux.Devices)
 }
 
@@ -662,7 +683,7 @@ func TestHandleShm(t *testing.T) {
 	// In case the type of mount is ephemeral, the container mount is not
 	// shared with the sandbox shm.
 	ociMounts[0].Type = KataEphemeralDevType
-	mountSource := "/tmp/mountPoint"
+	mountSource := t.TempDir()
 	ociMounts[0].Source = mountSource
 	k.handleShm(ociMounts, sandbox)
 
@@ -670,7 +691,9 @@ func TestHandleShm(t *testing.T) {
 	assert.Equal(ociMounts[0].Type, KataEphemeralDevType)
 	assert.NotEmpty(ociMounts[0].Source, mountSource)
 
-	epheStorages := k.handleEphemeralStorage(ociMounts)
+	epheStorages, err := k.handleEphemeralStorage(ociMounts)
+	assert.Nil(err)
+
 	epheMountPoint := epheStorages[0].MountPoint
 	expected := filepath.Join(ephemeralPath(), filepath.Base(mountSource))
 	assert.Equal(epheMountPoint, expected,
@@ -695,11 +718,11 @@ func TestHandlePidNamespace(t *testing.T) {
 		Linux: &pb.Linux{
 			Namespaces: []pb.LinuxNamespace{
 				{
-					Type: specs.NetworkNamespace,
+					Type: string(specs.NetworkNamespace),
 					Path: "/abc/123",
 				},
 				{
-					Type: specs.MountNamespace,
+					Type: string(specs.MountNamespace),
 					Path: "/abc/123",
 				},
 			},
@@ -720,7 +743,7 @@ func TestHandlePidNamespace(t *testing.T) {
 	}
 
 	utsNs := pb.LinuxNamespace{
-		Type: specs.UTSNamespace,
+		Type: string(specs.UTSNamespace),
 		Path: "",
 	}
 
@@ -745,23 +768,22 @@ func TestHandlePidNamespace(t *testing.T) {
 func TestAgentConfigure(t *testing.T) {
 	assert := assert.New(t)
 
-	dir, err := ioutil.TempDir("", "kata-agent-test")
-	assert.Nil(err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	k := &kataAgent{}
 	h := &mockHypervisor{}
 	c := KataAgentConfig{}
 	id := "foobar"
+	ctx := context.Background()
 
-	err = k.configure(h, id, dir, c)
+	err := k.configure(ctx, h, id, dir, c)
 	assert.Nil(err)
 
-	err = k.configure(h, id, dir, c)
+	err = k.configure(ctx, h, id, dir, c)
 	assert.Nil(err)
 	assert.Empty(k.state.URL)
 
-	err = k.configure(h, id, dir, c)
+	err = k.configure(ctx, h, id, dir, c)
 	assert.Nil(err)
 }
 
@@ -824,12 +846,17 @@ func TestAgentCreateContainer(t *testing.T) {
 			},
 		},
 		hypervisor: &mockHypervisor{},
+		agent:      newMockAgent(),
 	}
 
-	newStore, err := persist.GetDriver()
+	fsShare, err := NewFilesystemShare(sandbox)
+	assert.Nil(err)
+	sandbox.fsShare = fsShare
+
+	store, err := persist.GetDriver()
 	assert.NoError(err)
-	assert.NotNil(newStore)
-	sandbox.newStore = newStore
+	assert.NotNil(store)
+	sandbox.store = store
 
 	container := &Container{
 		ctx:       sandbox.ctx,
@@ -847,6 +874,7 @@ func TestAgentCreateContainer(t *testing.T) {
 
 	url, err := mock.GenerateKataMockHybridVSock()
 	assert.NoError(err)
+	defer mock.RemoveKataMockHybridVSock(url)
 
 	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
 	err = hybridVSockTTRPCMock.Start(url)
@@ -860,15 +888,13 @@ func TestAgentCreateContainer(t *testing.T) {
 		},
 	}
 
-	dir, err := ioutil.TempDir("", "kata-agent-test")
-	assert.Nil(err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
-	err = k.configure(&mockHypervisor{}, sandbox.id, dir, KataAgentConfig{})
+	err = k.configure(context.Background(), &mockHypervisor{}, sandbox.id, dir, KataAgentConfig{})
 	assert.Nil(err)
 
 	// We'll fail on container metadata file creation, but it helps increasing coverage...
-	_, err = k.createContainer(sandbox, container)
+	_, err = k.createContainer(context.Background(), sandbox, container)
 	assert.Error(err)
 }
 
@@ -877,6 +903,7 @@ func TestAgentNetworkOperation(t *testing.T) {
 
 	url, err := mock.GenerateKataMockHybridVSock()
 	assert.NoError(err)
+	defer mock.RemoveKataMockHybridVSock(url)
 
 	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
 	err = hybridVSockTTRPCMock.Start(url)
@@ -890,16 +917,16 @@ func TestAgentNetworkOperation(t *testing.T) {
 		},
 	}
 
-	_, err = k.updateInterface(nil)
+	_, err = k.updateInterface(k.ctx, nil)
 	assert.Nil(err)
 
-	_, err = k.listInterfaces()
+	_, err = k.listInterfaces(k.ctx)
 	assert.Nil(err)
 
-	_, err = k.updateRoutes([]*pbTypes.Route{})
+	_, err = k.updateRoutes(k.ctx, []*pbTypes.Route{})
 	assert.Nil(err)
 
-	_, err = k.listRoutes()
+	_, err = k.listRoutes(k.ctx)
 	assert.Nil(err)
 }
 
@@ -925,6 +952,7 @@ func TestKataCopyFile(t *testing.T) {
 
 	url, err := mock.GenerateKataMockHybridVSock()
 	assert.NoError(err)
+	defer mock.RemoveKataMockHybridVSock(url)
 
 	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
 	err = hybridVSockTTRPCMock.Start(url)
@@ -938,10 +966,10 @@ func TestKataCopyFile(t *testing.T) {
 		},
 	}
 
-	err = k.copyFile("/abc/xyz/123", "/tmp")
+	err = k.copyFile(context.Background(), "/abc/xyz/123", "/tmp")
 	assert.Error(err)
 
-	src, err := ioutil.TempFile("", "src")
+	src, err := os.CreateTemp("", "src")
 	assert.NoError(err)
 	defer os.Remove(src.Name())
 
@@ -950,7 +978,7 @@ func TestKataCopyFile(t *testing.T) {
 	assert.NoError(err)
 	assert.NoError(src.Close())
 
-	dst, err := ioutil.TempFile("", "dst")
+	dst, err := os.CreateTemp("", "dst")
 	assert.NoError(err)
 	assert.NoError(dst.Close())
 	defer os.Remove(dst.Name())
@@ -961,7 +989,7 @@ func TestKataCopyFile(t *testing.T) {
 		grpcMaxDataSize = orgGrpcMaxDataSize
 	}()
 
-	err = k.copyFile(src.Name(), dst.Name())
+	err = k.copyFile(context.Background(), src.Name(), dst.Name())
 	assert.NoError(err)
 }
 
@@ -970,8 +998,7 @@ func TestKataCleanupSandbox(t *testing.T) {
 
 	kataHostSharedDirSaved := kataHostSharedDir
 	kataHostSharedDir = func() string {
-		td, _ := ioutil.TempDir("", "kata-cleanup")
-		return td
+		return t.TempDir()
 	}
 	defer func() {
 		kataHostSharedDir = kataHostSharedDirSaved
@@ -982,12 +1009,11 @@ func TestKataCleanupSandbox(t *testing.T) {
 	}
 
 	dir := kataHostSharedDir()
-	defer os.RemoveAll(dir)
 	err := os.MkdirAll(path.Join(dir, s.id), 0777)
 	assert.Nil(err)
 
 	k := &kataAgent{ctx: context.Background()}
-	k.cleanup(&s)
+	k.cleanup(context.Background())
 
 	_, err = os.Stat(dir)
 	assert.False(os.IsExist(err))
@@ -996,79 +1022,48 @@ func TestKataCleanupSandbox(t *testing.T) {
 func TestKataAgentKernelParams(t *testing.T) {
 	assert := assert.New(t)
 
+	// nolint: govet
 	type testData struct {
 		debug             bool
 		trace             bool
 		containerPipeSize uint32
-		traceMode         string
-		traceType         string
 		expectedParams    []Param
 	}
 
 	debugParam := Param{Key: "agent.log", Value: "debug"}
-
-	traceIsolatedParam := Param{Key: "agent.trace", Value: "isolated"}
-	traceCollatedParam := Param{Key: "agent.trace", Value: "collated"}
-
-	traceFooParam := Param{Key: "agent.trace", Value: "foo"}
+	traceParam := Param{Key: "agent.trace", Value: "true"}
 
 	containerPipeSizeParam := Param{Key: vcAnnotations.ContainerPipeSizeKernelParam, Value: "2097152"}
 
 	data := []testData{
-		{false, false, 0, "", "", []Param{}},
-		{true, false, 0, "", "", []Param{debugParam}},
+		{false, false, 0, []Param{}},
 
-		{false, false, 0, "foo", "", []Param{}},
-		{false, false, 0, "foo", "", []Param{}},
-		{false, false, 0, "", "foo", []Param{}},
-		{false, false, 0, "", "foo", []Param{}},
-		{false, false, 0, "foo", "foo", []Param{}},
-		{false, true, 0, "foo", "foo", []Param{}},
+		// Debug
+		{true, false, 0, []Param{debugParam}},
 
-		{false, false, 0, agentTraceModeDynamic, "", []Param{}},
-		{false, false, 0, agentTraceModeStatic, "", []Param{}},
-		{false, false, 0, "", agentTraceTypeIsolated, []Param{}},
-		{false, false, 0, "", agentTraceTypeCollated, []Param{}},
-		{false, false, 0, "foo", agentTraceTypeIsolated, []Param{}},
-		{false, false, 0, "foo", agentTraceTypeCollated, []Param{}},
+		// Tracing
+		{false, true, 0, []Param{traceParam}},
 
-		{false, false, 0, agentTraceModeDynamic, agentTraceTypeIsolated, []Param{}},
-		{false, false, 0, agentTraceModeDynamic, agentTraceTypeCollated, []Param{}},
+		// Debug + Tracing
+		{true, true, 0, []Param{debugParam, traceParam}},
 
-		{false, false, 0, agentTraceModeStatic, agentTraceTypeCollated, []Param{}},
-		{false, false, 0, agentTraceModeStatic, agentTraceTypeCollated, []Param{}},
+		// pipesize
+		{false, false, 2097152, []Param{containerPipeSizeParam}},
 
-		{false, true, 0, agentTraceModeDynamic, agentTraceTypeIsolated, []Param{}},
-		{false, true, 0, agentTraceModeDynamic, agentTraceTypeCollated, []Param{}},
-		{true, true, 0, agentTraceModeDynamic, agentTraceTypeCollated, []Param{debugParam}},
+		// Debug + pipesize
+		{true, false, 2097152, []Param{debugParam, containerPipeSizeParam}},
 
-		{false, true, 0, "", agentTraceTypeIsolated, []Param{}},
-		{false, true, 0, "", agentTraceTypeCollated, []Param{}},
-		{true, true, 0, "", agentTraceTypeIsolated, []Param{debugParam}},
-		{true, true, 0, "", agentTraceTypeCollated, []Param{debugParam}},
-		{false, true, 0, "foo", agentTraceTypeIsolated, []Param{}},
-		{false, true, 0, "foo", agentTraceTypeCollated, []Param{}},
-		{true, true, 0, "foo", agentTraceTypeIsolated, []Param{debugParam}},
-		{true, true, 0, "foo", agentTraceTypeCollated, []Param{debugParam}},
+		// Tracing + pipesize
+		{false, true, 2097152, []Param{traceParam, containerPipeSizeParam}},
 
-		{false, true, 0, agentTraceModeStatic, agentTraceTypeIsolated, []Param{traceIsolatedParam}},
-		{false, true, 0, agentTraceModeStatic, agentTraceTypeCollated, []Param{traceCollatedParam}},
-		{true, true, 0, agentTraceModeStatic, agentTraceTypeIsolated, []Param{traceIsolatedParam, debugParam}},
-		{true, true, 0, agentTraceModeStatic, agentTraceTypeCollated, []Param{traceCollatedParam, debugParam}},
-
-		{false, true, 0, agentTraceModeStatic, "foo", []Param{traceFooParam}},
-		{true, true, 0, agentTraceModeStatic, "foo", []Param{debugParam, traceFooParam}},
-
-		{false, false, 0, "", "", []Param{}},
-		{false, false, 2097152, "", "", []Param{containerPipeSizeParam}},
+		// Debug + Tracing + pipesize
+		{true, true, 2097152, []Param{debugParam, traceParam, containerPipeSizeParam}},
 	}
 
 	for i, d := range data {
 		config := KataAgentConfig{
 			Debug:             d.debug,
 			Trace:             d.trace,
-			TraceMode:         d.traceMode,
-			TraceType:         d.traceType,
 			ContainerPipeSize: d.containerPipeSize,
 		}
 
@@ -1093,25 +1088,20 @@ func TestKataAgentHandleTraceSettings(t *testing.T) {
 	assert := assert.New(t)
 
 	type testData struct {
-		traceMode               string
 		trace                   bool
 		expectDisableVMShutdown bool
-		expectDynamicTracing    bool
 	}
 
 	data := []testData{
-		{"", false, false, false},
-		{"", true, false, false},
-		{agentTraceModeStatic, true, true, false},
-		{agentTraceModeDynamic, true, false, true},
+		{false, false},
+		{true, true},
 	}
 
 	for i, d := range data {
 		k := &kataAgent{}
 
 		config := KataAgentConfig{
-			Trace:     d.trace,
-			TraceMode: d.traceMode,
+			Trace: d.trace,
 		}
 
 		disableVMShutdown := k.handleTraceSettings(config)
@@ -1120,78 +1110,6 @@ func TestKataAgentHandleTraceSettings(t *testing.T) {
 			assert.Truef(disableVMShutdown, "test %d (%+v)", i, d)
 		} else {
 			assert.Falsef(disableVMShutdown, "test %d (%+v)", i, d)
-		}
-
-		if d.expectDynamicTracing {
-			assert.Truef(k.dynamicTracing, "test %d (%+v)", i, d)
-		} else {
-			assert.Falsef(k.dynamicTracing, "test %d (%+v)", i, d)
-		}
-	}
-}
-
-func TestKataAgentSetDefaultTraceConfigOptions(t *testing.T) {
-	assert := assert.New(t)
-
-	type testData struct {
-		traceMode              string
-		traceType              string
-		trace                  bool
-		expectDefaultTraceMode bool
-		expectDefaultTraceType bool
-		expectError            bool
-	}
-
-	data := []testData{
-		{"", "", false, false, false, false},
-		{agentTraceModeDynamic, agentTraceTypeCollated, false, false, false, false},
-		{agentTraceModeDynamic, agentTraceTypeIsolated, false, false, false, false},
-		{agentTraceModeStatic, agentTraceTypeCollated, false, false, false, false},
-		{agentTraceModeStatic, agentTraceTypeIsolated, false, false, false, false},
-
-		{agentTraceModeDynamic, agentTraceTypeCollated, true, false, false, false},
-		{agentTraceModeDynamic, agentTraceTypeIsolated, true, false, false, false},
-
-		{agentTraceModeStatic, agentTraceTypeCollated, true, false, false, false},
-		{agentTraceModeStatic, agentTraceTypeIsolated, true, false, false, false},
-
-		{agentTraceModeDynamic, "", true, false, true, false},
-		{agentTraceModeDynamic, "invalid", true, false, false, true},
-
-		{agentTraceModeStatic, "", true, false, true, false},
-		{agentTraceModeStatic, "invalid", true, false, false, true},
-
-		{"", agentTraceTypeIsolated, true, true, false, false},
-		{"invalid", agentTraceTypeIsolated, true, false, false, true},
-
-		{"", agentTraceTypeCollated, true, true, false, false},
-		{"invalid", agentTraceTypeCollated, true, false, false, true},
-
-		{"", "", true, true, true, false},
-		{"invalid", "invalid", true, false, false, true},
-	}
-
-	for i, d := range data {
-		config := &KataAgentConfig{
-			Trace:     d.trace,
-			TraceMode: d.traceMode,
-			TraceType: d.traceType,
-		}
-
-		err := KataAgentSetDefaultTraceConfigOptions(config)
-		if d.expectError {
-			assert.Error(err, "test %d (%+v)", i, d)
-			continue
-		} else {
-			assert.NoError(err, "test %d (%+v)", i, d)
-		}
-
-		if d.expectDefaultTraceMode {
-			assert.Equalf(config.TraceMode, defaultAgentTraceMode, "test %d (%+v)", i, d)
-		}
-
-		if d.expectDefaultTraceType {
-			assert.Equalf(config.TraceType, defaultAgentTraceType, "test %d (%+v)", i, d)
 		}
 	}
 }
@@ -1208,16 +1126,25 @@ func TestKataAgentDirs(t *testing.T) {
 	uidmap := strings.Fields(string(line))
 	expectedRootless := (uidmap[0] == "0" && uidmap[1] != "0")
 	assert.Equal(expectedRootless, rootless.IsRootless())
-
 	if expectedRootless {
 		assert.Equal(kataHostSharedDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataHostSharedDir)
 		assert.Equal(kataGuestSharedDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestSharedDir)
 		assert.Equal(kataGuestSandboxDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestSandboxDir)
 		assert.Equal(ephemeralPath(), os.Getenv("XDG_RUNTIME_DIR")+defaultEphemeralPath)
+		assert.Equal(kataGuestNydusRootDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestNydusRootDir)
+		assert.Equal(kataGuestNydusImageDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestNydusRootDir+"images"+"/")
+		assert.Equal(kataGuestSharedDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestNydusRootDir+"containers"+"/")
 	} else {
 		assert.Equal(kataHostSharedDir(), defaultKataHostSharedDir)
 		assert.Equal(kataGuestSharedDir(), defaultKataGuestSharedDir)
 		assert.Equal(kataGuestSandboxDir(), defaultKataGuestSandboxDir)
 		assert.Equal(ephemeralPath(), defaultEphemeralPath)
+		assert.Equal(kataGuestNydusRootDir(), defaultKataGuestNydusRootDir)
+		assert.Equal(kataGuestNydusImageDir(), defaultKataGuestNydusRootDir+"rafs"+"/")
+		assert.Equal(kataGuestSharedDir(), defaultKataGuestNydusRootDir+"containers"+"/")
 	}
+
+	cid := "123"
+	expected := "/rafs/123/lowerdir"
+	assert.Equal(rafsMountPath(cid), expected)
 }

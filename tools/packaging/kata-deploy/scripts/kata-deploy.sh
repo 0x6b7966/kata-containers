@@ -8,16 +8,15 @@ set -o errexit
 set -o pipefail
 set -o nounset
 
-crio_conf_file="/etc/crio/crio.conf"
-crio_conf_file_backup="${crio_conf_file}.bak"
+crio_drop_in_conf_dir="/etc/crio/crio.conf.d/"
+crio_drop_in_conf_file="${crio_drop_in_conf_dir}/99-kata-deploy"
+crio_drop_in_conf_file_debug="${crio_drop_in_conf_dir}/100-debug"
 containerd_conf_file="/etc/containerd/config.toml"
 containerd_conf_file_backup="${containerd_conf_file}.bak"
 
-shims=(
-	"fc"
-	"qemu"
-	"clh"
-)
+IFS=' ' read -a shims <<< "$SHIMS"
+
+default_shim="$DEFAULT_SHIM"
 
 # If we fail for any reason a message will be displayed
 die() {
@@ -26,8 +25,47 @@ die() {
         exit 1
 }
 
+function host_systemctl() {
+	nsenter --target 1 --mount systemctl "${@}"
+}
+
 function print_usage() {
 	echo "Usage: $0 [install/cleanup/reset]"
+}
+
+function create_runtimeclasses() {
+	echo "Creating the runtime classes"
+
+	for shim in "${shims[@]}"; do
+		echo "Creating the kata-${shim} runtime class"
+		kubectl apply -f /opt/kata-artifacts/runtimeclasses/kata-${shim}.yaml
+	done
+
+	if [[ "${CREATE_DEFAULT_RUNTIMECLASS}" == "true" ]]; then
+		echo "Creating the kata runtime class for the default shim (an alias for kata-${default_shim})"
+		cp /opt/kata-artifacts/runtimeclasses/kata-${default_shim}.yaml /tmp/kata.yaml
+		sed -i -e 's/kata-'${default_shim}'/kata/g' /tmp/kata.yaml
+		kubectl apply -f /tmp/kata.yaml
+		rm -f /tmp/kata.yaml
+	fi
+}
+
+function delete_runtimeclasses() {
+	echo "Deleting the runtime classes"
+
+	for shim in "${shims[@]}"; do
+		echo "Deleting the kata-${shim} runtime class"
+		kubectl delete -f /opt/kata-artifacts/runtimeclasses/kata-${shim}.yaml
+	done
+
+
+	if [[ "${CREATE_DEFAULT_RUNTIMECLASS}" == "true" ]]; then
+		echo "Deleting the kata runtime class for the default shim (an alias for kata-${default_shim})"
+		cp /opt/kata-artifacts/runtimeclasses/kata-${default_shim}.yaml /tmp/kata.yaml
+		sed -i -e 's/kata-'${default_shim}'/kata/g' /tmp/kata.yaml
+		kubectl delete -f /tmp/kata.yaml
+		rm -f /tmp/kata.yaml
+	fi
 }
 
 function get_container_runtime() {
@@ -37,7 +75,11 @@ function get_container_runtime() {
                 die "invalid node name"
 	fi
 	if echo "$runtime" | grep -qE 'containerd.*-k3s'; then
-		if systemctl is-active --quiet k3s-agent; then
+		if host_systemctl is-active --quiet rke2-agent; then
+			echo "rke2-agent"
+		elif host_systemctl is-active --quiet rke2-server; then
+			echo "rke2-server"
+		elif host_systemctl is-active --quiet k3s-agent; then
 			echo "k3s-agent"
 		else
 			echo "k3s"
@@ -49,8 +91,42 @@ function get_container_runtime() {
 
 function install_artifacts() {
 	echo "copying kata artifacts onto host"
-	cp -a /opt/kata-artifacts/opt/kata/* /opt/kata/
+	cp -au /opt/kata-artifacts/opt/kata/* /opt/kata/
 	chmod +x /opt/kata/bin/*
+	[ -d /opt/kata/runtime-rs/bin ] && \
+		chmod +x /opt/kata/runtime-rs/bin/*
+
+	# Allow enabling debug for Kata Containers
+	if [[ "${DEBUG}" == "true" ]]; then
+		config_path="/opt/kata/share/defaults/kata-containers/"
+		for shim in "${shims[@]}"; do
+			sed -i -e 's/^#\(enable_debug\).*=.*$/\1 = true/g' "${config_path}/configuration-${shim}.toml"
+			sed -i -e 's/^#\(debug_console_enabled\).*=.*$/\1 = true/g' "${config_path}/configuration-${shim}.toml"
+			sed -i -e 's/^kernel_params = "\(.*\)"/kernel_params = "\1 agent.log=debug initcall_debug"/g' "${config_path}/configuration-${shim}.toml"
+		done
+	fi
+
+	# Allow Mariner to use custom configuration.
+	if [ "${HOST_OS:-}" == "cbl-mariner" ]; then
+		config_path="/opt/kata/share/defaults/kata-containers/configuration-clh.toml"
+		clh_path="/opt/kata/bin/cloud-hypervisor-glibc"
+		sed -i -E 's|(enable_annotations) = .+|\1 = ["enable_iommu", "initrd", "kernel"]|' "${config_path}"
+		sed -i -E "s|(valid_hypervisor_paths) = .+|\1 = [\"${clh_path}\"]|" "${config_path}"
+		sed -i -E "s|(path) = \".+/cloud-hypervisor\"|\1 = \"${clh_path}\"|" "${config_path}"
+	fi
+
+	if [[ "${CREATE_RUNTIMECLASSES}" == "true" ]]; then
+		create_runtimeclasses
+	fi
+}
+
+function wait_till_node_is_ready() {
+	local ready="False"
+
+	while ! [[ "${ready}" == "True" ]]; do
+		sleep 2s
+		ready=$(kubectl get node $NODE_NAME -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+	done
 }
 
 function configure_cri_runtime() {
@@ -60,12 +136,28 @@ function configure_cri_runtime() {
 	crio)
 		configure_crio
 		;;
-	containerd | k3s | k3s-agent)
+	containerd | k3s | k3s-agent | rke2-agent | rke2-server)
 		configure_containerd
 		;;
 	esac
-	systemctl daemon-reload
-	systemctl restart "$1"
+	host_systemctl daemon-reload
+	host_systemctl restart "$1"
+
+	wait_till_node_is_ready
+}
+
+function backup_shim() {
+	local shim_file="$1"
+	local shim_backup="${shim_file}.bak"
+
+	if [ -f "${shim_file}" ]; then
+		echo "warning: ${shim_file} already exists" >&2
+		if [ ! -f "${shim_backup}" ]; then
+			mv "${shim_file}" "${shim_backup}"
+		else
+			rm "${shim_file}"
+		fi
+	fi
 }
 
 function configure_different_shims_base() {
@@ -76,84 +168,107 @@ function configure_different_shims_base() {
 	#   https://github.com/containerd/containerd/issues/3073
 	#   https://github.com/containerd/containerd/issues/5006
 
+	local default_shim_file="/usr/local/bin/containerd-shim-kata-v2"
+
 	mkdir -p /usr/local/bin
 
 	for shim in "${shims[@]}"; do
 		local shim_binary="containerd-shim-kata-${shim}-v2"
 		local shim_file="/usr/local/bin/${shim_binary}"
-		local shim_backup="/usr/local/bin/${shim_binary}.bak"
 
-		if [ -f "${shim_file}" ]; then
-			echo "warning: ${shim_binary} already exists" >&2
-			if [ ! -f "${shim_backup}" ]; then
-				mv "${shim_file}" "${shim_backup}"
-			else
-				rm "${shim_file}"
-			fi
+		backup_shim "${shim_file}"
+
+		if [[ "${shim}" == "dragonball" ]]; then
+			ln -sf /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 "${shim_file}"
+		else
+			ln -sf /opt/kata/bin/containerd-shim-kata-v2 "${shim_file}"
 		fi
-
-		cat << EOT | tee "$shim_file"
-#!/bin/bash
-KATA_CONF_FILE=/opt/kata/share/defaults/kata-containers/configuration-${shim}.toml /opt/kata/bin/containerd-shim-kata-v2 "\$@"
-EOT
 		chmod +x "$shim_file"
+
+		if [ "${shim}" == "${default_shim}" ]; then
+			backup_shim "${default_shim_file}"
+
+			echo "Creating the default shim-v2 binary"
+			ln -sf "${shim_file}" "${default_shim_file}"
+		fi
 	done
 }
 
+function restore_shim() {
+	local shim_file="$1"
+	local shim_backup="${shim_file}.bak"
+
+	if [ -f "${shim_backup}" ]; then
+		mv "$shim_backup" "$shim_file"
+	fi
+}
+
 function cleanup_different_shims_base() {
+	local default_shim_file="/usr/local/bin/containerd-shim-kata-v2"
+
 	for shim in "${shims[@]}"; do
 		local shim_binary="containerd-shim-kata-${shim}-v2"
 		local shim_file="/usr/local/bin/${shim_binary}"
-		local shim_backup="/usr/local/bin/${shim_binary}.bak"
 
 		rm "${shim_file}" || true
 
-		if [ -f "${shim_backup}" ]; then
-			mv "$shim_backup" "$shim_file"
-		fi
+		restore_shim "${shim_file}"
 	done
+
+	rm "${default_shim_file}" || true
+	restore_shim "${default_shim_file}"
+
+	if [[ "${CREATE_RUNTIMECLASSES}" == "true" ]]; then
+		delete_runtimeclasses
+	fi
 }
 
 function configure_crio_runtime() {
 	local runtime="kata"
+	local configuration="configuration"
 	if [ -n "${1-}" ]; then
 		runtime+="-$1"
+		configuration+="-$1"
 	fi
 
 	local kata_path="/usr/local/bin/containerd-shim-${runtime}-v2"
 	local kata_conf="crio.runtime.runtimes.${runtime}"
+	local kata_config_path="/opt/kata/share/defaults/kata-containers/$configuration.toml"
 
-	if grep -qEe "^\[$kata_conf\]" $crio_conf_file; then
-		echo "Configuration exists $kata_conf, overwriting"
-		sed -i "/\[$kata_conf\]/\[$kata_conf-original\]/" $crio_conf_file
-	fi
-
-	cat <<EOT | tee -a "$crio_conf_file"
+	cat <<EOF | tee -a "$crio_drop_in_conf_file"
 
 # Path to the Kata Containers runtime binary that uses the $1
 [$kata_conf]
 	runtime_path = "${kata_path}"
 	runtime_type = "vm"
 	runtime_root = "/run/vc"
+	runtime_config_path = "${kata_config_path}"
 	privileged_without_host_devices = true
-EOT
+EOF
 }
 
 function configure_crio() {
 	# Configure crio to use Kata:
 	echo "Add Kata Containers as a supported runtime for CRIO:"
 
-	# backup the CRIO.conf only if a backup doesn't already exist (don't override original)
-	cp -n "$crio_conf_file" "$crio_conf_file_backup"
+	# As we don't touch the original configuration file in any way,
+	# let's just ensure we remove any exist configuration from a
+	# previous deployment.
+	mkdir -p "$crio_drop_in_conf_dir"
+	rm -f "$crio_drop_in_conf_file"
+	touch "$crio_drop_in_conf_file"
 
 	for shim in "${shims[@]}"; do
 		configure_crio_runtime $shim
 	done
 
-	# Replace if exists, insert otherwise
-	grep -Fq 'manage_network_ns_lifecycle =' $crio_conf_file \
-		&& sed -i '/manage_network_ns_lifecycle =/c manage_network_ns_lifecycle = true' $crio_conf_file \
-		|| sed -i '/\[crio.runtime\]/a manage_network_ns_lifecycle = true' $crio_conf_file
+
+	if [ "${DEBUG}" == "true" ]; then
+		cat <<EOF | tee -a $crio_drop_in_conf_file_debug
+[crio]
+log_level = "debug"
+EOF
+	fi
 }
 
 function configure_containerd_runtime() {
@@ -175,22 +290,34 @@ function configure_containerd_runtime() {
 		echo "Configuration exists for $runtime_table, overwriting"
 		sed -i "/\[$runtime_table\]/,+1s#runtime_type.*#runtime_type = \"${runtime_type}\"#" $containerd_conf_file
 	else
-		cat <<EOT | tee -a "$containerd_conf_file"
+		cat <<EOF | tee -a "$containerd_conf_file"
 [$runtime_table]
   runtime_type = "${runtime_type}"
   privileged_without_host_devices = true
   pod_annotations = ["io.katacontainers.*"]
-EOT
+EOF
 	fi
 
 	if grep -q "\[$options_table\]" $containerd_conf_file; then
 		echo "Configuration exists for $options_table, overwriting"
 		sed -i "/\[$options_table\]/,+1s#ConfigPath.*#ConfigPath = \"${config_path}\"#" $containerd_conf_file
 	else
-		cat <<EOT | tee -a "$containerd_conf_file"
+		cat <<EOF | tee -a "$containerd_conf_file"
   [$options_table]
     ConfigPath = "${config_path}"
-EOT
+EOF
+	fi
+
+	if [ "${DEBUG}" == "true" ]; then
+		if grep -q "\[debug\]" $containerd_conf_file; then
+			sed -i 's/level.*/level = \"debug\"/' $containerd_conf_file
+		else
+			cat <<EOF | tee -a "$containerd_conf_file"
+[debug]
+  level = "debug"
+EOF
+		fi
+
 	fi
 }
 
@@ -225,7 +352,7 @@ function cleanup_cri_runtime() {
 	crio)
 		cleanup_crio
 		;;
-	containerd | k3s | k3s-agent)
+	containerd | k3s | k3s-agent | rke2-agent | rke2-server)
 		cleanup_containerd
 		;;
 	esac
@@ -233,8 +360,9 @@ function cleanup_cri_runtime() {
 }
 
 function cleanup_crio() {
-	if [ -f "$crio_conf_file_backup" ]; then
-		cp "$crio_conf_file_backup" "$crio_conf_file"
+	rm $crio_drop_in_conf_file
+	if [[ "${DEBUG}" == "true" ]]; then
+		rm $crio_drop_in_conf_file_debug
 	fi
 }
 
@@ -247,14 +375,24 @@ function cleanup_containerd() {
 
 function reset_runtime() {
 	kubectl label node "$NODE_NAME" katacontainers.io/kata-runtime-
-	systemctl daemon-reload
-	systemctl restart "$1"
+	host_systemctl daemon-reload
+	host_systemctl restart "$1"
 	if [ "$1" == "crio" ] || [ "$1" == "containerd" ]; then
-		systemctl restart kubelet
+		host_systemctl restart kubelet
 	fi
+
+	wait_till_node_is_ready
 }
 
 function main() {
+	echo "Environment variables passed to this script"
+	echo "* NODE_NAME: ${NODE_NAME}"
+	echo "* DEBUG: ${DEBUG}"
+	echo "* SHIMS: ${SHIMS}"
+	echo "* DEFAULT_SHIM: ${DEFAULT_SHIM}"
+	echo "* CREATE_RUNTIMECLASSES: ${CREATE_RUNTIMECLASSES}"
+	echo "* CREATE_DEFAULT_RUNTIMECLASS: ${CREATE_DEFAULT_RUNTIMECLASS}"
+
 	# script requires that user is root
 	euid=$(id -u)
 	if [[ $euid -ne 0 ]]; then
@@ -266,7 +404,7 @@ function main() {
 	# CRI-O isn't consistent with the naming -- let's use crio to match the service file
 	if [ "$runtime" == "cri-o" ]; then
 		runtime="crio"
-	elif [ "$runtime" == "k3s" ] || [ "$runtime" == "k3s-agent" ]; then
+	elif [ "$runtime" == "k3s" ] || [ "$runtime" == "k3s-agent" ] || [ "$runtime" == "rke2-agent" ] || [ "$runtime" == "rke2-server" ]; then
 		containerd_conf_tmpl_file="${containerd_conf_file}.tmpl"
 		if [ ! -f "$containerd_conf_tmpl_file" ]; then
 			cp "$containerd_conf_file" "$containerd_conf_tmpl_file"
@@ -274,6 +412,12 @@ function main() {
 
 		containerd_conf_file="${containerd_conf_tmpl_file}"
 		containerd_conf_file_backup="${containerd_conf_file}.bak"
+	else
+		# runtime == containerd
+		if [ ! -f "$containerd_conf_file" ] && [ -d $(dirname "$containerd_conf_file") ] && \
+			[ -x $(command -v containerd) ]; then
+			containerd config default > "$containerd_conf_file"
+		fi
 	fi
 
 	action=${1:-}
@@ -283,11 +427,10 @@ function main() {
 	fi
 
 	# only install / remove / update if we are dealing with CRIO or containerd
-	if [[ "$runtime" =~ ^(crio|containerd|k3s|k3s-agent)$ ]]; then
+	if [[ "$runtime" =~ ^(crio|containerd|k3s|k3s-agent|rke2-agent|rke2-server)$ ]]; then
 
 		case "$action" in
 		install)
-
 			install_artifacts
 			configure_cri_runtime "$runtime"
 			kubectl label node "$NODE_NAME" --overwrite katacontainers.io/kata-runtime=true

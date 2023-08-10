@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 IBM
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -9,7 +11,7 @@ import (
 	"fmt"
 	"testing"
 
-	govmmQemu "github.com/kata-containers/govmm/qemu"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -49,4 +51,60 @@ func TestQemuPPC64leMemoryTopology(t *testing.T) {
 	}
 
 	assert.Equal(expectedMemory, m)
+}
+
+func TestQemuPPC64leAppendProtectionDevice(t *testing.T) {
+	assert := assert.New(t)
+	ppc64le := newTestQemu(assert, QemuPseries)
+
+	var devices []govmmQemu.Device
+	var bios, firmware string
+	var err error
+	devices, bios, err = ppc64le.appendProtectionDevice(devices, firmware, "")
+	assert.NoError(err)
+
+	//no protection
+	assert.Empty(bios)
+
+	//Secure Execution protection
+	ppc64le.(*qemuPPC64le).protection = seProtection
+	devices, bios, err = ppc64le.appendProtectionDevice(devices, firmware, "")
+	assert.Error(err)
+	assert.Empty(bios)
+
+	//SEV protection
+	ppc64le.(*qemuPPC64le).protection = sevProtection
+	devices, bios, err = ppc64le.appendProtectionDevice(devices, firmware, "")
+	assert.Error(err)
+	assert.Empty(bios)
+
+	//SNP protection
+	ppc64le.(*qemuPPC64le).protection = snpProtection
+	devices, bios, err = ppc64le.appendProtectionDevice(devices, firmware, "")
+	assert.Error(err)
+	assert.Empty(bios)
+
+	//TDX protection
+	ppc64le.(*qemuPPC64le).protection = tdxProtection
+	devices, bios, err = ppc64le.appendProtectionDevice(devices, firmware, "")
+	assert.Error(err)
+	assert.Empty(bios)
+
+	//PEF protection
+	ppc64le.(*qemuPPC64le).protection = pefProtection
+	devices, bios, err = ppc64le.appendProtectionDevice(devices, firmware, "")
+	assert.NoError(err)
+	assert.Empty(bios)
+
+	expectedOut := []govmmQemu.Device{
+		govmmQemu.Object{
+			Driver:   govmmQemu.SpaprTPMProxy,
+			Type:     govmmQemu.PEFGuest,
+			ID:       pefID,
+			DeviceID: tpmID,
+			File:     tpmHostPath,
+		},
+	}
+	assert.Equal(expectedOut, devices)
+
 }

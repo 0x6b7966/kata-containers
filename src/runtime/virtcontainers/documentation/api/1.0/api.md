@@ -3,10 +3,6 @@
 The virtcontainers 1.0 API operates on two high level objects:
 [Sandboxes](#sandbox-api) and [containers](#container-api):
 
-* [Sandbox API](#sandbox-api)
-* [Container API](#container-api)
-* [Examples](#examples)
-
 ## Sandbox API
 
 The virtcontainers 1.0 sandbox API manages hardware virtualized
@@ -14,13 +10,10 @@ The virtcontainers 1.0 sandbox API manages hardware virtualized
 semantics strictly follow the
 [Kubernetes](https://kubernetes.io/docs/concepts/workloads/pods/pod-overview/) ones.
 
-The sandbox API allows callers to [create](#createsandbox), [delete](#deletesandbox),
-[start](#startsandbox), [stop](#stopsandbox), [run](#runsandbox), [pause](#pausesandbox),
-[resume](#resumesandbox) and [list](#listsandbox) VM (Virtual Machine) based sandboxes.
+The sandbox API allows callers to [create](#createsandbox) VM (Virtual Machine) based sandboxes.
 
 To initially create a sandbox, the API caller must prepare a
-[`SandboxConfig`](#sandboxconfig) and pass it to either [`CreateSandbox`](#createsandbox)
-or [`RunSandbox`](#runsandbox). Upon successful sandbox creation, the virtcontainers
+[`SandboxConfig`](#sandboxconfig) and pass it to either [`CreateSandbox`](#createsandbox). Upon successful sandbox creation, the virtcontainers
 API will return a [`VCSandbox`](#vcsandbox) interface back to the caller.
 
 The `VCSandbox` interface is a sandbox abstraction hiding the internal and private
@@ -33,12 +26,8 @@ sandbox lifecycle through the rest of the [sandbox API](#sandbox-functions).
 ### Sandbox Structures
 
 * [`SandboxConfig`](#sandboxconfig)
-  * [`Resources`](#resources)
   * [`HypervisorType`](#hypervisortype)
   * [`HypervisorConfig`](#hypervisorconfig)
-  * [`ProxyType`](#proxytype)
-  * [`ProxyConfig`](#proxyconfig)
-  * [`ShimType`](#shimtype)
   * [`NetworkConfig`](#networkconfig)
     * [`NetInterworkingModel`](#netinterworkingmodel)
   * [`Volume`](#volume)
@@ -56,47 +45,48 @@ type SandboxConfig struct {
 
 	Hostname string
 
-	// Field specific to OCI specs, needed to setup all the hooks
-	Hooks Hooks
-
-	// VMConfig is the VM configuration to set for this sandbox.
-	VMConfig Resources
-
 	HypervisorType   HypervisorType
+
 	HypervisorConfig HypervisorConfig
 
-	AgentConfig interface{}
-
-	ProxyType   ProxyType
-	ProxyConfig ProxyConfig
-
-	ShimType   ShimType
-	ShimConfig interface{}
+	AgentConfig KataAgentConfig
 
 	NetworkConfig NetworkConfig
 
 	// Volumes is a list of shared volumes between the host and the Sandbox.
-	Volumes []Volume
+	Volumes []types.Volume
 
 	// Containers describe the list of containers within a Sandbox.
 	// This list can be empty and populated by adding containers
 	// to the Sandbox a posteriori.
 	Containers []ContainerConfig
 
+	// SandboxBindMounts - list of paths to mount into guest
+	SandboxBindMounts []string
+
+	// Experimental features enabled
+	Experimental []exp.Feature
+
+	// Cgroups specifies specific cgroup settings for the various subsystems that the container is
+	// placed into to limit the resources the container has available
+	Cgroups *configs.Cgroup
+
 	// Annotations keys must be unique strings and must be name-spaced
 	// with e.g. reverse domain notation (org.clearlinux.key).
 	Annotations map[string]string
-}
-```
-##### `Resources`
-```Go
-// Resources describes VM resources configuration.
-type Resources struct {
-	// VCPUs is the number of available virtual CPUs.
-	VCPUs uint
 
-	// Memory is the amount of available memory in MiB.
-	Memory uint
+	ShmSize uint64
+
+	// SharePidNs sets all containers to share the same sandbox level pid namespace.
+	SharePidNs bool
+
+	// SystemdCgroup enables systemd cgroup support
+	SystemdCgroup bool
+
+	// SandboxCgroupOnly enables cgroup only at podlevel in the host
+	SandboxCgroupOnly bool
+
+	DisableGuestSeccomp bool
 }
 ```
 
@@ -106,8 +96,17 @@ type Resources struct {
 type HypervisorType string
 
 const (
+	// FirecrackerHypervisor is the FC hypervisor.
+	FirecrackerHypervisor HypervisorType = "firecracker"
+
 	// QemuHypervisor is the QEMU hypervisor.
 	QemuHypervisor HypervisorType = "qemu"
+
+	// AcrnHypervisor is the ACRN hypervisor.
+	AcrnHypervisor HypervisorType = "acrn"
+
+	// ClhHypervisor is the ICH hypervisor.
+	ClhHypervisor HypervisorType = "clh"
 
 	// MockHypervisor is a mock hypervisor for testing purposes
 	MockHypervisor HypervisorType = "mock"
@@ -118,11 +117,46 @@ const (
 ```Go
 // HypervisorConfig is the hypervisor configuration.
 type HypervisorConfig struct {
+	// NumVCPUs specifies default number of vCPUs for the VM.
+	NumVCPUs uint32
+
+	//DefaultMaxVCPUs specifies the maximum number of vCPUs for the VM.
+	DefaultMaxVCPUs uint32
+
+	// DefaultMem specifies default memory size in MiB for the VM.
+	MemorySize uint32
+
+	// DefaultBridges specifies default number of bridges for the VM.
+	// Bridges can be used to hot plug devices
+	DefaultBridges uint32
+
+	// Msize9p is used as the msize for 9p shares
+	Msize9p uint32
+
+	// MemSlots specifies default memory slots the VM.
+	MemSlots uint32
+
+	// MemOffset specifies memory space for nvdimm device
+	MemOffset uint32
+
+	// VirtioFSCacheSize is the DAX cache size in MiB
+	VirtioFSCacheSize uint32
+
+	// KernelParams are additional guest kernel parameters.
+	KernelParams []Param
+
+	// HypervisorParams are additional hypervisor parameters.
+	HypervisorParams []Param
+
 	// KernelPath is the guest kernel host path.
 	KernelPath string
 
 	// ImagePath is the guest image host path.
 	ImagePath string
+
+	// InitrdPath is the guest initrd image host path.
+	// ImagePath and InitrdPath cannot be set at the same time.
+	InitrdPath string
 
 	// FirmwarePath is the bios host path
 	FirmwarePath string
@@ -136,8 +170,43 @@ type HypervisorConfig struct {
 	// HypervisorPath is the hypervisor executable host path.
 	HypervisorPath string
 
-	// DisableBlockDeviceUse disallows a block device from being used.
-	DisableBlockDeviceUse bool
+	// HypervisorPathList is the list of hypervisor paths names allowed in annotations
+	HypervisorPathList []string
+
+	// HypervisorCtlPathList is the list of hypervisor control paths names allowed in annotations
+	HypervisorCtlPathList []string
+
+	// HypervisorCtlPath is the hypervisor ctl executable host path.
+	HypervisorCtlPath string
+
+	// JailerPath is the jailer executable host path.
+	JailerPath string
+
+	// JailerPathList is the list of jailer paths names allowed in annotations
+	JailerPathList []string
+
+	// BlockDeviceDriver specifies the driver to be used for block device
+	// either VirtioSCSI or VirtioBlock with the default driver being defaultBlockDriver
+	BlockDeviceDriver string
+
+	// HypervisorMachineType specifies the type of machine being
+	// emulated.
+	HypervisorMachineType string
+
+	// MemoryPath is the memory file path of VM memory. Used when either BootToBeTemplate or
+	// BootFromTemplate is true.
+	MemoryPath string
+
+	// DevicesStatePath is the VM device state file path. Used when either BootToBeTemplate or
+	// BootFromTemplate is true.
+	DevicesStatePath string
+
+	// EntropySource is the path to a host source of
+	// entropy (/dev/random, /dev/urandom or real hardware RNG device)
+	EntropySource string
+
+	// EntropySourceList is the list of valid entropy sources
+	EntropySourceList []string
 
 	// Shared file system type:
 	//   - virtio-9p (default)
@@ -147,37 +216,51 @@ type HypervisorConfig struct {
 	// VirtioFSDaemon is the virtio-fs vhost-user daemon path
 	VirtioFSDaemon string
 
-	// VirtioFSCacheSize is the virtio-fs DAX cache size in MiB
-	VirtioFSCacheSize uint32
+	// VirtioFSDaemonList is the list of valid virtiofs names for annotations
+	VirtioFSDaemonList []string
 
-	// VirtioFSCache cache mode for fs version cache or "none"
+	// VirtioFSCache cache mode for fs version cache
 	VirtioFSCache string
 
-	// KernelParams are additional guest kernel parameters.
-	KernelParams []Param
+	// VirtioFSExtraArgs passes options to virtiofsd daemon
+	VirtioFSExtraArgs []string
 
-	// HypervisorParams are additional hypervisor parameters.
-	HypervisorParams []Param
+	// File based memory backend root directory
+	FileBackedMemRootDir string
 
-	// HypervisorMachineType specifies the type of machine being
-	// emulated.
-	HypervisorMachineType string
+	// FileBackedMemRootList is the list of valid root directories values for annotations
+	FileBackedMemRootList []string
+
+	// PFlash image paths
+	PFlash []string
+
+	// customAssets is a map of assets.
+	// Each value in that map takes precedence over the configured assets.
+	// For example, if there is a value for the "kernel" key in this map,
+	// it will be used for the sandbox's kernel path instead of KernelPath.
+	customAssets map[types.AssetType]*types.Asset
+
+	// BlockDeviceCacheSet specifies cache-related options will be set to block devices or not.
+	BlockDeviceCacheSet bool
+
+	// BlockDeviceCacheDirect specifies cache-related options for block devices.
+	// Denotes whether use of O_DIRECT (bypass the host page cache) is enabled.
+	BlockDeviceCacheDirect bool
+
+	// BlockDeviceCacheNoflush specifies cache-related options for block devices.
+	// Denotes whether flush requests for the device are ignored.
+	BlockDeviceCacheNoflush bool
+
+	// DisableBlockDeviceUse disallows a block device from being used.
+	DisableBlockDeviceUse bool
+
+	// EnableIOThreads enables IO to be processed in a separate thread.
+	// Supported currently for virtio-scsi driver.
+	EnableIOThreads bool
 
 	// Debug changes the default hypervisor and kernel parameters to
 	// enable debug output where available.
 	Debug bool
-
-	// NumVCPUs specifies default number of vCPUs for the VM.
-	// Sandbox configuration VMConfig.VCPUs overwrites this.
-	NumVCPUs uint32
-
-	// DefaultMem specifies default memory size in MiB for the VM.
-	// Sandbox configuration VMConfig.Memory overwrites this.
-	MemorySize uint32
-
-	// DefaultBridges specifies default number of bridges for the VM.
-	// Bridges can be used to hot plug devices
-	DefaultBridges uint32
 
 	// MemPrealloc specifies if the memory should be pre-allocated
 	MemPrealloc bool
@@ -185,67 +268,101 @@ type HypervisorConfig struct {
 	// HugePages specifies if the memory should be pre-allocated from huge pages
 	HugePages bool
 
-	// Realtime Used to enable/disable realtime
-	Realtime bool
+	// VirtioMem is used to enable/disable virtio-mem
+	VirtioMem bool
 
-	// Mlock is used to control memory locking when Realtime is enabled
-	// Realtime=true and Mlock=false, allows for swapping out of VM memory
-	// enabling higher density
-	Mlock bool
+	// IOMMU specifies if the VM should have a vIOMMU
+	IOMMU bool
+
+	// IOMMUPlatform is used to indicate if IOMMU_PLATFORM is enabled for supported devices
+	IOMMUPlatform bool
 
 	// DisableNestingChecks is used to override customizations performed
 	// when running on top of another VMM.
 	DisableNestingChecks bool
+
+	// DisableImageNvdimm is used to disable guest rootfs image nvdimm devices
+	DisableImageNvdimm bool
+
+	// HotPlugVFIO is used to indicate if devices need to be hotplugged on the
+	// root port, switch, bridge or no port
+	HotPlugVFIO hv.PCIePort
+
+	// ColdPlugVFIO is used to indicate if devices need to be coldplugged on the
+	// root port, switch, bridge or no port
+	ColdPlugVFIO hv.PCIePort
+
+	// BootToBeTemplate used to indicate if the VM is created to be a template VM
+	BootToBeTemplate bool
+
+	// BootFromTemplate used to indicate if the VM should be created from a template VM
+	BootFromTemplate bool
+
+	// DisableVhostNet is used to indicate if host supports vhost_net
+	DisableVhostNet bool
+
+	// EnableVhostUserStore is used to indicate if host supports vhost-user-blk/scsi
+	EnableVhostUserStore bool
+
+	// GuestSwap Used to enable/disable swap in the guest
+	GuestSwap bool
+
+	// VhostUserStorePath is the directory path where vhost-user devices
+	// related folders, sockets and device nodes should be.
+	VhostUserStorePath string
+
+	// VhostUserStorePathList is the list of valid values for vhost-user paths
+	VhostUserStorePathList []string
+
+	// GuestHookPath is the path within the VM that will be used for 'drop-in' hooks
+	GuestHookPath string
+
+	// VMid is the id of the VM that create the hypervisor if the VM is created by the factory.
+	// VMid is "" if the hypervisor is not created by the factory.
+	VMid string
+
+	// SELinux label for the VM
+	SELinuxProcessLabel string
+
+	// RxRateLimiterMaxRate is used to control network I/O inbound bandwidth on VM level.
+	RxRateLimiterMaxRate uint64
+
+	// TxRateLimiterMaxRate is used to control network I/O outbound bandwidth on VM level.
+	TxRateLimiterMaxRate uint64
+
+	// SGXEPCSize specifies the size in bytes for the EPC Section.
+	// Enable SGX. Hardware-based isolation and memory encryption.
+	SGXEPCSize int64
+
+	// Enable annotations by name
+	EnableAnnotations []string
+
+	// GuestCoredumpPath is the path in host for saving guest memory dump
+	GuestMemoryDumpPath string
+
+	// GuestMemoryDumpPaging is used to indicate if enable paging
+	// for QEMU dump-guest-memory command
+	GuestMemoryDumpPaging bool
+
+	// Enable confidential guest support.
+	// Enable or disable different hardware features, ranging
+	// from memory encryption to both memory and CPU-state encryption and integrity.
+	ConfidentialGuest bool
+
+	// Enables SEV-SNP guests in case both AMD SEV and SNP are supported.
+	// SEV is default.
+	SevSnpGuest bool
 }
-```
-
-##### `ProxyType`
-```Go
-// ProxyType describes a proxy type.
-type ProxyType string
-
-const (
-	// NoopProxyType is the noopProxy.
-	NoopProxyType ProxyType = "noopProxy"
-
-	// NoProxyType is the noProxy.
-	NoProxyType ProxyType = "noProxy"
-
-	// KataProxyType is the kataProxy.
-	KataProxyType ProxyType = "kataProxy"
-)
-```
-
-##### `ProxyConfig`
-```Go
-// ProxyConfig is a structure storing information needed from any
-// proxy in order to be properly initialized.
-type ProxyConfig struct {
-	Path  string
-	Debug bool
-}
-```
-
-##### `ShimType`
-```Go
-// ShimType describes a shim type.
-type ShimType string
-
-const (
-	// NoopShimType is the noopShim.
-	NoopShimType ShimType = "noopShim"
-
-	// KataShimType is the Kata Containers shim type.
-	KataShimType ShimType = "kataShim"
-)
 ```
 
 ##### `NetworkConfig`
 ```Go
 // NetworkConfig is the network configuration related to a network.
 type NetworkConfig struct {
-	NetNSPath         string
+	NetworkID         string
 	InterworkingModel NetInterworkingModel
+	NetworkCreated    bool
+	DisableNewNetwork bool
 }
 ```
 ###### `NetInterworkingModel`
@@ -261,6 +378,14 @@ const (
 	// NetXConnectMacVtapModel can be used when the Container network
 	// interface can be bridged using macvtap
 	NetXConnectMacVtapModel
+
+	// NetXConnectTCFilterModel redirects traffic from the network interface
+	// provided by the network plugin to a tap interface.
+	// This works for ipvlan and macvlan as well.
+	NetXConnectTCFilterModel
+
+	// NetXConnectNoneModel can be used when the VM is in the host network namespace
+	NetXConnectNoneModel
 
 	// NetXConnectInvalidModel is the last item to check valid values by IsValid()
 	NetXConnectInvalidModel
@@ -287,13 +412,13 @@ type ContainerConfig struct {
 	ID string
 
 	// RootFs is the container workload image on the host.
-	RootFs string
+	RootFs RootFs
 
 	// ReadOnlyRootfs indicates if the rootfs should be mounted readonly
 	ReadonlyRootfs bool
 
 	// Cmd specifies the command to run on a container
-	Cmd Cmd
+	Cmd types.Cmd
 
 	// Annotations allow clients to store arbitrary values,
 	// for example to add additional status values required
@@ -303,7 +428,13 @@ type ContainerConfig struct {
 	Mounts []Mount
 
 	// Device configuration for devices that must be available within the container.
-	DeviceInfos []DeviceInfo
+	DeviceInfos []config.DeviceInfo
+
+	// Resources container resources
+	Resources specs.LinuxResources
+
+	// Raw OCI specification, it won't be saved to disk.
+	CustomSpec *specs.Spec `json:"-"`
 }
 ```
 
@@ -311,9 +442,9 @@ type ContainerConfig struct {
 ```Go
 // Cmd represents a command to execute in a running container.
 type Cmd struct {
-	Args    []string
-	Envs    []EnvVar
-	WorkDir string
+	Args                []string
+	Envs                []EnvVar
+	SupplementaryGroups []string
 
 	// Note that these fields *MUST* remain as strings.
 	//
@@ -337,15 +468,15 @@ type Cmd struct {
 	// all the user and group mapping is handled by the container manager
 	// and specified to the runtime in terms of UID/GID's in the
 	// configuration file generated by the container manager.
-	User                string
-	PrimaryGroup        string
-	SupplementaryGroups []string
+	User         string
+	PrimaryGroup string
+	WorkDir      string
+	Console      string
+	Capabilities *specs.LinuxCapabilities
 
 	Interactive     bool
-	Console         string
 	Detach          bool
 	NoNewPrivileges bool
-	Capabilities    LinuxCapabilities
 }
 ```
 
@@ -367,6 +498,11 @@ type Mount struct {
 
 	// ReadOnly specifies if the mount should be read only or not
 	ReadOnly bool
+
+	// BlockDeviceID represents block device that is attached to the
+	// VM in case this mount is a block device file or a directory
+	// backed by a block device.
+	BlockDeviceID string
 }
 ```
 
@@ -374,11 +510,11 @@ type Mount struct {
 ```Go
 // DeviceInfo is an embedded type that contains device data common to all types of devices.
 type DeviceInfo struct {
-	// Device path on host
+	// Hostpath is device path on host
 	HostPath string
 
-	// Device path inside the container
-	ContainerPath string
+	// ContainerPath is device path inside container
+	ContainerPath string `json:"-"`
 
 	// Type of device: c, b, u or p
 	// c , u - character(unbuffered)
@@ -391,6 +527,17 @@ type DeviceInfo struct {
 	Major int64
 	Minor int64
 
+	// Pmem enabled persistent memory. Use HostPath as backing file
+	// for a nvdimm device in the guest.
+	Pmem bool
+
+	// If applicable, should this device be considered RO
+	ReadOnly bool
+
+	// ColdPlug specifies whether the device must be cold plugged (true)
+	// or hot plugged (false).
+	ColdPlug bool
+
 	// FileMode permission bits for the device.
 	FileMode os.FileMode
 
@@ -400,12 +547,12 @@ type DeviceInfo struct {
 	// id of the device group.
 	GID uint32
 
-	// Hotplugged is used to store device state indicating if the
-	// device was hotplugged.
-	Hotplugged bool
-
 	// ID for the device that is passed to the hypervisor.
 	ID string
+
+	// DriverOptions is specific options for each device driver
+	// for example, for BlockDevice, we can set DriverOptions["block-driver"]="virtio-blk"
+	DriverOptions map[string]string
 }
 ```
 
@@ -415,87 +562,86 @@ type DeviceInfo struct {
 // (required since virtcontainers.Sandbox only contains private fields)
 type VCSandbox interface {
 	Annotations(key string) (string, error)
+	GetNetNs() string
 	GetAllContainers() []VCContainer
 	GetAnnotations() map[string]string
 	GetContainer(containerID string) VCContainer
 	ID() string
 	SetAnnotations(annotations map[string]string) error
+
+	Stats(ctx context.Context) (SandboxStats, error)
+
+	Start(ctx context.Context) error
+	Stop(ctx context.Context, force bool) error
+	Release(ctx context.Context) error
+	Monitor(ctx context.Context) (chan error, error)
+	Delete(ctx context.Context) error
+	Status() SandboxStatus
+	CreateContainer(ctx context.Context, contConfig ContainerConfig) (VCContainer, error)
+	DeleteContainer(ctx context.Context, containerID string) (VCContainer, error)
+	StartContainer(ctx context.Context, containerID string) (VCContainer, error)
+	StopContainer(ctx context.Context, containerID string, force bool) (VCContainer, error)
+	KillContainer(ctx context.Context, containerID string, signal syscall.Signal, all bool) error
+	StatusContainer(containerID string) (ContainerStatus, error)
+	StatsContainer(ctx context.Context, containerID string) (ContainerStats, error)
+	PauseContainer(ctx context.Context, containerID string) error
+	ResumeContainer(ctx context.Context, containerID string) error
+	EnterContainer(ctx context.Context, containerID string, cmd types.Cmd) (VCContainer, *Process, error)
+	UpdateContainer(ctx context.Context, containerID string, resources specs.LinuxResources) error
+	WaitProcess(ctx context.Context, containerID, processID string) (int32, error)
+	SignalProcess(ctx context.Context, containerID, processID string, signal syscall.Signal, all bool) error
+	WinsizeProcess(ctx context.Context, containerID, processID string, height, width uint32) error
+	IOStream(containerID, processID string) (io.WriteCloser, io.Reader, io.Reader, error)
+
+	AddDevice(ctx context.Context, info config.DeviceInfo) (api.Device, error)
+
+	AddInterface(ctx context.Context, inf *pbTypes.Interface) (*pbTypes.Interface, error)
+	RemoveInterface(ctx context.Context, inf *pbTypes.Interface) (*pbTypes.Interface, error)
+	ListInterfaces(ctx context.Context) ([]*pbTypes.Interface, error)
+	UpdateRoutes(ctx context.Context, routes []*pbTypes.Route) ([]*pbTypes.Route, error)
+	ListRoutes(ctx context.Context) ([]*pbTypes.Route, error)
+
+	GetOOMEvent(ctx context.Context) (string, error)
+	GetHypervisorPid() (int, error)
+
+	UpdateRuntimeMetrics() error
+	GetAgentMetrics(ctx context.Context) (string, error)
+	GetAgentURL() (string, error)
 }
 ```
 
 ### Sandbox Functions
 
 * [`CreateSandbox`](#createsandbox)
-* [`DeleteSandbox`](#deletesandbox)
-* [`StartSandbox`](#startsandbox)
-* [`StopSandbox`](#stopsandbox)
-* [`RunSandbox`](#runsandbox)
-* [`ListSandbox`](#listsandbox)
-* [`StatusSandbox`](#statussandbox)
-* [`PauseSandbox`](#pausesandbox)
-* [`ResumeSandbox`](#resumesandbox)
+* [`CleanupContainer`](#cleanupcontainer)
+* [`SetFactory`](#setfactory)
+* [`SetLogger`](#setlogger)
 
 #### `CreateSandbox`
 ```Go
 // CreateSandbox is the virtcontainers sandbox creation entry point.
 // CreateSandbox creates a sandbox and its containers. It does not start them.
-func CreateSandbox(sandboxConfig SandboxConfig) (VCSandbox, error)
+func (impl *VCImpl) CreateSandbox(ctx context.Context, sandboxConfig SandboxConfig) (VCSandbox, error)
 ```
 
-#### `DeleteSandbox`
+#### `CleanupContainer`
 ```Go
-// DeleteSandbox is the virtcontainers sandbox deletion entry point.
-// DeleteSandbox will stop an already running container and then delete it.
-func DeleteSandbox(sandboxID string) (VCSandbox, error)
+// CleanupContainer is used by shimv2 to stop and delete a container exclusively, once there is no container
+// in the sandbox left, do stop the sandbox and delete it. Those serial operations will be done exclusively by
+// locking the sandbox.
+func (impl *VCImpl) CleanupContainer(ctx context.Context, sandboxID, containerID string, force bool) error
 ```
 
-#### `StartSandbox`
+#### `SetFactory`
 ```Go
-// StartSandbox is the virtcontainers sandbox starting entry point.
-// StartSandbox will talk to the given hypervisor to start an existing
-// sandbox and all its containers.
-func StartSandbox(sandboxID string) (VCSandbox, error)
+// SetFactory implements the VC function of the same name.
+func (impl *VCImpl) SetFactory(ctx context.Context, factory Factory)
 ```
 
-#### `StopSandbox`
+#### `SetLogger`
 ```Go
-// StopSandbox is the virtcontainers sandbox stopping entry point.
-// StopSandbox will talk to the given agent to stop an existing sandbox
-// and destroy all containers within that sandbox.
-func StopSandbox(sandboxID string) (VCSandbox, error)
-```
-
-#### `RunSandbox`
-```Go
-// RunSandbox is the virtcontainers sandbox running entry point.
-// RunSandbox creates a sandbox and its containers and then it starts them.
-func RunSandbox(sandboxConfig SandboxConfig) (VCSandbox, error)
-```
-
-#### `ListSandbox`
-```Go
-// ListSandbox is the virtcontainers sandbox listing entry point.
-func ListSandbox() ([]SandboxStatus, error)
-```
-
-#### `StatusSandbox`
-```Go
-// StatusSandbox is the virtcontainers sandbox status entry point.
-func StatusSandbox(sandboxID string) (SandboxStatus, error)
-```
-
-#### `PauseSandbox`
-```Go
-// PauseSandbox is the virtcontainers pausing entry point which pauses an
-// already running sandbox.
-func PauseSandbox(sandboxID string) (VCSandbox, error)
-```
-
-#### `ResumeSandbox`
-```Go
-// ResumeSandbox is the virtcontainers resuming entry point which resumes
-// (or unpauses) and already paused sandbox.
-func ResumeSandbox(sandboxID string) (VCSandbox, error)
+// SetLogger implements the VC function of the same name.
+func (impl *VCImpl) SetLogger(ctx context.Context, logger *logrus.Entry)
 ```
 
 ## Container API
@@ -544,7 +690,6 @@ to manage the container lifecycle through the rest of the
   * [Container `DeviceInfo`](#container-deviceinfo)
 * [`Process`](#process)
 * [`ContainerStatus`](#containerstatus)
-* [`ProcessListOptions`](#processlistoptions)
 * [`VCContainer`](#vccontainer)
 
 
@@ -555,13 +700,13 @@ type ContainerConfig struct {
 	ID string
 
 	// RootFs is the container workload image on the host.
-	RootFs string
+	RootFs RootFs
 
 	// ReadOnlyRootfs indicates if the rootfs should be mounted readonly
 	ReadonlyRootfs bool
 
 	// Cmd specifies the command to run on a container
-	Cmd Cmd
+	Cmd types.Cmd
 
 	// Annotations allow clients to store arbitrary values,
 	// for example to add additional status values required
@@ -571,7 +716,13 @@ type ContainerConfig struct {
 	Mounts []Mount
 
 	// Device configuration for devices that must be available within the container.
-	DeviceInfos []DeviceInfo
+	DeviceInfos []config.DeviceInfo
+
+	// Resources container resources
+	Resources specs.LinuxResources
+
+	// Raw OCI specification, it won't be saved to disk.
+	CustomSpec *specs.Spec `json:"-"`
 }
 ```
 
@@ -579,9 +730,9 @@ type ContainerConfig struct {
 ```Go
 // Cmd represents a command to execute in a running container.
 type Cmd struct {
-	Args    []string
-	Envs    []EnvVar
-	WorkDir string
+	Args                []string
+	Envs                []EnvVar
+	SupplementaryGroups []string
 
 	// Note that these fields *MUST* remain as strings.
 	//
@@ -605,15 +756,15 @@ type Cmd struct {
 	// all the user and group mapping is handled by the container manager
 	// and specified to the runtime in terms of UID/GID's in the
 	// configuration file generated by the container manager.
-	User                string
-	PrimaryGroup        string
-	SupplementaryGroups []string
+	User         string
+	PrimaryGroup string
+	WorkDir      string
+	Console      string
+	Capabilities *specs.LinuxCapabilities
 
 	Interactive     bool
-	Console         string
 	Detach          bool
 	NoNewPrivileges bool
-	Capabilities    LinuxCapabilities
 }
 ```
 
@@ -635,6 +786,11 @@ type Mount struct {
 
 	// ReadOnly specifies if the mount should be read only or not
 	ReadOnly bool
+
+	// BlockDeviceID represents block device that is attached to the
+	// VM in case this mount is a block device file or a directory
+	// backed by a block device.
+	BlockDeviceID string
 }
 ```
 
@@ -642,11 +798,11 @@ type Mount struct {
 ```Go
 // DeviceInfo is an embedded type that contains device data common to all types of devices.
 type DeviceInfo struct {
-	// Device path on host
+	// Hostpath is device path on host
 	HostPath string
 
-	// Device path inside the container
-	ContainerPath string
+	// ContainerPath is device path inside container
+	ContainerPath string `json:"-"`
 
 	// Type of device: c, b, u or p
 	// c , u - character(unbuffered)
@@ -659,6 +815,17 @@ type DeviceInfo struct {
 	Major int64
 	Minor int64
 
+	// Pmem enabled persistent memory. Use HostPath as backing file
+	// for a nvdimm device in the guest.
+	Pmem bool
+
+	// If applicable, should this device be considered RO
+	ReadOnly bool
+
+	// ColdPlug specifies whether the device must be cold plugged (true)
+	// or hot plugged (false).
+	ColdPlug bool
+
 	// FileMode permission bits for the device.
 	FileMode os.FileMode
 
@@ -668,12 +835,12 @@ type DeviceInfo struct {
 	// id of the device group.
 	GID uint32
 
-	// Hotplugged is used to store device state indicating if the
-	// device was hotplugged.
-	Hotplugged bool
-
 	// ID for the device that is passed to the hypervisor.
 	ID string
+
+	// DriverOptions is specific options for each device driver
+	// for example, for BlockDevice, we can set DriverOptions["block-driver"]="virtio-blk"
+	DriverOptions map[string]string
 }
 ```
 
@@ -702,31 +869,16 @@ type Process struct {
 // ContainerStatus describes a container status.
 type ContainerStatus struct {
 	ID        string
-	State     State
+	State     types.ContainerState
 	PID       int
 	StartTime time.Time
 	RootFs    string
+	Spec      *specs.Spec
 
 	// Annotations allow clients to store arbitrary values,
 	// for example to add additional status values required
 	// to support particular specifications.
 	Annotations map[string]string
-}
-```
-
-#### `ProcessListOptions`
-```Go
-// ProcessListOptions contains the options used to list running
-// processes inside the container
-type ProcessListOptions struct {
-	// Format describes the output format to list the running processes.
-	// Formats are unrelated to ps(1) formats, only two formats can be specified:
-	// "json" and "table"
-	Format string
-
-	// Args contains the list of arguments to run ps(1) command.
-	// If Args is empty the agent will use "-ef" as options to ps(1).
-	Args []string
 }
 ```
 
@@ -753,13 +905,20 @@ type VCContainer interface {
 * [`EnterContainer`](#entercontainer)
 * [`StatusContainer`](#statuscontainer)
 * [`KillContainer`](#killcontainer)
-* [`ProcessListContainer`](#processlistcontainer)
+* [`StatsContainer`](#statscontainer)
+* [`PauseContainer`](#pausecontainer)
+* [`ResumeContainer`](#resumecontainer)
+* [`UpdateContainer`](#updatecontainer)
+* [`WaitProcess`](#waitprocess)
+* [`SignalProcess`](#signalprocess)
+* [`WinsizeProcess`](#winsizeprocess)
+* [`IOStream`](#iostream)
 
 #### `CreateContainer`
 ```Go
 // CreateContainer is the virtcontainers container creation entry point.
 // CreateContainer creates a container on a given sandbox.
-func CreateContainer(sandboxID string, containerConfig ContainerConfig) (VCSandbox, VCContainer, error)
+func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfig) (VCContainer, error)
 ```
 
 #### `DeleteContainer`
@@ -767,35 +926,35 @@ func CreateContainer(sandboxID string, containerConfig ContainerConfig) (VCSandb
 // DeleteContainer is the virtcontainers container deletion entry point.
 // DeleteContainer deletes a Container from a Sandbox. If the container is running,
 // it needs to be stopped first.
-func DeleteContainer(sandboxID, containerID string) (VCContainer, error)
+func (s *Sandbox) DeleteContainer(ctx context.Context, containerID string) (VCContainer, error)
 ```
 
 #### `StartContainer`
 ```Go
 // StartContainer is the virtcontainers container starting entry point.
 // StartContainer starts an already created container.
-func StartContainer(sandboxID, containerID string) (VCContainer, error)
+func (s *Sandbox) StartContainer(ctx context.Context, containerID string) (VCContainer, error)
 ```
 
 #### `StopContainer`
 ```Go
 // StopContainer is the virtcontainers container stopping entry point.
 // StopContainer stops an already running container.
-func StopContainer(sandboxID, containerID string) (VCContainer, error)
+func (s *Sandbox) StopContainer(ctx context.Context, containerID string, force bool) (VCContainer, error)
 ```
 
 #### `EnterContainer`
 ```Go
 // EnterContainer is the virtcontainers container command execution entry point.
 // EnterContainer enters an already running container and runs a given command.
-func EnterContainer(sandboxID, containerID string, cmd Cmd) (VCSandbox, VCContainer, *Process, error)
+func (s *Sandbox) EnterContainer(ctx context.Context, containerID string, cmd types.Cmd) (VCContainer, *Process, error)
 ```
 
 #### `StatusContainer`
 ```Go
 // StatusContainer is the virtcontainers container status entry point.
 // StatusContainer returns a detailed container status.
-func StatusContainer(sandboxID, containerID string) (ContainerStatus, error)
+func (s *Sandbox) StatusContainer(containerID string) (ContainerStatus, error)
 ```
 
 #### `KillContainer`
@@ -803,14 +962,56 @@ func StatusContainer(sandboxID, containerID string) (ContainerStatus, error)
 // KillContainer is the virtcontainers entry point to send a signal
 // to a container running inside a sandbox. If all is true, all processes in
 // the container will be sent the signal.
-func KillContainer(sandboxID, containerID string, signal syscall.Signal, all bool) error
+func (s *Sandbox) KillContainer(ctx context.Context, containerID string, signal syscall.Signal, all bool) error
 ```
 
-#### `ProcessListContainer`
+#### `StatsContainer`
 ```Go
-// ProcessListContainer is the virtcontainers entry point to list
-// processes running inside a container
-func ProcessListContainer(sandboxID, containerID string, options ProcessListOptions) (ProcessList, error)
+// StatsContainer return the stats of a running container
+func (s *Sandbox) StatsContainer(ctx context.Context, containerID string) (ContainerStats, error)
+```
+
+#### `PauseContainer`
+```Go
+// PauseContainer pauses a running container.
+func (s *Sandbox) PauseContainer(ctx context.Context, containerID string) error
+```
+
+#### `ResumeContainer`
+```Go
+// ResumeContainer resumes a paused container.
+func (s *Sandbox) ResumeContainer(ctx context.Context, containerID string) error
+```
+
+#### `UpdateContainer`
+```Go
+// UpdateContainer update a running container.
+func (s *Sandbox) UpdateContainer(ctx context.Context, containerID string, resources specs.LinuxResources) error
+```
+
+#### `WaitProcess`
+```Go
+// WaitProcess waits on a container process and return its exit code
+func (s *Sandbox) WaitProcess(ctx context.Context, containerID, processID string) (int32, error)
+```
+
+#### `SignalProcess`
+```Go
+// SignalProcess sends a signal to a process of a container when all is false.
+// When all is true, it sends the signal to all processes of a container.
+func (s *Sandbox) SignalProcess(ctx context.Context, containerID, processID string, signal syscall.Signal, all bool) error
+```
+
+#### `WinsizeProcess`
+```Go
+// WinsizeProcess resizes the tty window of a process
+func (s *Sandbox) WinsizeProcess(ctx context.Context, containerID, processID string, height, width uint32) error
+```
+
+#### `IOStream`
+```Go
+// IOStream returns stdin writer, stdout reader and stderr reader of a process
+func (s *Sandbox) IOStream(containerID, processID string) (io.WriteCloser, io.Reader, io.Reader, error)
 ```
 
 ## Examples
@@ -859,6 +1060,7 @@ func Example_createAndStartSandbox() {
 		ImagePath:      "/usr/share/kata-containers/clear-containers.img",
 		HypervisorPath: "/usr/bin/qemu-system-x86_64",
 		MemorySize:     1024,
+		MemSlots:       10,
 	}
 
 	// Use kata default values for the agent.
@@ -869,6 +1071,7 @@ func Example_createAndStartSandbox() {
 	// - Hypervisor is QEMU
 	// - Agent is kata
 	sandboxConfig := vc.SandboxConfig{
+		ID:               "sandbox-abc",
 		HypervisorType:   vc.QemuHypervisor,
 		HypervisorConfig: hypervisorConfig,
 

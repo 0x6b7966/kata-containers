@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -6,12 +8,15 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
 	"os"
 
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
+
+var macvtapTrace = getNetworkTrace(MacvtapEndpointType)
 
 // MacvtapEndpoint represents a macvtap endpoint
 type MacvtapEndpoint struct {
@@ -59,38 +64,41 @@ func (endpoint *MacvtapEndpoint) SetProperties(properties NetworkInfo) {
 }
 
 // Attach for macvtap endpoint passes macvtap device to the hypervisor.
-func (endpoint *MacvtapEndpoint) Attach(s *Sandbox) error {
+func (endpoint *MacvtapEndpoint) Attach(ctx context.Context, s *Sandbox) error {
 	var err error
+	span, ctx := macvtapTrace(ctx, "Attach", endpoint)
+	defer span.End()
+
 	h := s.hypervisor
 
-	endpoint.VMFds, err = createMacvtapFds(endpoint.EndpointProperties.Iface.Index, int(h.hypervisorConfig().NumVCPUs))
+	endpoint.VMFds, err = createMacvtapFds(endpoint.EndpointProperties.Iface.Index, int(h.HypervisorConfig().NumVCPUs))
 	if err != nil {
 		return fmt.Errorf("Could not setup macvtap fds %s: %s", endpoint.EndpointProperties.Iface.Name, err)
 	}
 
-	if !h.hypervisorConfig().DisableVhostNet {
-		vhostFds, err := createVhostFds(int(h.hypervisorConfig().NumVCPUs))
+	if !h.HypervisorConfig().DisableVhostNet {
+		vhostFds, err := createVhostFds(int(h.HypervisorConfig().NumVCPUs))
 		if err != nil {
 			return fmt.Errorf("Could not setup vhost fds %s : %s", endpoint.EndpointProperties.Iface.Name, err)
 		}
 		endpoint.VhostFds = vhostFds
 	}
 
-	return h.addDevice(endpoint, netDev)
+	return h.AddDevice(ctx, endpoint, NetDev)
 }
 
 // Detach for macvtap endpoint does nothing.
-func (endpoint *MacvtapEndpoint) Detach(netNsCreated bool, netNsPath string) error {
+func (endpoint *MacvtapEndpoint) Detach(ctx context.Context, netNsCreated bool, netNsPath string) error {
 	return nil
 }
 
 // HotAttach for macvtap endpoint not supported yet
-func (endpoint *MacvtapEndpoint) HotAttach(h hypervisor) error {
+func (endpoint *MacvtapEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
 	return fmt.Errorf("MacvtapEndpoint does not support Hot attach")
 }
 
 // HotDetach for macvtap endpoint not supported yet
-func (endpoint *MacvtapEndpoint) HotDetach(h hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *MacvtapEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
 	return fmt.Errorf("MacvtapEndpoint does not support Hot detach")
 }
 

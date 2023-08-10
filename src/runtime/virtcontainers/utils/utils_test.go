@@ -7,26 +7,31 @@ package utils
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
+
+const waitLocalProcessTimeoutSecs = 3
 
 func TestFileCopySuccessful(t *testing.T) {
 	assert := assert.New(t)
 	fileContent := "testContent"
 
-	srcFile, err := ioutil.TempFile("", "test_src_copy")
+	srcFile, err := os.CreateTemp("", "test_src_copy")
 	assert.NoError(err)
 	defer os.Remove(srcFile.Name())
 	defer srcFile.Close()
 
-	dstFile, err := ioutil.TempFile("", "test_dst_copy")
+	dstFile, err := os.CreateTemp("", "test_dst_copy")
 	assert.NoError(err)
 	defer os.Remove(dstFile.Name())
 
@@ -40,7 +45,7 @@ func TestFileCopySuccessful(t *testing.T) {
 	err = FileCopy(srcFile.Name(), dstPath)
 	assert.NoError(err)
 
-	dstContent, err := ioutil.ReadFile(dstPath)
+	dstContent, err := os.ReadFile(dstPath)
 	assert.NoError(err)
 	assert.Equal(string(dstContent), fileContent)
 
@@ -69,7 +74,7 @@ func TestFileCopyDestinationEmptyFailure(t *testing.T) {
 
 func TestFileCopySourceNotExistFailure(t *testing.T) {
 	assert := assert.New(t)
-	srcFile, err := ioutil.TempFile("", "test_src_copy")
+	srcFile, err := os.CreateTemp("", "test_src_copy")
 	assert.NoError(err)
 
 	srcPath := srcFile.Name()
@@ -91,14 +96,14 @@ func TestGenerateRandomBytes(t *testing.T) {
 func TestRevereString(t *testing.T) {
 	assert := assert.New(t)
 	str := "Teststr"
-	reversed := ReverseString(str)
+	reversed := reverseString(str)
 	assert.Equal(reversed, "rtstseT")
 }
 
 func TestCleanupFds(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpFile, err := ioutil.TempFile("", "testFds1")
+	tmpFile, err := os.CreateTemp("", "testFds1")
 	assert.NoError(err)
 	filename := tmpFile.Name()
 	defer os.Remove(filename)
@@ -123,7 +128,7 @@ func TestWriteToFile(t *testing.T) {
 	err := WriteToFile("/file-does-not-exist", []byte("test-data"))
 	assert.NotNil(err)
 
-	tmpFile, err := ioutil.TempFile("", "test_append_file")
+	tmpFile, err := os.CreateTemp("", "test_append_file")
 	assert.NoError(err)
 
 	filename := tmpFile.Name()
@@ -135,7 +140,7 @@ func TestWriteToFile(t *testing.T) {
 	err = WriteToFile(filename, testData)
 	assert.NoError(err)
 
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	assert.NoError(err)
 
 	assert.True(reflect.DeepEqual(testData, data))
@@ -164,23 +169,6 @@ func TestCaluclateVCpusFromMilliCpus(t *testing.T) {
 	assert.Equal(n, expected)
 }
 
-func TestConstraintsToVCPUs(t *testing.T) {
-	assert := assert.New(t)
-
-	vcpus := ConstraintsToVCPUs(0, 100)
-	assert.Zero(vcpus)
-
-	vcpus = ConstraintsToVCPUs(100, 0)
-	assert.Zero(vcpus)
-
-	expectedVCPUs := uint(4)
-	vcpus = ConstraintsToVCPUs(4000, 1000)
-	assert.Equal(expectedVCPUs, vcpus)
-
-	vcpus = ConstraintsToVCPUs(4000, 1200)
-	assert.Equal(expectedVCPUs, vcpus)
-}
-
 func TestGetVirtDriveNameInvalidIndex(t *testing.T) {
 	assert := assert.New(t)
 	_, err := GetVirtDriveName(-1)
@@ -189,6 +177,7 @@ func TestGetVirtDriveNameInvalidIndex(t *testing.T) {
 
 func TestGetVirtDriveName(t *testing.T) {
 	assert := assert.New(t)
+	// nolint: govet
 	tests := []struct {
 		index         int
 		expectedDrive string
@@ -243,6 +232,7 @@ func TestGetSCSIIdLun(t *testing.T) {
 
 func TestGetSCSIAddress(t *testing.T) {
 	assert := assert.New(t)
+	// nolint: govet
 	tests := []struct {
 		index               int
 		expectedSCSIAddress string
@@ -276,6 +266,7 @@ func TestMakeNameID(t *testing.T) {
 func TestBuildSocketPath(t *testing.T) {
 	assert := assert.New(t)
 
+	// nolint: govet
 	type testData struct {
 		elems    []string
 		valid    bool
@@ -306,9 +297,9 @@ func TestBuildSocketPath(t *testing.T) {
 		msg := fmt.Sprintf("test[%d]: %+v", i, d)
 
 		if d.valid {
-			assert.NoErrorf(err, "test %d, data %+v", i, d, msg)
+			assert.NoError(err, msg)
 		} else {
-			assert.Errorf(err, "test %d, data %+v", i, d, msg)
+			assert.Error(err, msg)
 		}
 
 		assert.NotNil(result, msg)
@@ -327,7 +318,7 @@ func TestSupportsVsocks(t *testing.T) {
 	VHostVSockDevicePath = "/abc/xyz/123"
 	assert.False(SupportsVsocks())
 
-	vHostVSockFile, err := ioutil.TempFile("", "vhost-vsock")
+	vHostVSockFile, err := os.CreateTemp("", "vhost-vsock")
 	assert.NoError(err)
 	defer os.Remove(vHostVSockFile.Name())
 	defer vHostVSockFile.Close()
@@ -374,4 +365,218 @@ func TestToBytes(t *testing.T) {
 	result := memSize.ToBytes()
 	expected := uint64(1073741824)
 	assert.Equal(expected, result)
+}
+
+func TestWaitLocalProcess(t *testing.T) {
+	cfg := []struct {
+		command string
+		args    []string
+		timeout uint
+		signal  syscall.Signal
+	}{
+		{
+			"true",
+			[]string{},
+			waitLocalProcessTimeoutSecs,
+			syscall.SIGKILL,
+		},
+		{
+			"sleep",
+			[]string{"999"},
+			waitLocalProcessTimeoutSecs,
+			syscall.SIGKILL,
+		},
+		{
+			"sleep",
+			[]string{"999"},
+			1,
+			syscall.SIGKILL,
+		},
+	}
+
+	logger := logrus.WithField("foo", "bar")
+
+	for _, opts := range cfg {
+		assert := assert.New(t)
+
+		cmd := exec.Command(opts.command, opts.args...)
+		err := cmd.Start()
+		assert.NoError(err)
+
+		pid := cmd.Process.Pid
+
+		err = WaitLocalProcess(pid, opts.timeout, opts.signal, logger)
+		assert.NoError(err)
+
+		_ = cmd.Wait()
+	}
+}
+
+func TestWaitLocalProcessInvalidSignal(t *testing.T) {
+	assert := assert.New(t)
+
+	const invalidSignal = syscall.Signal(999)
+
+	cmd := exec.Command("sleep", "999")
+	err := cmd.Start()
+	assert.NoError(err)
+
+	pid := cmd.Process.Pid
+
+	logger := logrus.WithField("foo", "bar")
+
+	err = WaitLocalProcess(pid, waitLocalProcessTimeoutSecs, invalidSignal, logger)
+	assert.Error(err)
+
+	err = syscall.Kill(pid, syscall.SIGTERM)
+	assert.NoError(err)
+
+	err = cmd.Wait()
+
+	// This will error because we killed the process without the knowledge
+	// of exec.Command.
+	assert.Error(err)
+}
+
+func TestWaitLocalProcessInvalidPid(t *testing.T) {
+	assert := assert.New(t)
+
+	invalidPids := []int{-999, -173, -3, -2, -1, 0}
+
+	logger := logrus.WithField("foo", "bar")
+
+	for i, pid := range invalidPids {
+		msg := fmt.Sprintf("test[%d]: %v", i, pid)
+
+		err := WaitLocalProcess(pid, waitLocalProcessTimeoutSecs, syscall.Signal(0), logger)
+		assert.Error(err, msg)
+	}
+}
+
+func TestMkdirAllWithInheritedOwnerSuccessful(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test disabled as requires root user")
+	}
+	assert := assert.New(t)
+	tmpDir1 := t.TempDir()
+	tmpDir2 := t.TempDir()
+
+	testCases := []struct {
+		before    func(rootDir string, uid, gid int)
+		rootDir   string
+		targetDir string
+		uid       int
+		gid       int
+	}{
+		{
+			before: func(rootDir string, uid, gid int) {
+				err := syscall.Chown(rootDir, uid, gid)
+				assert.NoError(err)
+			},
+			rootDir:   tmpDir1,
+			targetDir: path.Join(tmpDir1, "foo", "bar"),
+			uid:       1234,
+			gid:       5678,
+		},
+		{
+			before: func(rootDir string, uid, gid int) {
+				// remove the tmpDir2 so the MkdirAllWithInheritedOwner() call creates them from /tmp
+				err := os.RemoveAll(tmpDir2)
+				assert.NoError(err)
+			},
+			rootDir:   tmpDir2,
+			targetDir: path.Join(tmpDir2, "foo", "bar"),
+			uid:       0,
+			gid:       0,
+		},
+	}
+
+	for _, tc := range testCases {
+		if tc.before != nil {
+			tc.before(tc.rootDir, tc.uid, tc.gid)
+		}
+
+		err := MkdirAllWithInheritedOwner(tc.targetDir, 0700)
+		assert.NoError(err)
+		// tmpDir1: /tmp/TestMkdirAllWithInheritedOwnerSuccessful/001
+		// tmpDir2: /tmp/TestMkdirAllWithInheritedOwnerSuccessful/002
+		// remove the first two parent "/tmp/TestMkdirAllWithInheritedOwnerSuccessful" from the assertion as it's owned by root
+		for _, p := range getAllParentPaths(tc.targetDir)[2:] {
+			info, err := os.Stat(p)
+			assert.NoError(err)
+			assert.True(info.IsDir())
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			assert.True(ok)
+			assert.Equal(tc.uid, int(stat.Uid))
+			assert.Equal(tc.gid, int(stat.Gid))
+		}
+	}
+}
+
+func TestChownToParent(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("Test disabled as requires root user")
+	}
+	assert := assert.New(t)
+	rootDir := t.TempDir()
+	uid := 1234
+	gid := 5678
+	err := syscall.Chown(rootDir, uid, gid)
+	assert.NoError(err)
+
+	targetDir := path.Join(rootDir, "foo")
+
+	err = os.MkdirAll(targetDir, 0700)
+	assert.NoError(err)
+
+	err = ChownToParent(targetDir)
+	assert.NoError(err)
+
+	info, err := os.Stat(targetDir)
+	assert.NoError(err)
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	assert.True(ok)
+	assert.Equal(uid, int(stat.Uid))
+	assert.Equal(gid, int(stat.Gid))
+}
+
+func TestGetAllParentPaths(t *testing.T) {
+	assert := assert.New(t)
+
+	testCases := []struct {
+		targetPath string
+		parents    []string
+	}{
+		{
+			targetPath: "/",
+			parents:    []string{},
+		},
+		{
+			targetPath: ".",
+			parents:    []string{},
+		},
+		{
+			targetPath: "foo",
+			parents:    []string{"foo"},
+		},
+		{
+			targetPath: "/tmp/bar",
+			parents:    []string{"/tmp", "/tmp/bar"},
+		},
+	}
+
+	for _, tc := range testCases {
+		assert.Equal(tc.parents, getAllParentPaths(tc.targetPath))
+	}
+}
+
+func TestRevertBytes(t *testing.T) {
+	assert := assert.New(t)
+
+	//10MB
+	testNum := uint64(10000000)
+	expectedNum := uint64(10485760)
+
+	num := RevertBytes(testNum)
+	assert.Equal(expectedNum, num)
 }

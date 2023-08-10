@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -6,17 +8,17 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 
-	govmmQemu "github.com/kata-containers/govmm/qemu"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/pkg/errors"
@@ -27,7 +29,7 @@ const (
 )
 
 var qemuArchBaseMachine = govmmQemu.Machine{
-	Type: "pc",
+	Type: "q35",
 }
 
 var qemuArchBaseQemuPaths = map[string]string{
@@ -115,9 +117,16 @@ func TestQemuArchBaseKernelParameters(t *testing.T) {
 func TestQemuArchBaseCapabilities(t *testing.T) {
 	assert := assert.New(t)
 	qemuArchBase := newQemuArchBase()
+	hConfig := HypervisorConfig{}
+	hConfig.SharedFS = config.VirtioFS
 
-	c := qemuArchBase.capabilities()
+	c := qemuArchBase.capabilities(hConfig)
 	assert.True(c.IsBlockDeviceHotplugSupported())
+	assert.True(c.IsFsSharingSupported())
+
+	hConfig.SharedFS = config.NoSharedFS
+	c = qemuArchBase.capabilities(hConfig)
+	assert.False(c.IsFsSharingSupported())
 }
 
 func TestQemuArchBaseBridges(t *testing.T) {
@@ -142,24 +151,24 @@ func TestQemuAddDeviceToBridge(t *testing.T) {
 
 	// addDeviceToBridge successfully
 	q := newQemuArchBase()
-	q.qemuMachine.Type = QemuPC
+	q.qemuMachine.Type = QemuQ35
 
 	q.bridges(1)
 	for i := uint32(1); i <= types.PCIBridgeMaxCapacity; i++ {
-		_, _, err := q.addDeviceToBridge(fmt.Sprintf("qemu-bridge-%d", i), types.PCI)
+		_, _, err := q.addDeviceToBridge(context.Background(), fmt.Sprintf("qemu-bridge-%d", i), types.PCI)
 		assert.Nil(err)
 	}
 
 	// fail to add device to bridge cause no more available bridge slot
-	_, _, err := q.addDeviceToBridge("qemu-bridge-31", types.PCI)
+	_, _, err := q.addDeviceToBridge(context.Background(), "qemu-bridge-31", types.PCI)
 	exceptErr := errors.New("no more bridge slots available")
 	assert.Equal(exceptErr.Error(), err.Error())
 
 	// addDeviceToBridge fails cause q.Bridges == 0
 	q = newQemuArchBase()
-	q.qemuMachine.Type = QemuPCLite
+	q.qemuMachine.Type = QemuQ35
 	q.bridges(0)
-	_, _, err = q.addDeviceToBridge("qemu-bridge", types.PCI)
+	_, _, err = q.addDeviceToBridge(context.Background(), "qemu-bridge", types.PCI)
 	if assert.Error(err) {
 		exceptErr = errors.New("failed to get available address from bridges")
 		assert.Equal(exceptErr.Error(), err.Error())
@@ -173,13 +182,13 @@ func TestQemuArchBaseCPUTopology(t *testing.T) {
 
 	expectedSMP := govmmQemu.SMP{
 		CPUs:    vcpus,
-		Sockets: defaultMaxQemuVCPUs,
+		Sockets: defaultMaxVCPUs,
 		Cores:   defaultCores,
 		Threads: defaultThreads,
-		MaxCPUs: defaultMaxQemuVCPUs,
+		MaxCPUs: defaultMaxVCPUs,
 	}
 
-	smp := qemuArchBase.cpuTopology(vcpus, defaultMaxQemuVCPUs)
+	smp := qemuArchBase.cpuTopology(vcpus, defaultMaxVCPUs)
 	assert.Equal(expectedSMP, smp)
 }
 
@@ -215,15 +224,15 @@ func testQemuArchBaseAppend(t *testing.T, structure interface{}, expected []govm
 
 	switch s := structure.(type) {
 	case types.Volume:
-		devices, err = qemuArchBase.append9PVolume(devices, s)
+		devices, err = qemuArchBase.append9PVolume(context.Background(), devices, s)
 	case types.Socket:
 		devices = qemuArchBase.appendSocket(devices, s)
 	case config.BlockDrive:
-		devices, err = qemuArchBase.appendBlockDevice(devices, s)
+		devices, err = qemuArchBase.appendBlockDevice(context.Background(), devices, s)
 	case config.VFIODev:
 		devices = qemuArchBase.appendVFIODevice(devices, s)
 	case config.VhostUserDeviceAttrs:
-		devices, err = qemuArchBase.appendVhostUserDevice(devices, s)
+		devices, err = qemuArchBase.appendVhostUserDevice(context.Background(), devices, s)
 	}
 
 	assert.NoError(err)
@@ -253,9 +262,39 @@ func TestQemuArchBaseAppendConsoles(t *testing.T) {
 		},
 	}
 
-	devices, err = qemuArchBase.appendConsole(devices, path)
+	devices, err = qemuArchBase.appendConsole(context.Background(), devices, path)
 	assert.NoError(err)
 	assert.Equal(expectedOut, devices)
+	assert.Contains(qemuArchBase.kernelParams, Param{"console", "hvc0"})
+	assert.Contains(qemuArchBase.kernelParams, Param{"console", "hvc1"})
+}
+
+func TestQemuArchBaseAppendConsolesLegacy(t *testing.T) {
+	var devices []govmmQemu.Device
+	var err error
+	assert := assert.New(t)
+	qemuArchBase := newQemuArchBase()
+	qemuArchBase.legacySerial = true
+
+	path := filepath.Join(filepath.Join(fs.MockRunStoragePath(), "test"), consoleSocket)
+
+	expectedOut := []govmmQemu.Device{
+		govmmQemu.LegacySerialDevice{
+			Chardev: "charconsole0",
+		},
+		govmmQemu.CharDevice{
+			Driver:   govmmQemu.LegacySerial,
+			Backend:  govmmQemu.Socket,
+			DeviceID: "console0",
+			ID:       "charconsole0",
+			Path:     path,
+		},
+	}
+
+	devices, err = qemuArchBase.appendConsole(context.Background(), devices, path)
+	assert.NoError(err)
+	assert.Equal(expectedOut, devices)
+	assert.Contains(qemuArchBase.kernelParams, Param{"console", "ttyS0"})
 }
 
 func TestQemuArchBaseAppendImage(t *testing.T) {
@@ -263,13 +302,13 @@ func TestQemuArchBaseAppendImage(t *testing.T) {
 	assert := assert.New(t)
 	qemuArchBase := newQemuArchBase()
 
-	image, err := ioutil.TempFile("", "img")
+	image, err := os.CreateTemp("", "img")
 	assert.NoError(err)
 	defer os.Remove(image.Name())
 	err = image.Close()
 	assert.NoError(err)
 
-	devices, err = qemuArchBase.appendImage(devices, image.Name())
+	devices, err = qemuArchBase.appendImage(context.Background(), devices, image.Name())
 	assert.NoError(err)
 	assert.Len(devices, 1)
 
@@ -306,12 +345,15 @@ func TestQemuArchBaseAppendBridges(t *testing.T) {
 
 	expectedOut := []govmmQemu.Device{
 		govmmQemu.BridgeDevice{
-			Type:    govmmQemu.PCIBridge,
-			Bus:     defaultBridgeBus,
-			ID:      bridges[0].ID,
-			Chassis: 1,
-			SHPC:    true,
-			Addr:    "2",
+			Type:          govmmQemu.PCIBridge,
+			Bus:           defaultBridgeBus,
+			ID:            bridges[0].ID,
+			Chassis:       1,
+			SHPC:          false,
+			Addr:          "2",
+			IOReserve:     "4k",
+			MemReserve:    "1m",
+			Pref64Reserve: "1m",
 		},
 	}
 
@@ -468,12 +510,12 @@ func TestQemuArchBaseAppendSCSIController(t *testing.T) {
 		},
 	}
 
-	devices, ioThread, err := qemuArchBase.appendSCSIController(devices, false)
+	devices, ioThread, err := qemuArchBase.appendSCSIController(context.Background(), devices, false)
 	assert.Equal(expectedOut, devices)
 	assert.Nil(ioThread)
 	assert.NoError(err)
 
-	_, ioThread, err = qemuArchBase.appendSCSIController(devices, true)
+	_, ioThread, err = qemuArchBase.appendSCSIController(context.Background(), devices, true)
 	assert.NotNil(ioThread)
 	assert.NoError(err)
 }
@@ -486,7 +528,7 @@ func TestQemuArchBaseAppendNetwork(t *testing.T) {
 
 	macAddr := net.HardwareAddr{0x02, 0x00, 0xCA, 0xFE, 0x00, 0x04}
 
-	macvlanEp := &BridgedMacvlanEndpoint{
+	macvlanEp := &MacvlanEndpoint{
 		NetPair: NetworkInterfacePair{
 			TapInterface: TapInterface{
 				ID:   "uniqueTestID-4",
@@ -501,7 +543,7 @@ func TestQemuArchBaseAppendNetwork(t *testing.T) {
 			},
 			NetInterworkingModel: DefaultNetInterworkingModel,
 		},
-		EndpointType: BridgedMacvlanEndpointType,
+		EndpointType: MacvlanEndpointType,
 	}
 
 	macvtapEp := &MacvtapEndpoint{
@@ -538,9 +580,9 @@ func TestQemuArchBaseAppendNetwork(t *testing.T) {
 		},
 	}
 
-	devices, err = qemuArchBase.appendNetwork(devices, macvlanEp)
+	devices, err = qemuArchBase.appendNetwork(context.Background(), devices, macvlanEp)
 	assert.NoError(err)
-	devices, err = qemuArchBase.appendNetwork(devices, macvtapEp)
+	devices, err = qemuArchBase.appendNetwork(context.Background(), devices, macvtapEp)
 	assert.NoError(err)
 	assert.Equal(expectedOut, devices)
 }
@@ -558,10 +600,6 @@ func TestQemuArchBaseAppendIOMMU(t *testing.T) {
 			CachingMode: true,
 		},
 	}
-	// Test IOMMU is not appended to PC machine type
-	qemuArchBase.qemuMachine.Type = QemuPC
-	devices, err = qemuArchBase.appendIOMMU(devices)
-	assert.Error(err)
 
 	qemuArchBase.qemuMachine.Type = QemuQ35
 	devices, err = qemuArchBase.appendIOMMU(devices)

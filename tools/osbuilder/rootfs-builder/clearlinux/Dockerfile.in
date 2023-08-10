@@ -3,7 +3,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-From docker.io/fedora:30
+ARG IMAGE_REGISTRY=docker.io
+FROM ${IMAGE_REGISTRY}/fedora:30
 
 @SET_PROXY@
 
@@ -23,8 +24,6 @@ RUN dnf -y update && dnf install -y \
     glibc-headers \
     glibc-static \
     glibc-utils \
-    libseccomp \
-    libseccomp-devel \
     libstdc++-devel \
     libstdc++-static \
     m4 \
@@ -34,9 +33,8 @@ RUN dnf -y update && dnf install -y \
     systemd \
     tar \
     vim \
-    which
+    which && \
+    dnf clean all
 
-# This will install the proper golang to build Kata components
-@INSTALL_MUSL@
-@INSTALL_GO@
+# This will install the proper packages to build Kata components
 @INSTALL_RUST@

@@ -5,11 +5,11 @@
 
 use libc::pid_t;
 use std::fs::File;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use tokio::sync::mpsc::Sender;
 
+use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{self, WaitStatus};
 use nix::unistd::{self, Pid};
 use nix::Result;
@@ -24,12 +24,20 @@ use tokio::io::{split, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
+macro_rules! close_process_stream {
+    ($self: ident, $stream:ident, $stream_type: ident) => {
+        if $self.$stream.is_some() {
+            $self.close_stream(StreamType::$stream_type);
+            $self.$stream = None;
+        }
+    };
+}
+
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum StreamType {
     Stdin,
     Stdout,
     Stderr,
-    ExitPipeR,
     TermMaster,
     ParentStdin,
     ParentStdout,
@@ -45,8 +53,8 @@ pub struct Process {
     pub stdin: Option<RawFd>,
     pub stdout: Option<RawFd>,
     pub stderr: Option<RawFd>,
-    pub exit_pipe_r: Option<RawFd>,
-    pub exit_pipe_w: Option<RawFd>,
+    pub exit_tx: Option<tokio::sync::watch::Sender<bool>>,
+    pub exit_rx: Option<tokio::sync::watch::Receiver<bool>>,
     pub extra_files: Vec<File>,
     pub term_master: Option<RawFd>,
     pub tty: bool,
@@ -71,7 +79,7 @@ pub struct Process {
 pub trait ProcessOperations {
     fn pid(&self) -> Pid;
     fn wait(&self) -> Result<WaitStatus>;
-    fn signal(&self, sig: Signal) -> Result<()>;
+    fn signal(&self, sig: libc::c_int) -> Result<()>;
 }
 
 impl ProcessOperations for Process {
@@ -83,8 +91,10 @@ impl ProcessOperations for Process {
         wait::waitpid(Some(self.pid()), None)
     }
 
-    fn signal(&self, sig: Signal) -> Result<()> {
-        signal::kill(self.pid(), Some(sig))
+    fn signal(&self, sig: libc::c_int) -> Result<()> {
+        let res = unsafe { libc::kill(self.pid().into(), sig) };
+
+        Errno::result(res).map(drop)
     }
 }
 
@@ -97,14 +107,15 @@ impl Process {
         pipe_size: i32,
     ) -> Result<Self> {
         let logger = logger.new(o!("subsystem" => "process"));
+        let (exit_tx, exit_rx) = tokio::sync::watch::channel(false);
 
         let mut p = Process {
             exec_id: String::from(id),
             stdin: None,
             stdout: None,
             stderr: None,
-            exit_pipe_w: None,
-            exit_pipe_r: None,
+            exit_tx: Some(exit_tx),
+            exit_rx: Some(exit_rx),
             extra_files: Vec::new(),
             tty: ocip.terminal,
             term_master: None,
@@ -125,26 +136,48 @@ impl Process {
         info!(logger, "before create console socket!");
 
         if !p.tty {
-            info!(logger, "created console socket!");
+            if cfg!(feature = "standard-oci-runtime") {
+                p.stdin = Some(std::io::stdin().as_raw_fd());
+                p.stdout = Some(std::io::stdout().as_raw_fd());
+                p.stderr = Some(std::io::stderr().as_raw_fd());
+            } else {
+                info!(logger, "created console socket!");
 
-            let (stdin, pstdin) = unistd::pipe2(OFlag::O_CLOEXEC)?;
-            p.parent_stdin = Some(pstdin);
-            p.stdin = Some(stdin);
+                let (stdin, pstdin) = unistd::pipe2(OFlag::O_CLOEXEC)?;
+                p.parent_stdin = Some(pstdin);
+                p.stdin = Some(stdin);
 
-            let (pstdout, stdout) = create_extended_pipe(OFlag::O_CLOEXEC, pipe_size)?;
-            p.parent_stdout = Some(pstdout);
-            p.stdout = Some(stdout);
+                let (pstdout, stdout) = create_extended_pipe(OFlag::O_CLOEXEC, pipe_size)?;
+                p.parent_stdout = Some(pstdout);
+                p.stdout = Some(stdout);
 
-            let (pstderr, stderr) = create_extended_pipe(OFlag::O_CLOEXEC, pipe_size)?;
-            p.parent_stderr = Some(pstderr);
-            p.stderr = Some(stderr);
+                let (pstderr, stderr) = create_extended_pipe(OFlag::O_CLOEXEC, pipe_size)?;
+                p.parent_stderr = Some(pstderr);
+                p.stderr = Some(stderr);
+            }
         }
         Ok(p)
     }
 
     pub fn notify_term_close(&mut self) {
         let notify = self.term_exit_notifier.clone();
-        notify.notify_one();
+        notify.notify_waiters();
+    }
+
+    pub fn close_stdin(&mut self) {
+        close_process_stream!(self, term_master, TermMaster);
+        close_process_stream!(self, parent_stdin, ParentStdin);
+
+        self.notify_term_close();
+    }
+
+    pub fn cleanup_process_stream(&mut self) {
+        close_process_stream!(self, parent_stdin, ParentStdin);
+        close_process_stream!(self, parent_stdout, ParentStdout);
+        close_process_stream!(self, parent_stderr, ParentStderr);
+        close_process_stream!(self, term_master, TermMaster);
+
+        self.notify_term_close();
     }
 
     fn get_fd(&self, stream_type: &StreamType) -> Option<RawFd> {
@@ -152,7 +185,6 @@ impl Process {
             StreamType::Stdin => self.stdin,
             StreamType::Stdout => self.stdout,
             StreamType::Stderr => self.stderr,
-            StreamType::ExitPipeR => self.exit_pipe_r,
             StreamType::TermMaster => self.term_master,
             StreamType::ParentStdin => self.parent_stdin,
             StreamType::ParentStdout => self.parent_stdout,
@@ -192,7 +224,7 @@ impl Process {
         Some(writer)
     }
 
-    pub fn close_stream(&mut self, stream_type: StreamType) {
+    fn close_stream(&mut self, stream_type: StreamType) {
         let _ = self.readers.remove(&stream_type);
         let _ = self.writers.remove(&stream_type);
     }
@@ -256,6 +288,12 @@ mod tests {
         // signal to every process in the process
         // group of the calling process.
         process.pid = 0;
-        assert!(process.signal(Signal::SIGCONT).is_ok());
+        assert!(process.signal(libc::SIGCONT).is_ok());
+
+        if cfg!(feature = "standard-oci-runtime") {
+            assert_eq!(process.stdin.unwrap(), std::io::stdin().as_raw_fd());
+            assert_eq!(process.stdout.unwrap(), std::io::stdout().as_raw_fd());
+            assert_eq!(process.stderr.unwrap(), std::io::stderr().as_raw_fd());
+        }
     }
 }

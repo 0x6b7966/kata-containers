@@ -1,28 +1,4 @@
-[![Build Status](https://travis-ci.org/kata-containers/osbuilder.svg?branch=master)](https://travis-ci.org/kata-containers/osbuilder)
-
 # osbuilder
-
-* [osbuilder](#osbuilder)
-    * [Introduction](#introduction)
-    * [Terms](#terms)
-    * [Building](#building)
-        * [Rootfs creation](#rootfs-creation)
-            * [Rootfs with systemd as init](#rootfs-with-systemd-as-init)
-            * [Rootfs with the agent as init](#rootfs-with-the-agent-as-init)
-            * [dracut based rootfs](#dracut-based-rootfs)
-        * [Image creation](#image-creation)
-            * [Image with systemd as init](#image-with-systemd-as-init)
-            * [Image with the agent as init](#image-with-the-agent-as-init)
-            * [dracut based image](#dracut-based-image)
-        * [Initrd creation](#initrd-creation)
-            * [Rootfs based initrd](#rootfs-based-initrd)
-            * [dracut based initrd](#dracut-based-initrd)
-        * [dracut options](#dracut-options)
-            * [Add kernel modules](#add-kernel-modules)
-        * [Custom images](#custom-images)
-            * [Intel® QuickAssist Technology (QAT) customized kernel and rootfs](#intel-quickassist-technology-qat-customized-kernel-and-rootfs)
-    * [Testing](#testing)
-    * [Platform-Distro Compatibility Matrix](#platform-distro-compatibility-matrix)
 
 ## Introduction
 
@@ -104,8 +80,8 @@ filesystem components to generate an initrd.
 3. When generating an image, the initrd is extracted to obtain the base rootfs for
 the image.
 
-CentOS is the default distro for building the rootfs, to use a different one, you can set `DISTRO=<your_distro>`.
-For example `make USE_DOCKER=true DISTRO=ubuntu rootfs` will make Ubuntu rootfs using Docker.
+Ubuntu is the default distro for building the rootfs, to use a different one, you can set `DISTRO=alpine|clearlinux|debian|ubuntu|cbl-mariner`.
+For example `make USE_DOCKER=true DISTRO=alpine rootfs` will make an Alpine rootfs using Docker.
 
 ### Rootfs creation
 
@@ -233,9 +209,9 @@ of the the osbuilder distributions.
 > Note: this table is not relevant for the dracut build method, since it supports
 any Linux distribution and architecture where dracut is available.
 
-|           |Alpine            |CentOS            |Clear Linux       |Debian/Ubuntu     |Fedora            |openSUSE          |
-|--         |--                |--                |--                |--                |--                |--                |
-|**ARM64**  |:heavy_check_mark:|:heavy_check_mark:|                  |                  |:heavy_check_mark:|:heavy_check_mark:|
-|**PPC64le**|:heavy_check_mark:|:heavy_check_mark:|                  |:heavy_check_mark:|:heavy_check_mark:|:heavy_check_mark:|
-|**s390x**  |:heavy_check_mark:|                  |                  |:heavy_check_mark:|:heavy_check_mark:|                  |
-|**x86_64** |:heavy_check_mark:|:heavy_check_mark:|:heavy_check_mark:|:heavy_check_mark:|:heavy_check_mark:|:heavy_check_mark:|
+|           |Alpine            |CentOS Stream     |Clear Linux       |Debian/Ubuntu     |CBL-Mariner       |
+|--         |--                |--                |--                |--                |--                |
+|**ARM64**  |:heavy_check_mark:|:heavy_check_mark:|                  |                  |                  |
+|**PPC64le**|                  |:heavy_check_mark:|                  |:heavy_check_mark:|                  |
+|**s390x**  |                  |:heavy_check_mark:|                  |:heavy_check_mark:|                  |
+|**x86_64** |:heavy_check_mark:|:heavy_check_mark:|:heavy_check_mark:|:heavy_check_mark:|:heavy_check_mark:|

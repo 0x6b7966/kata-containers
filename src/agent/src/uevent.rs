@@ -6,23 +6,36 @@
 use crate::device::online_device;
 use crate::linux_abi::*;
 use crate::sandbox::Sandbox;
-use crate::GLOBAL_DEVICE_WATCHER;
+use crate::AGENT_CONFIG;
 use slog::Logger;
 
+use anyhow::{anyhow, Result};
 use netlink_sys::{protocols, SocketAddr, TokioSocket};
-use nix::errno::Errno;
+use std::fmt::Debug;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
+use tokio::select;
+use tokio::sync::watch::Receiver;
 use tokio::sync::Mutex;
+use tracing::instrument;
 
-#[derive(Debug, Default)]
-struct Uevent {
-    action: String,
-    devpath: String,
-    devname: String,
-    subsystem: String,
+// Convenience function to obtain the scope logger.
+fn sl() -> slog::Logger {
+    slog_scope::logger().new(o!("subsystem" => "uevent"))
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Uevent {
+    pub action: String,
+    pub devpath: String,
+    pub devname: String,
+    pub subsystem: String,
     seqnum: String,
-    interface: String,
+    pub interface: String,
+}
+
+pub trait UeventMatcher: Sync + Send + Debug + 'static {
+    fn is_match(&self, uev: &Uevent) -> bool;
 }
 
 impl Uevent {
@@ -49,132 +62,234 @@ impl Uevent {
         event
     }
 
-    // Check whether this is a block device hot-add event.
-    fn is_block_add_event(&self) -> bool {
-        let pci_root_bus_path = create_pci_root_bus_path();
-        self.action == U_EVENT_ACTION_ADD
-            && self.subsystem == "block"
-            && {
-                self.devpath.starts_with(pci_root_bus_path.as_str())
-                    || self.devpath.starts_with(ACPI_DEV_PATH) // NVDIMM/PMEM devices
-            }
-            && !self.devname.is_empty()
-    }
+    #[instrument]
+    async fn process_add(&self, logger: &Logger, sandbox: &Arc<Mutex<Sandbox>>) {
+        // Special case for memory hot-adds first
+        let online_path = format!("{}/{}/online", SYSFS_DIR, &self.devpath);
+        if online_path.starts_with(SYSFS_MEMORY_ONLINE_PATH) {
+            let _ = online_device(online_path.as_ref()).map_err(|e| {
+                error!(
+                    *logger,
+                    "failed to online device";
+                    "device" => &self.devpath,
+                    "error" => format!("{}", e),
+                )
+            });
+            return;
+        }
 
-    async fn handle_block_add_event(&self, sandbox: &Arc<Mutex<Sandbox>>) {
-        let pci_root_bus_path = create_pci_root_bus_path();
-
-        // Keep the same lock order as device::get_device_name(), otherwise it may cause deadlock.
-        let watcher = GLOBAL_DEVICE_WATCHER.clone();
-        let mut w = watcher.lock().await;
         let mut sb = sandbox.lock().await;
 
-        // Add the device node name to the pci device map.
-        sb.pci_device_map
-            .insert(self.devpath.clone(), self.devname.clone());
+        // Record the event by sysfs path
+        sb.uevent_map.insert(self.devpath.clone(), self.clone());
 
         // Notify watchers that are interested in the udev event.
-        // Close the channel after watcher has been notified.
-        let devpath = self.devpath.clone();
-        let empties: Vec<_> = w
-            .iter_mut()
-            .filter(|(dev_addr, _)| {
-                let pci_p = format!("{}/{}", pci_root_bus_path, *dev_addr);
-
-                // blk block device
-                devpath.starts_with(pci_p.as_str()) ||
-                // scsi block device
-                {
-                    (*dev_addr).ends_with(SCSI_BLOCK_SUFFIX) &&
-                        devpath.contains(*dev_addr)
-                } ||
-                // nvdimm/pmem device
-                {
-                    let pmem_suffix = format!("/{}/{}", SCSI_BLOCK_SUFFIX, self.devname);
-                    devpath.starts_with(ACPI_DEV_PATH) &&
-                        devpath.ends_with(pmem_suffix.as_str()) &&
-                        dev_addr.ends_with(pmem_suffix.as_str())
+        sb.uevent_watchers.iter_mut().for_each(move |watch| {
+            if let Some((matcher, _)) = watch {
+                if matcher.is_match(self) {
+                    let (_, sender) = watch.take().unwrap();
+                    let _ = sender.send(self.clone());
                 }
-            })
-            .map(|(k, sender)| {
-                let devname = self.devname.clone();
-                let sender = sender.take().unwrap();
-                let _ = sender.send(devname);
-                k.clone()
-            })
-            .collect();
-
-        // Remove notified nodes from the watcher map.
-        for empty in empties {
-            w.remove(&empty);
-        }
+            }
+        })
     }
 
+    #[instrument]
+    async fn process_remove(&self, logger: &Logger, sandbox: &Arc<Mutex<Sandbox>>) {
+        let mut sb = sandbox.lock().await;
+        sb.uevent_map.remove(&self.devpath);
+    }
+
+    #[instrument]
     async fn process(&self, logger: &Logger, sandbox: &Arc<Mutex<Sandbox>>) {
-        if self.is_block_add_event() {
-            return self.handle_block_add_event(sandbox).await;
-        } else if self.action == U_EVENT_ACTION_ADD {
-            let online_path = format!("{}/{}/online", SYSFS_DIR, &self.devpath);
-            // It's a memory hot-add event.
-            if online_path.starts_with(SYSFS_MEMORY_ONLINE_PATH) {
-                let _ = online_device(online_path.as_ref()).map_err(|e| {
-                    error!(
-                        *logger,
-                        "failed to online device";
-                        "device" => &self.devpath,
-                        "error" => format!("{}", e),
-                    )
-                });
-                return;
-            }
+        if self.action == U_EVENT_ACTION_ADD {
+            return self.process_add(logger, sandbox).await;
+        } else if self.action == U_EVENT_ACTION_REMOVE {
+            return self.process_remove(logger, sandbox).await;
         }
         debug!(*logger, "ignoring event"; "uevent" => format!("{:?}", self));
     }
 }
 
-pub async fn watch_uevents(sandbox: Arc<Mutex<Sandbox>>) {
+#[instrument]
+pub async fn wait_for_uevent(
+    sandbox: &Arc<Mutex<Sandbox>>,
+    matcher: impl UeventMatcher,
+) -> Result<Uevent> {
+    let logprefix = format!("Waiting for {:?}", &matcher);
+
+    info!(sl(), "{}", logprefix);
+    let mut sb = sandbox.lock().await;
+    for uev in sb.uevent_map.values() {
+        if matcher.is_match(uev) {
+            info!(sl(), "{}: found {:?} in uevent map", logprefix, &uev);
+            return Ok(uev.clone());
+        }
+    }
+
+    // If device is not found in the device map, hotplug event has not
+    // been received yet, create and add channel to the watchers map.
+    // The key of the watchers map is the device we are interested in.
+    // Note this is done inside the lock, not to miss any events from the
+    // global udev listener.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Uevent>();
+    let idx = sb.uevent_watchers.len();
+    sb.uevent_watchers.push(Some((Box::new(matcher), tx)));
+    drop(sb); // unlock
+
+    info!(sl(), "{}: waiting on channel", logprefix);
+
+    let hotplug_timeout = AGENT_CONFIG.hotplug_timeout;
+
+    let uev = match tokio::time::timeout(hotplug_timeout, rx).await {
+        Ok(v) => v?,
+        Err(_) => {
+            let mut sb = sandbox.lock().await;
+            let matcher = sb.uevent_watchers[idx].take().unwrap().0;
+
+            return Err(anyhow!(
+                "Timeout after {:?} waiting for uevent {:?}",
+                hotplug_timeout,
+                &matcher
+            ));
+        }
+    };
+
+    info!(sl(), "{}: found {:?} on channel", logprefix, &uev);
+    Ok(uev)
+}
+
+#[instrument]
+pub async fn watch_uevents(
+    sandbox: Arc<Mutex<Sandbox>>,
+    mut shutdown: Receiver<bool>,
+) -> Result<()> {
     let sref = sandbox.clone();
     let s = sref.lock().await;
     let logger = s.logger.new(o!("subsystem" => "uevent"));
 
-    tokio::spawn(async move {
-        let mut socket;
-        unsafe {
-            let fd = libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
-                protocols::NETLINK_KOBJECT_UEVENT as libc::c_int,
-            );
-            socket = TokioSocket::from_raw_fd(fd);
-        }
-        socket.bind(&SocketAddr::new(0, 1)).unwrap();
+    // Unlock the sandbox to allow a successful shutdown
+    drop(s);
 
-        loop {
-            match socket.recv_from_full().await {
-                Err(e) => {
-                    error!(logger, "receive uevent message failed"; "error" => format!("{}", e))
-                }
-                Ok((buf, addr)) => {
-                    if addr.port_number() != 0 {
-                        // not our netlink message
-                        let err_msg = format!("{:?}", nix::Error::Sys(Errno::EBADMSG));
-                        error!(logger, "receive uevent message failed"; "error" => err_msg);
-                        return;
+    info!(logger, "starting uevents handler");
+
+    let mut socket;
+
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            protocols::NETLINK_KOBJECT_UEVENT as libc::c_int,
+        );
+        socket = TokioSocket::from_raw_fd(fd);
+    }
+
+    socket.bind(&SocketAddr::new(0, 1))?;
+
+    loop {
+        select! {
+            _ = shutdown.changed() => {
+                info!(logger, "got shutdown request");
+                break;
+            }
+            result = socket.recv_from_full() => {
+                match result {
+                    Err(e) => {
+                        error!(logger, "failed to receive uevent"; "error" => format!("{}", e))
                     }
-
-                    let text = String::from_utf8(buf);
-                    match text {
-                        Err(e) => {
-                            error!(logger, "failed to convert bytes to text"; "error" => format!("{}", e))
+                    Ok((buf, addr)) => {
+                        if addr.port_number() != 0 {
+                            // not our netlink message
+                            let err_msg = format!("{:?}", nix::Error::EBADMSG);
+                            error!(logger, "receive uevent message failed"; "error" => err_msg);
+                            continue;
                         }
-                        Ok(text) => {
-                            let event = Uevent::new(&text);
-                            info!(logger, "got uevent message"; "event" => format!("{:?}", event));
-                            event.process(&logger, &sandbox).await;
+
+                        let text = String::from_utf8(buf);
+                        match text {
+                            Err(e) => {
+                                error!(logger, "failed to convert bytes to text"; "error" => format!("{}", e))
+                            }
+                            Ok(text) => {
+                                let event = Uevent::new(&text);
+                                info!(logger, "got uevent message"; "event" => format!("{:?}", event));
+                                event.process(&logger, &sandbox).await;
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+// Used in the device module unit tests
+#[cfg(test)]
+pub(crate) fn spawn_test_watcher(sandbox: Arc<Mutex<Sandbox>>, uev: Uevent) {
+    tokio::spawn(async move {
+        loop {
+            let mut sb = sandbox.lock().await;
+            let uev = uev.clone();
+            sb.uevent_watchers.iter_mut().for_each(move |watch| {
+                if let Some((matcher, _)) = watch {
+                    if matcher.is_match(&uev) {
+                        let (_, sender) = watch.take().unwrap();
+                        let _ = sender.send(uev.clone());
+                    }
+                }
+            });
+
+            drop(sb); // unlock
+        }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    struct AlwaysMatch();
+
+    impl UeventMatcher for AlwaysMatch {
+        fn is_match(&self, _: &Uevent) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_uevent() {
+        let uev = Uevent {
+            action: crate::linux_abi::U_EVENT_ACTION_ADD.to_string(),
+            subsystem: "test".to_string(),
+            devpath: "/test/sysfs/path".to_string(),
+            devname: "testdevname".to_string(),
+            ..Default::default()
+        };
+
+        let matcher = AlwaysMatch();
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let sandbox = Arc::new(Mutex::new(Sandbox::new(&logger).unwrap()));
+
+        let mut sb = sandbox.lock().await;
+        sb.uevent_map.insert(uev.devpath.clone(), uev.clone());
+        drop(sb); // unlock
+
+        let uev2 = wait_for_uevent(&sandbox, matcher).await;
+        assert!(uev2.is_ok());
+        assert_eq!(uev2.unwrap(), uev);
+
+        let mut sb = sandbox.lock().await;
+        sb.uevent_map.remove(&uev.devpath).unwrap();
+        drop(sb); // unlock
+
+        spawn_test_watcher(sandbox.clone(), uev.clone());
+
+        let uev2 = wait_for_uevent(&sandbox, matcher).await;
+        assert!(uev2.is_ok());
+        assert_eq!(uev2.unwrap(), uev);
+    }
 }

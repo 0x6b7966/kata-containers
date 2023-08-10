@@ -1,21 +1,5 @@
 # Kata Containers and service mesh for Kubernetes
 
-* [Assumptions](#assumptions)
-* [How they work](#how-they-work)
-* [Prerequisites](#prerequisites)
-    * [Kata and Kubernetes](#kata-and-kubernetes)
-    * [Restrictions](#restrictions)
-* [Install and deploy your service mesh](#install-and-deploy-your-service-mesh)
-    * [Service Mesh Istio](#service-mesh-istio)
-    * [Service Mesh Linkerd](#service-mesh-linkerd)
-* [Inject your services with sidecars](#inject-your-services-with-sidecars)
-    * [Sidecar Istio](#sidecar-istio)
-    * [Sidecar Linkerd](#sidecar-linkerd)
-* [Run your services with Kata](#run-your-services-with-kata)
-    * [Lower privileges](#lower-privileges)
-    * [Add annotations](#add-annotations)
-    * [Deploy](#deploy)
-
 A service mesh is a way to monitor and control the traffic between
 micro-services running in your Kubernetes cluster. It is a powerful
 tool that you might want to use in combination with the security
@@ -50,7 +34,7 @@ as the proxy starts.
 
 Follow the [instructions](../install/README.md)
 to get Kata Containers properly installed and configured with Kubernetes.
-You can choose between CRI-O and CRI-containerd, both are supported
+You can choose between CRI-O and containerd, both are supported
 through this document.
 
 For both cases, select the workloads as _trusted_ by default. This way,
@@ -76,14 +60,15 @@ is not able to perform a proper setup of the rules.
 
 ### Service Mesh Istio
 
-As a reference, you can follow Istio [instructions](https://istio.io/docs/setup/kubernetes/quick-start/#download-and-prepare-for-the-installation).
-
 The following is a summary of what you need to install Istio on your system:
+
 ```
 $ curl -L https://git.io/getLatestIstio | sh -
 $ cd istio-*
 $ export PATH=$PWD/bin:$PATH
 ```
+
+See the [Istio documentation](https://istio.io/docs) for further details.
 
 Now deploy Istio in the control plane of your cluster with the following:
 ```
@@ -174,7 +159,7 @@ containers with `privileged: true` to `privileged: false`.
 There is no difference between Istio and Linkerd in this section. It is
 about which CRI implementation you use.
 
-For both CRI-O and CRI-containerd, you have to add an annotation indicating
+For both CRI-O and containerd, you have to add an annotation indicating
 the workload for this deployment is not _trusted_, which will trigger
 `kata-runtime` to be called instead of `runc`.
 
@@ -208,9 +193,9 @@ spec:
 ...
 ```
 
-__CRI-containerd:__
+__containerd:__
 
-Add the following annotation for CRI-containerd
+Add the following annotation for containerd
 ```yaml
 io.kubernetes.cri.untrusted-workload: "true"
 ```

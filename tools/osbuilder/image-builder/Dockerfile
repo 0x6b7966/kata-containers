@@ -2,9 +2,18 @@
 # Copyright (c) 2018 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
+ARG IMAGE_REGISTRY=registry.fedoraproject.org
+FROM ${IMAGE_REGISTRY}/fedora:38
 
-From registry.fedoraproject.org/fedora:latest
-
-RUN [ -n "$http_proxy" ] && sed -i '$ a proxy='$http_proxy /etc/dnf/dnf.conf ; true
-
-RUN dnf install -y qemu-img parted gdisk e2fsprogs gcc xfsprogs findutils
+RUN ([ -n "$http_proxy" ] && \
+    sed -i '$ a proxy='$http_proxy /etc/dnf/dnf.conf ; true) && \
+    dnf install -y \
+        e2fsprogs \
+        findutils \
+        gcc \
+        gdisk \
+        parted \
+        qemu-img \
+        veritysetup \
+        xfsprogs && \
+    dnf clean all

@@ -3,17 +3,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+//go:build linux
+// +build linux
+
 package virtcontainers
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/stretchr/testify/assert"
@@ -81,8 +83,9 @@ func TestAcrnArchBaseKernelParameters(t *testing.T) {
 func TestAcrnArchBaseCapabilities(t *testing.T) {
 	assert := assert.New(t)
 	acrnArchBase := newAcrnArchBase()
+	config := HypervisorConfig{}
 
-	c := acrnArchBase.capabilities()
+	c := acrnArchBase.capabilities(config)
 	assert.True(c.IsBlockDeviceSupported())
 	assert.True(c.IsBlockDeviceHotplugSupported())
 	assert.False(c.IsFsSharingSupported())
@@ -127,7 +130,7 @@ func TestAcrnArchBaseAppendImage(t *testing.T) {
 	assert := assert.New(t)
 	acrnArchBase := newAcrnArchBase()
 
-	image, err := ioutil.TempFile("", "img")
+	image, err := os.CreateTemp("", "img")
 	assert.NoError(err)
 	defer os.Remove(image.Name())
 	err = image.Close()

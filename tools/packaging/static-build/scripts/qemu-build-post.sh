@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright (c) 2020 Red Hat, Inc.
 #
@@ -22,6 +22,14 @@ echo "INFO: remove uneeded files"
 for pattern in ${qemu_black_list[@]}; do
 	find . -path "$pattern" | xargs rm -rfv
 done
+
+if [[ -n "${BUILD_SUFFIX}" ]]; then
+	echo "Rename binaries using $BUILD_SUFFIX"
+	find -name 'qemu-system-*' -exec mv {} {}-$BUILD_SUFFIX \;
+	if [[ ${ARCH} != "x86_64" ]]; then
+		find -name 'virtiofsd' -exec mv {} {}-$BUILD_SUFFIX \;
+	fi
+fi
 
 echo "INFO: create the tarball"
 tar -czvf "${QEMU_TARBALL}" *

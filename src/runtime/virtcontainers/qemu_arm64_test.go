@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 IBM
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -6,12 +8,13 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 
-	govmmQemu "github.com/kata-containers/govmm/qemu"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/govmm"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -54,10 +57,10 @@ func TestQemuArm64MemoryTopology(t *testing.T) {
 	assert.Equal(expectedMemory, m)
 }
 
-func TestMaxQemuVCPUs(t *testing.T) {
+func TestMaxVCPUs(t *testing.T) {
 	assert := assert.New(t)
 
-	vCPUs := MaxQemuVCPUs()
+	vCPUs := govmm.MaxVCPUs()
 	assert.Equal(uint32(123), vCPUs)
 }
 
@@ -77,12 +80,15 @@ func TestQemuArm64AppendBridges(t *testing.T) {
 
 	expectedOut := []govmmQemu.Device{
 		govmmQemu.BridgeDevice{
-			Type:    govmmQemu.PCIBridge,
-			Bus:     defaultBridgeBus,
-			ID:      bridges[0].ID,
-			Chassis: 1,
-			SHPC:    true,
-			Addr:    "2",
+			Type:          govmmQemu.PCIBridge,
+			Bus:           defaultBridgeBus,
+			ID:            bridges[0].ID,
+			Chassis:       1,
+			SHPC:          false,
+			Addr:          "2",
+			IOReserve:     "4k",
+			MemReserve:    "1m",
+			Pref64Reserve: "1m",
 		},
 	}
 
@@ -93,7 +99,7 @@ func TestQemuArm64AppendImage(t *testing.T) {
 	var devices []govmmQemu.Device
 	assert := assert.New(t)
 
-	f, err := ioutil.TempFile("", "img")
+	f, err := os.CreateTemp("", "img")
 	assert.NoError(err)
 	defer func() { _ = f.Close() }()
 	defer func() { _ = os.Remove(f.Name()) }()
@@ -101,14 +107,11 @@ func TestQemuArm64AppendImage(t *testing.T) {
 	imageStat, err := f.Stat()
 	assert.NoError(err)
 
-	// save default supportedQemuMachines options
-	machinesCopy := make([]govmmQemu.Machine, len(supportedQemuMachines))
-	assert.Equal(len(supportedQemuMachines), copy(machinesCopy, supportedQemuMachines))
-
 	cfg := qemuConfig(QemuVirt)
 	cfg.ImagePath = f.Name()
-	arm64 := newQemuArch(cfg)
-	assert.Contains(m.machine().Options, qemuNvdimmOption)
+	arm64, err := newQemuArch(cfg)
+	assert.NoError(err)
+	assert.Contains(arm64.machine().Options, qemuNvdimmOption)
 
 	expectedOut := []govmmQemu.Device{
 		govmmQemu.Object{
@@ -121,12 +124,42 @@ func TestQemuArm64AppendImage(t *testing.T) {
 		},
 	}
 
-	devices, err = arm64.appendImage(devices, f.Name())
+	devices, err = arm64.appendImage(context.Background(), devices, f.Name())
 	assert.NoError(err)
 	assert.Equal(expectedOut, devices)
+}
 
-	// restore default supportedQemuMachines options
-	assert.Equal(len(supportedQemuMachines), copy(supportedQemuMachines, machinesCopy))
+func TestQemuArm64AppendNvdimmImage(t *testing.T) {
+	var devices []govmmQemu.Device
+	assert := assert.New(t)
+
+	f, err := os.CreateTemp("", "img")
+	assert.NoError(err)
+	defer func() { _ = f.Close() }()
+	defer func() { _ = os.Remove(f.Name()) }()
+
+	imageStat, err := f.Stat()
+	assert.NoError(err)
+
+	cfg := qemuConfig(QemuVirt)
+	cfg.ImagePath = f.Name()
+	arm64, err := newQemuArch(cfg)
+	assert.NoError(err)
+
+	expectedOut := []govmmQemu.Device{
+		govmmQemu.Object{
+			Driver:   govmmQemu.NVDIMM,
+			Type:     govmmQemu.MemoryBackendFile,
+			DeviceID: "nv0",
+			ID:       "mem0",
+			MemPath:  f.Name(),
+			Size:     (uint64)(imageStat.Size()),
+		},
+	}
+
+	devices, err = arm64.appendNvdimmImage(devices, f.Name())
+	assert.NoError(err)
+	assert.Equal(expectedOut, devices)
 }
 
 func TestQemuArm64WithInitrd(t *testing.T) {
@@ -134,7 +167,58 @@ func TestQemuArm64WithInitrd(t *testing.T) {
 
 	cfg := qemuConfig(QemuVirt)
 	cfg.InitrdPath = "dummy-initrd"
-	arm64 := newQemuArch(cfg)
+	arm64, err := newQemuArch(cfg)
+	assert.NoError(err)
 
-	assert.NotContains(m.machine().Options, qemuNvdimmOption)
+	assert.NotContains(arm64.machine().Options, qemuNvdimmOption)
+}
+
+func TestQemuArm64AppendProtectionDevice(t *testing.T) {
+	assert := assert.New(t)
+	arm64 := newTestQemu(assert, QemuVirt)
+
+	var devices []govmmQemu.Device
+	var bios, firmware string
+	var err error
+
+	// no protection
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
+	assert.Empty(devices)
+	assert.Empty(bios)
+	assert.NoError(err)
+
+	// PEF protection
+	arm64.(*qemuArm64).protection = pefProtection
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
+	assert.Empty(devices)
+	assert.Empty(bios)
+	assert.NoError(err)
+
+	// Secure Execution protection
+	arm64.(*qemuArm64).protection = seProtection
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
+	assert.Empty(devices)
+	assert.Empty(bios)
+	assert.NoError(err)
+
+	// SEV protection
+	arm64.(*qemuArm64).protection = sevProtection
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
+	assert.Empty(devices)
+	assert.Empty(bios)
+	assert.NoError(err)
+
+	// SNP protection
+	arm64.(*qemuArm64).protection = snpProtection
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
+	assert.Empty(devices)
+	assert.Empty(bios)
+	assert.NoError(err)
+
+	// TDX protection
+	arm64.(*qemuArm64).protection = tdxProtection
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
+	assert.Empty(devices)
+	assert.Empty(bios)
+	assert.NoError(err)
 }

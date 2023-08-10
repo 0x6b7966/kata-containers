@@ -19,12 +19,14 @@ import (
 type cache struct {
 	base base.FactoryBase
 
-	cacheCh   chan *vc.VM
-	closed    chan<- int
+	cacheCh chan *vc.VM
+	closed  chan<- int
+
+	vmm map[*vc.VM]interface{}
+
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 
-	vmm     map[*vc.VM]interface{}
 	vmmLock sync.RWMutex
 }
 
@@ -62,8 +64,8 @@ func New(ctx context.Context, count uint, b base.FactoryBase) base.FactoryBase {
 					c.removeFromVmm(vm)
 				case <-closed:
 					c.removeFromVmm(vm)
-					vm.Stop()
-					vm.Disconnect()
+					vm.Stop(ctx)
+					vm.Disconnect(ctx)
 					c.wg.Done()
 					return
 				}

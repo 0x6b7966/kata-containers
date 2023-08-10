@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2016 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -11,36 +13,47 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
-	govmmQemu "github.com/kata-containers/govmm/qemu"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
+
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel"
-	otelLabel "go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/sys/unix"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
+	hv "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	pkgUtils "github.com/kata-containers/kata-containers/src/runtime/pkg/utils"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/uuid"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/uuid"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 )
+
+// qemuTracingTags defines tags for the trace span
+var qemuTracingTags = map[string]string{
+	"source":    "runtime",
+	"package":   "virtcontainers",
+	"subsystem": "hypervisor",
+	"type":      "qemu",
+}
 
 // romFile is the file name of the ROM that can be used for virtio-pci devices.
 // If this file name is empty, this means we expect the firmware used by Qemu,
@@ -53,80 +66,79 @@ const romFile = ""
 const defaultDisableModern = false
 
 type qmpChannel struct {
-	sync.Mutex
-	ctx     context.Context
-	path    string
 	qmp     *govmmQemu.QMP
+	ctx     context.Context
 	disconn chan struct{}
-}
-
-// CPUDevice represents a CPU device which was hot-added in a running VM
-type CPUDevice struct {
-	// ID is used to identify this CPU in the hypervisor options.
-	ID string
+	path    string
+	sync.Mutex
 }
 
 // QemuState keeps Qemu's state
 type QemuState struct {
-	Bridges []types.Bridge
-	// HotpluggedCPUs is the list of CPUs that were hot-added
-	HotpluggedVCPUs      []CPUDevice
-	HotpluggedMemory     int
-	UUID                 string
-	HotplugVFIOOnRootBus bool
-	VirtiofsdPid         int
-	PCIeRootPort         int
+	UUID              string
+	HotPlugVFIO       config.PCIePort
+	Bridges           []types.Bridge
+	HotpluggedVCPUs   []hv.CPUDevice
+	HotpluggedMemory  int
+	VirtiofsDaemonPid int
+	HotplugVFIO       config.PCIePort
+	ColdPlugVFIO      config.PCIePort
 }
 
 // qemu is an Hypervisor interface implementation for the Linux qemu hypervisor.
+// nolint: govet
 type qemu struct {
-	id string
-
-	config HypervisorConfig
-
-	qmpMonitorCh qmpChannel
-
-	qemuConfig govmmQemu.Config
-
-	state QemuState
-
 	arch qemuArch
+
+	virtiofsDaemon VirtiofsDaemon
+
+	ctx context.Context
 
 	// fds is a list of file descriptors inherited by QEMU process
 	// they'll be closed once QEMU process is running
 	fds []*os.File
 
-	ctx context.Context
+	id string
 
-	nvdimmCount int
+	state QemuState
 
-	stopped bool
+	qmpMonitorCh qmpChannel
 
-	store persistapi.PersistDriver
+	qemuConfig govmmQemu.Config
+
+	config HypervisorConfig
 
 	// if in memory dump progress
 	memoryDumpFlag sync.Mutex
+
+	nvdimmCount int
+
+	stopped int32
+
+	mu sync.Mutex
 }
 
 const (
 	consoleSocket = "console.sock"
 	qmpSocket     = "qmp.sock"
+	hmpSocket     = "hmp.sock"
 	vhostFSSocket = "vhost-fs.sock"
+	nydusdAPISock = "nydusd-api.sock"
 
 	// memory dump format will be set to elf
 	memoryDumpFormat = "elf"
 
-	qmpCapErrMsg  = "Failed to negoatiate QMP capabilities"
+	qmpCapErrMsg  = "Failed to negotiate QMP Capabilities"
 	qmpExecCatCmd = "exec:cat"
 
 	scsiControllerID         = "scsi0"
 	rngID                    = "rng0"
-	vsockKernelOption        = "agent.use_vsock"
 	fallbackFileBackedMemDir = "/dev/shm"
-)
 
-var qemuMajorVersion int
-var qemuMinorVersion int
+	qemuStopSandboxTimeoutSecs = 15
+
+	qomPathPrefix = "/machine/peripheral/"
+)
 
 // agnostic list of kernel parameters
 var defaultKernelParameters = []Param{
@@ -139,7 +151,7 @@ type qmpLogger struct {
 
 func newQMPLogger() qmpLogger {
 	return qmpLogger{
-		logger: virtLog.WithField("subsystem", "qmp"),
+		logger: hvLogger.WithField("subsystem", "qmp"),
 	}
 }
 
@@ -161,7 +173,7 @@ func (l qmpLogger) Errorf(format string, v ...interface{}) {
 
 // Logger returns a logrus logger appropriate for logging qemu messages
 func (q *qemu) Logger() *logrus.Entry {
-	return virtLog.WithField("subsystem", "qemu")
+	return hvLogger.WithField("subsystem", "qemu")
 }
 
 func (q *qemu) kernelParameters() string {
@@ -174,6 +186,15 @@ func (q *qemu) kernelParameters() string {
 	// set the maximum number of vCPUs
 	params = append(params, Param{"nr_cpus", fmt.Sprintf("%d", q.config.DefaultMaxVCPUs)})
 
+	// set the SELinux params in accordance with the runtime configuration, disable_guest_selinux.
+	if q.config.DisableGuestSeLinux {
+		q.Logger().Info("Set selinux=0 to kernel params because SELinux on the guest is disabled")
+		params = append(params, Param{"selinux", "0"})
+	} else {
+		q.Logger().Info("Set selinux=1 to kernel params because SELinux on the guest is enabled")
+		params = append(params, Param{"selinux", "1"})
+	}
+
 	// add the params specified by the provided config. As the kernel
 	// honours the last parameter value set and since the config-provided
 	// params are added here, they will take priority over the defaults.
@@ -185,14 +206,14 @@ func (q *qemu) kernelParameters() string {
 }
 
 // Adds all capabilities supported by qemu implementation of hypervisor interface
-func (q *qemu) capabilities() types.Capabilities {
-	span, _ := q.trace("capabilities")
+func (q *qemu) Capabilities(ctx context.Context) types.Capabilities {
+	span, _ := katatrace.Trace(ctx, q.Logger(), "Capabilities", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
-	return q.arch.capabilities()
+	return q.arch.capabilities(q.config)
 }
 
-func (q *qemu) hypervisorConfig() HypervisorConfig {
+func (q *qemu) HypervisorConfig() HypervisorConfig {
 	return q.config
 }
 
@@ -214,31 +235,19 @@ func (q *qemu) qemuPath() (string, error) {
 	return p, nil
 }
 
-func (q *qemu) trace(name string) (otelTrace.Span, context.Context) {
-	if q.ctx == nil {
-		q.Logger().WithField("type", "bug").Error("trace called before context set")
-		q.ctx = context.Background()
-	}
-
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(q.ctx, name)
-	span.SetAttributes([]otelLabel.KeyValue{otelLabel.Key("subsystem").String("hypervisor"), otelLabel.Key("type").String("qemu")}...)
-
-	return span, ctx
-}
-
 // setup sets the Qemu structure up.
-func (q *qemu) setup(id string, hypervisorConfig *HypervisorConfig) error {
-	span, _ := q.trace("setup")
+func (q *qemu) setup(ctx context.Context, id string, hypervisorConfig *HypervisorConfig) error {
+	span, _ := katatrace.Trace(ctx, q.Logger(), "setup", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
-	err := hypervisorConfig.valid()
-	if err != nil {
+	if err := q.setConfig(hypervisorConfig); err != nil {
 		return err
 	}
 
 	q.id = id
-	q.config = *hypervisorConfig
+
+	var err error
+
 	q.arch, err = newQemuArch(q.config)
 	if err != nil {
 		return err
@@ -272,13 +281,13 @@ func (q *qemu) setup(id string, hypervisorConfig *HypervisorConfig) error {
 
 		q.Logger().Debug("Creating UUID")
 		q.state.UUID = uuid.Generate().String()
-
-		q.state.HotplugVFIOOnRootBus = q.config.HotplugVFIOOnRootBus
-		q.state.PCIeRootPort = int(q.config.PCIeRootPort)
+		q.state.HotPlugVFIO = q.config.HotPlugVFIO
+		q.state.ColdPlugVFIO = q.config.ColdPlugVFIO
+		q.state.HotPlugVFIO = q.config.HotPlugVFIO
 
 		// The path might already exist, but in case of VM templating,
 		// we have to create it since the sandbox has not created it yet.
-		if err = os.MkdirAll(filepath.Join(q.store.RunStoragePath(), id), DirMode); err != nil {
+		if err = utils.MkdirAllWithInheritedOwner(filepath.Join(q.config.RunStorePath, id), DirMode); err != nil {
 			return err
 		}
 	}
@@ -309,31 +318,19 @@ func (q *qemu) cpuTopology() govmmQemu.SMP {
 	return q.arch.cpuTopology(q.config.NumVCPUs, q.config.DefaultMaxVCPUs)
 }
 
-func (q *qemu) hostMemMB() (uint64, error) {
-	hostMemKb, err := getHostMemorySizeKb(procMemInfo)
-	if err != nil {
-		return 0, fmt.Errorf("Unable to read memory info: %s", err)
-	}
-	if hostMemKb == 0 {
-		return 0, fmt.Errorf("Error host memory size 0")
-	}
-
-	return hostMemKb / 1024, nil
-}
-
 func (q *qemu) memoryTopology() (govmmQemu.Memory, error) {
-	hostMemMb, err := q.hostMemMB()
-	if err != nil {
-		return govmmQemu.Memory{}, err
-	}
-
+	hostMemMb := q.config.DefaultMaxMemorySize
 	memMb := uint64(q.config.MemorySize)
 
 	return q.arch.memoryTopology(memMb, hostMemMb, uint8(q.config.MemSlots)), nil
 }
 
 func (q *qemu) qmpSocketPath(id string) (string, error) {
-	return utils.BuildSocketPath(q.store.RunVMStoragePath(), id, qmpSocket)
+	return utils.BuildSocketPath(q.config.VMStorePath, id, qmpSocket)
+}
+
+func (q *qemu) hmpSocketPath(id string) (string, error) {
+	return utils.BuildSocketPath(q.config.VMStorePath, id, hmpSocket)
 }
 
 func (q *qemu) getQemuMachine() (govmmQemu.Machine, error) {
@@ -350,14 +347,14 @@ func (q *qemu) getQemuMachine() (govmmQemu.Machine, error) {
 	return machine, nil
 }
 
-func (q *qemu) appendImage(devices []govmmQemu.Device) ([]govmmQemu.Device, error) {
+func (q *qemu) appendImage(ctx context.Context, devices []govmmQemu.Device) ([]govmmQemu.Device, error) {
 	imagePath, err := q.config.ImageAssetPath()
 	if err != nil {
 		return nil, err
 	}
 
 	if imagePath != "" {
-		devices, err = q.arch.appendImage(devices, imagePath)
+		devices, err = q.arch.appendImage(ctx, devices, imagePath)
 		if err != nil {
 			return nil, err
 		}
@@ -377,20 +374,36 @@ func (q *qemu) createQmpSocket() ([]govmmQemu.QMPSocket, error) {
 		path: monitorSockPath,
 	}
 
-	return []govmmQemu.QMPSocket{
-		{
+	var sockets []govmmQemu.QMPSocket
+
+	sockets = append(sockets, govmmQemu.QMPSocket{
+		Type:   "unix",
+		Server: true,
+		NoWait: true,
+	})
+
+	if q.HypervisorConfig().Debug {
+		humanMonitorSockPath, err := q.hmpSocketPath(q.id)
+		if err != nil {
+			return nil, err
+		}
+
+		sockets = append(sockets, govmmQemu.QMPSocket{
 			Type:   "unix",
-			Name:   q.qmpMonitorCh.path,
+			IsHmp:  true,
+			Name:   humanMonitorSockPath,
 			Server: true,
 			NoWait: true,
-		},
-	}, nil
+		})
+	}
+
+	return sockets, nil
 }
 
-func (q *qemu) buildDevices(initrdPath string) ([]govmmQemu.Device, *govmmQemu.IOThread, error) {
+func (q *qemu) buildDevices(ctx context.Context, initrdPath string) ([]govmmQemu.Device, *govmmQemu.IOThread, error) {
 	var devices []govmmQemu.Device
 
-	_, console, err := q.getSandboxConsole(q.id)
+	_, console, err := q.GetVMConsole(ctx, q.id)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -399,13 +412,13 @@ func (q *qemu) buildDevices(initrdPath string) ([]govmmQemu.Device, *govmmQemu.I
 	// bridge gets the first available PCI address i.e bridgePCIStartAddr
 	devices = q.arch.appendBridges(devices)
 
-	devices, err = q.arch.appendConsole(devices, console)
+	devices, err = q.arch.appendConsole(ctx, devices, console)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if initrdPath == "" {
-		devices, err = q.appendImage(devices)
+		devices, err = q.appendImage(ctx, devices)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -425,7 +438,7 @@ func (q *qemu) buildDevices(initrdPath string) ([]govmmQemu.Device, *govmmQemu.I
 
 	var ioThread *govmmQemu.IOThread
 	if q.config.BlockDeviceDriver == config.VirtioSCSI {
-		return q.arch.appendSCSIController(devices, q.config.EnableIOThreads)
+		return q.arch.appendSCSIController(ctx, devices, q.config.EnableIOThreads)
 	}
 
 	return devices, ioThread, nil
@@ -467,15 +480,62 @@ func (q *qemu) setupFileBackedMem(knobs *govmmQemu.Knobs, memory *govmmQemu.Memo
 	memory.Path = target
 }
 
-// createSandbox is the Hypervisor sandbox creation implementation for govmmQemu.
-func (q *qemu) createSandbox(ctx context.Context, id string, networkNS NetworkNamespace, hypervisorConfig *HypervisorConfig) error {
+func (q *qemu) setConfig(config *HypervisorConfig) error {
+	q.config = *config
+
+	return nil
+}
+
+func (q *qemu) createVirtiofsDaemon(sharedPath string) (VirtiofsDaemon, error) {
+	virtiofsdSocketPath, err := q.vhostFSSocketPath(q.id)
+	if err != nil {
+		return nil, err
+	}
+
+	if q.config.SharedFS == config.VirtioFSNydus {
+		apiSockPath, err := q.nydusdAPISocketPath(q.id)
+		if err != nil {
+			return nil, err
+		}
+		nd := &nydusd{
+			path:        q.config.VirtioFSDaemon,
+			sockPath:    virtiofsdSocketPath,
+			apiSockPath: apiSockPath,
+			sourcePath:  sharedPath,
+			debug:       q.config.Debug,
+			extraArgs:   q.config.VirtioFSExtraArgs,
+			startFn:     startInShimNS,
+		}
+		nd.setupShareDirFn = nd.setupPassthroughFS
+		return nd, nil
+	}
+
+	// Set the xattr option for virtiofsd daemon to enable extended attributes
+	// in virtiofs if SELinux on the guest side is enabled.
+	if !q.config.DisableGuestSeLinux {
+		q.Logger().Info("Set the xattr option for virtiofsd")
+		q.config.VirtioFSExtraArgs = append(q.config.VirtioFSExtraArgs, "-o", "xattr")
+	}
+
+	// default use virtiofsd
+	return &virtiofsd{
+		path:       q.config.VirtioFSDaemon,
+		sourcePath: sharedPath,
+		socketPath: virtiofsdSocketPath,
+		extraArgs:  q.config.VirtioFSExtraArgs,
+		cache:      q.config.VirtioFSCache,
+	}, nil
+}
+
+// CreateVM is the Hypervisor VM creation implementation for govmmQemu.
+func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervisorConfig *HypervisorConfig) error {
 	// Save the tracing context
 	q.ctx = ctx
 
-	span, _ := q.trace("createSandbox")
+	span, ctx := katatrace.Trace(ctx, q.Logger(), "CreateVM", qemuTracingTags, map[string]string{"VM_ID": q.id})
 	defer span.End()
 
-	if err := q.setup(id, hypervisorConfig); err != nil {
+	if err := q.setup(ctx, id, hypervisorConfig); err != nil {
 		return err
 	}
 
@@ -496,11 +556,9 @@ func (q *qemu) createSandbox(ctx context.Context, id string, networkNS NetworkNa
 		NoDefaults:    true,
 		NoGraphic:     true,
 		NoReboot:      true,
-		Daemonize:     true,
+		Daemonize:     false,
 		MemPrealloc:   q.config.MemPrealloc,
 		HugePages:     q.config.HugePages,
-		Realtime:      q.config.Realtime,
-		Mlock:         q.config.Mlock,
 		IOMMUPlatform: q.config.IOMMUPlatform,
 	}
 
@@ -514,12 +572,6 @@ func (q *qemu) createSandbox(ctx context.Context, id string, networkNS NetworkNa
 		return err
 	}
 
-	kernel := govmmQemu.Kernel{
-		Path:       kernelPath,
-		InitrdPath: initrdPath,
-		Params:     q.kernelParameters(),
-	}
-
 	incoming := q.setupTemplate(&knobs, &memory)
 
 	// With the current implementations, VM templating will not work with file
@@ -527,7 +579,8 @@ func (q *qemu) createSandbox(ctx context.Context, id string, networkNS NetworkNa
 	// builds the first VM with file-backed memory and shared=on and the
 	// subsequent ones with shared=off. virtio-fs always requires shared=on for
 	// memory.
-	if q.config.SharedFS == config.VirtioFS || q.config.FileBackedMemRootDir != "" {
+	if q.config.SharedFS == config.VirtioFS || q.config.SharedFS == config.VirtioFSNydus ||
+		q.config.FileBackedMemRootDir != "" {
 		if !(q.config.BootToBeTemplate || q.config.BootFromTemplate) {
 			q.setupFileBackedMem(&knobs, &memory)
 		} else {
@@ -562,7 +615,7 @@ func (q *qemu) createSandbox(ctx context.Context, id string, networkNS NetworkNa
 		return err
 	}
 
-	devices, ioThread, err := q.buildDevices(initrdPath)
+	devices, ioThread, err := q.buildDevices(ctx, initrdPath)
 	if err != nil {
 		return err
 	}
@@ -571,6 +624,11 @@ func (q *qemu) createSandbox(ctx context.Context, id string, networkNS NetworkNa
 	cpuModel += "," + q.config.CPUFeatures
 
 	firmwarePath, err := q.config.FirmwareAssetPath()
+	if err != nil {
+		return err
+	}
+
+	firmwareVolumePath, err := q.config.FirmwareVolumeAssetPath()
 	if err != nil {
 		return err
 	}
@@ -585,131 +643,221 @@ func (q *qemu) createSandbox(ctx context.Context, id string, networkNS NetworkNa
 		return err
 	}
 
+	// Breaks hypervisor abstraction has Kata Specific logic
+	kernel := govmmQemu.Kernel{
+		Path:       kernelPath,
+		InitrdPath: initrdPath,
+		// some devices configuration may also change kernel params, make sure this is called afterwards
+		Params: q.kernelParameters(),
+	}
+	q.checkBpfEnabled()
+
 	qemuConfig := govmmQemu.Config{
-		Name:        fmt.Sprintf("sandbox-%s", q.id),
-		UUID:        q.state.UUID,
-		Path:        qemuPath,
-		Ctx:         q.qmpMonitorCh.ctx,
-		Machine:     machine,
-		SMP:         smp,
-		Memory:      memory,
-		Devices:     devices,
-		CPUModel:    cpuModel,
-		Kernel:      kernel,
-		RTC:         rtc,
-		QMPSockets:  qmpSockets,
-		Knobs:       knobs,
-		Incoming:    incoming,
-		VGA:         "none",
-		GlobalParam: "kvm-pit.lost_tick_policy=discard",
-		Bios:        firmwarePath,
-		PFlash:      pflash,
-		PidFile:     filepath.Join(q.store.RunVMStoragePath(), q.id, "pid"),
+		Name:           fmt.Sprintf("sandbox-%s", q.id),
+		UUID:           q.state.UUID,
+		Path:           qemuPath,
+		Ctx:            q.qmpMonitorCh.ctx,
+		Uid:            q.config.Uid,
+		Gid:            q.config.Gid,
+		Groups:         q.config.Groups,
+		Machine:        machine,
+		SMP:            smp,
+		Memory:         memory,
+		Devices:        devices,
+		CPUModel:       cpuModel,
+		SeccompSandbox: q.config.SeccompSandbox,
+		Kernel:         kernel,
+		RTC:            rtc,
+		QMPSockets:     qmpSockets,
+		Knobs:          knobs,
+		Incoming:       incoming,
+		VGA:            "none",
+		GlobalParam:    "kvm-pit.lost_tick_policy=discard",
+		Bios:           firmwarePath,
+		PFlash:         pflash,
+		PidFile:        filepath.Join(q.config.VMStorePath, q.id, "pid"),
+	}
+
+	qemuConfig.Devices, qemuConfig.Bios, err = q.arch.appendProtectionDevice(qemuConfig.Devices, firmwarePath, firmwareVolumePath)
+	if err != nil {
+		return err
 	}
 
 	if ioThread != nil {
 		qemuConfig.IOThreads = []govmmQemu.IOThread{*ioThread}
 	}
 	// Add RNG device to hypervisor
-	rngDev := config.RNGDev{
-		ID:       rngID,
-		Filename: q.config.EntropySource,
-	}
-	qemuConfig.Devices, err = q.arch.appendRNGDevice(qemuConfig.Devices, rngDev)
-	if err != nil {
-		return err
-	}
-
-	// Add PCIe Root Port devices to hypervisor
-	// The pcie.0 bus do not support hot-plug, but PCIe device can be hot-plugged into PCIe Root Port.
-	// For more details, please see https://github.com/qemu/qemu/blob/master/docs/pcie.txt
-	if hypervisorConfig.PCIeRootPort > 0 {
-		qemuConfig.Devices = q.arch.appendPCIeRootPortDevice(qemuConfig.Devices, hypervisorConfig.PCIeRootPort)
+	// Skip for s390x as CPACF is used
+	if machine.Type != QemuCCWVirtio {
+		rngDev := config.RNGDev{
+			ID:       rngID,
+			Filename: q.config.EntropySource,
+		}
+		qemuConfig.Devices, err = q.arch.appendRNGDevice(ctx, qemuConfig.Devices, rngDev)
+		if err != nil {
+			return err
+		}
 	}
 
+	if machine.Type == QemuQ35 || machine.Type == QemuVirt {
+		if err := q.createPCIeTopology(&qemuConfig, hypervisorConfig, machine.Type); err != nil {
+			q.Logger().WithError(err).Errorf("Cannot create PCIe topology")
+			return err
+		}
+	}
 	q.qemuConfig = qemuConfig
 
+	q.virtiofsDaemon, err = q.createVirtiofsDaemon(hypervisorConfig.SharedPath)
+	return err
+}
+
+func (q *qemu) checkBpfEnabled() {
+	if q.config.SeccompSandbox != "" {
+		out, err := os.ReadFile("/proc/sys/net/core/bpf_jit_enable")
+		if err != nil {
+			q.Logger().WithError(err).Warningf("failed to get bpf_jit_enable status")
+			return
+		}
+		enabled, err := strconv.Atoi(strings.TrimSpace(string(out)))
+		if err != nil {
+			q.Logger().WithError(err).Warningf("failed to convert bpf_jit_enable status to integer")
+			return
+		}
+		if enabled == 0 {
+			q.Logger().Warningf("bpf_jit_enable is disabled. " +
+				"It's recommended to turn on bpf_jit_enable to reduce the performance impact of QEMU seccomp sandbox.")
+		}
+	}
+}
+
+// If a user uses 8 GPUs with 4 devices in each IOMMU Group that means we need
+// to hotplug 32 devices. We do not have enough PCIe root bus slots to
+// accomplish this task. Kata will use already some slots for vfio-xxxx-pci
+// devices.
+// Max PCI slots per root bus is 32
+// Max PCIe root ports is 16
+// Max PCIe switch ports is 16
+// There is only 64kB of IO memory each root,switch port will consume 4k hence
+// only 16 ports possible.
+func (q *qemu) createPCIeTopology(qemuConfig *govmmQemu.Config, hypervisorConfig *HypervisorConfig, machineType string) error {
+
+	// If no-port set just return no need to add PCIe Root Port or PCIe Switches
+	if hypervisorConfig.HotPlugVFIO == config.NoPort && hypervisorConfig.ColdPlugVFIO == config.NoPort && machineType == QemuQ35 {
+		return nil
+	}
+
+	// Add PCIe Root Port or PCIe Switches to the hypervisor
+	// The pcie.0 bus do not support hot-plug, but PCIe device can be hot-plugged
+	// into a PCIe Root Port or PCIe Switch.
+	// For more details, please see https://github.com/qemu/qemu/blob/master/docs/pcie.txt
+
+	// Deduce the right values for mem-reserve and pref-64-reserve memory regions
+	memSize32bit, memSize64bit := q.arch.getBARsMaxAddressableMemory()
+
+	// The default OVMF MMIO aperture is too small for some PCIe devices
+	// with huge BARs so we need to increase it.
+	// memSize64bit is in bytes, convert to MB, OVMF expects MB as a string
+	if strings.Contains(strings.ToLower(hypervisorConfig.FirmwarePath), "ovmf") {
+		pciMmio64Mb := fmt.Sprintf("%d", (memSize64bit / 1024 / 1024))
+		fwCfg := govmmQemu.FwCfg{
+			Name: "opt/ovmf/X-PciMmio64Mb",
+			Str:  pciMmio64Mb,
+		}
+		qemuConfig.FwCfg = append(qemuConfig.FwCfg, fwCfg)
+	}
+
+	// Get the number of hot(cold)-pluggable ports needed from the provided
+	// VFIO devices and VhostUserBlockDevices
+	var numOfPluggablePorts uint32 = 0
+	for _, dev := range hypervisorConfig.VFIODevices {
+		var err error
+		dev.HostPath, err = config.GetHostPath(dev, false, "")
+		if err != nil {
+			return fmt.Errorf("Cannot get host path for device: %v err: %v", dev, err)
+		}
+
+		devicesPerIOMMUGroup, err := drivers.GetAllVFIODevicesFromIOMMUGroup(dev)
+		if err != nil {
+			return fmt.Errorf("Cannot get all VFIO devices from IOMMU group with device: %v err: %v", dev, err)
+		}
+		for _, vfioDevice := range devicesPerIOMMUGroup {
+			if drivers.IsPCIeDevice(vfioDevice.BDF) {
+				numOfPluggablePorts = numOfPluggablePorts + 1
+			}
+		}
+	}
+	vfioOnRootPort := (q.state.HotPlugVFIO == config.RootPort || q.state.ColdPlugVFIO == config.RootPort)
+	vfioOnSwitchPort := (q.state.HotPlugVFIO == config.SwitchPort || q.state.ColdPlugVFIO == config.SwitchPort)
+
+	numOfVhostUserBlockDevices := len(hypervisorConfig.VhostUserBlkDevices)
+
+	// If number of PCIe root ports > 16 then bail out otherwise we may
+	// use up all slots or IO memory on the root bus and vfio-XXX-pci devices
+	// cannot be added which are crucial for Kata max slots on root bus is 32
+	// max slots on the complete pci(e) topology is 256 in QEMU
+	if vfioOnRootPort {
+		// On Arm the vhost-user-block device is a PCIe device we need
+		// to account for it in the number of pluggable ports
+		if machineType == QemuVirt {
+			numOfPluggablePorts = numOfPluggablePorts + uint32(numOfVhostUserBlockDevices)
+		}
+		if numOfPluggablePorts > maxPCIeRootPort {
+			return fmt.Errorf("Number of PCIe Root Ports exceeed allowed max of %d", maxPCIeRootPort)
+		}
+		qemuConfig.Devices = q.arch.appendPCIeRootPortDevice(qemuConfig.Devices, numOfPluggablePorts, memSize32bit, memSize64bit)
+		return nil
+	}
+	if vfioOnSwitchPort {
+		// On Arm the vhost-user-block device is a PCIe device we need
+		// to account for it in the number of pluggable ports
+		if machineType == QemuVirt {
+			numOfPluggableRootPorts := uint32(numOfVhostUserBlockDevices)
+			if numOfPluggableRootPorts > maxPCIeRootPort {
+				return fmt.Errorf("Number of PCIe Root Ports exceeed allowed max of %d", maxPCIeRootPort)
+			}
+			qemuConfig.Devices = q.arch.appendPCIeRootPortDevice(qemuConfig.Devices, numOfPluggableRootPorts, memSize32bit, memSize64bit)
+		}
+		if numOfPluggablePorts > maxPCIeSwitchPort {
+			return fmt.Errorf("Number of PCIe Switch Ports exceeed allowed max of %d", maxPCIeSwitchPort)
+		}
+		qemuConfig.Devices = q.arch.appendPCIeSwitchPortDevice(qemuConfig.Devices, numOfPluggablePorts, memSize32bit, memSize64bit)
+		return nil
+	}
 	return nil
 }
 
 func (q *qemu) vhostFSSocketPath(id string) (string, error) {
-	return utils.BuildSocketPath(q.store.RunVMStoragePath(), id, vhostFSSocket)
+	return utils.BuildSocketPath(q.config.VMStorePath, id, vhostFSSocket)
 }
 
-func (q *qemu) virtiofsdArgs(fd uintptr) []string {
-	// The daemon will terminate when the vhost-user socket
-	// connection with QEMU closes.  Therefore we do not keep track
-	// of this child process after returning from this function.
-	sourcePath := filepath.Join(getSharePath(q.id))
-	args := []string{
-		fmt.Sprintf("--fd=%v", fd),
-		"-o", "source=" + sourcePath,
-		"-o", "cache=" + q.config.VirtioFSCache,
-		"--syslog", "-o", "no_posix_lock"}
-	if q.config.Debug {
-		args = append(args, "-d")
-	} else {
-		args = append(args, "-f")
-	}
-
-	if len(q.config.VirtioFSExtraArgs) != 0 {
-		args = append(args, q.config.VirtioFSExtraArgs...)
-	}
-	return args
+func (q *qemu) nydusdAPISocketPath(id string) (string, error) {
+	return utils.BuildSocketPath(q.config.VMStorePath, id, nydusdAPISock)
 }
 
-func (q *qemu) setupVirtiofsd() (err error) {
-	var listener *net.UnixListener
-	var fd *os.File
-
-	sockPath, err := q.vhostFSSocketPath(q.id)
-	if err != nil {
-		return err
-	}
-
-	listener, err = net.ListenUnix("unix", &net.UnixAddr{
-		Name: sockPath,
-		Net:  "unix",
+func (q *qemu) setupVirtiofsDaemon(ctx context.Context) (err error) {
+	pid, err := q.virtiofsDaemon.Start(ctx, func() {
+		q.StopVM(ctx, false)
 	})
 	if err != nil {
 		return err
 	}
-	listener.SetUnlinkOnClose(false)
+	q.state.VirtiofsDaemonPid = pid
 
-	fd, err = listener.File()
-	listener.Close() // no longer needed since fd is a dup
-	listener = nil
+	return nil
+}
+
+func (q *qemu) stopVirtiofsDaemon(ctx context.Context) (err error) {
+	if q.state.VirtiofsDaemonPid == 0 {
+		q.Logger().Warn("The virtiofsd had stopped")
+		return nil
+	}
+
+	err = q.virtiofsDaemon.Stop(ctx)
 	if err != nil {
 		return err
 	}
-	defer fd.Close()
-
-	const sockFd = 3 // Cmd.ExtraFiles[] fds are numbered starting from 3
-	cmd := exec.Command(q.config.VirtioFSDaemon, q.virtiofsdArgs(sockFd)...)
-	cmd.ExtraFiles = append(cmd.ExtraFiles, fd)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-
-	err = cmd.Start()
-	if err != nil {
-		return fmt.Errorf("virtiofs daemon %v returned with error: %v", q.config.VirtioFSDaemon, err)
-	}
-	q.state.VirtiofsdPid = cmd.Process.Pid
-
-	// Monitor virtiofsd's stderr and stop sandbox if virtiofsd quits
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			q.Logger().WithField("source", "virtiofsd").Info(scanner.Text())
-		}
-		q.Logger().Info("virtiofsd quits")
-		// Wait to release resources of virtiofsd process
-		cmd.Process.Wait()
-		q.stopSandbox()
-	}()
-	return err
+	q.state.VirtiofsDaemonPid = 0
+	return nil
 }
 
 func (q *qemu) getMemArgs() (bool, string, string, error) {
@@ -730,7 +878,8 @@ func (q *qemu) getMemArgs() (bool, string, string, error) {
 			return share, target, "", fmt.Errorf("Vhost-user-blk/scsi requires hugepage memory")
 		}
 
-		if q.config.SharedFS == config.VirtioFS || q.config.FileBackedMemRootDir != "" {
+		if q.config.SharedFS == config.VirtioFS || q.config.SharedFS == config.VirtioFSNydus ||
+			q.config.FileBackedMemRootDir != "" {
 			target = q.qemuConfig.Memory.Path
 			memoryBack = "memory-backend-file"
 		}
@@ -743,13 +892,9 @@ func (q *qemu) getMemArgs() (bool, string, string, error) {
 	return share, target, memoryBack, nil
 }
 
-func (q *qemu) setupVirtioMem() error {
-	maxMem, err := q.hostMemMB()
-	if err != nil {
-		return err
-	}
-	// 1024 is size for nvdimm
-	sizeMB := int(maxMem) - int(q.config.MemorySize)
+func (q *qemu) setupVirtioMem(ctx context.Context) error {
+	// backend memory size must be multiple of 4Mib
+	sizeMB := (int(q.config.DefaultMaxMemorySize) - int(q.config.MemorySize)) >> 2 << 2
 
 	share, target, memoryBack, err := q.getMemArgs()
 	if err != nil {
@@ -759,9 +904,20 @@ func (q *qemu) setupVirtioMem() error {
 	if err = q.qmpSetup(); err != nil {
 		return err
 	}
-	err = q.qmpMonitorCh.qmp.ExecMemdevAdd(q.qmpMonitorCh.ctx, memoryBack, "virtiomem", target, sizeMB, share, "virtio-mem-pci", "virtiomem0")
+
+	addr, bridge, err := q.arch.addDeviceToBridge(ctx, "virtiomem-dev", types.PCI)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			q.arch.removeDeviceFromBridge("virtiomem-dev")
+		}
+	}()
+
+	err = q.qmpMonitorCh.qmp.ExecMemdevAdd(q.qmpMonitorCh.ctx, memoryBack, "virtiomem", target, sizeMB, share, "virtio-mem-pci", "virtiomem0", addr, bridge.ID)
 	if err == nil {
-		q.config.VirtioMem = true
 		q.Logger().Infof("Setup %dMB virtio-mem-pci success", sizeMB)
 	} else {
 		help := ""
@@ -774,9 +930,80 @@ func (q *qemu) setupVirtioMem() error {
 	return err
 }
 
-// startSandbox will start the Sandbox's VM.
-func (q *qemu) startSandbox(timeout int) error {
-	span, _ := q.trace("startSandbox")
+// setupEarlyQmpConnection creates a listener socket to be passed to QEMU
+// as a QMP listening endpoint. An initial connection is established, to
+// be used as the QMP client socket. This allows to detect an early failure
+// of QEMU instead of looping on connect until some timeout expires.
+func (q *qemu) setupEarlyQmpConnection() (net.Conn, error) {
+	monitorSockPath := q.qmpMonitorCh.path
+
+	qmpListener, err := net.Listen("unix", monitorSockPath)
+	if err != nil {
+		q.Logger().WithError(err).Errorf("Unable to listen on unix socket address (%s)", monitorSockPath)
+		return nil, err
+	}
+
+	// A duplicate fd of this socket will be passed to QEMU. We must
+	// close the original one when we're done.
+	defer qmpListener.Close()
+
+	if rootless.IsRootless() {
+		err = syscall.Chown(monitorSockPath, int(q.config.Uid), int(q.config.Gid))
+		if err != nil {
+			q.Logger().WithError(err).Errorf("Unable to make unix socket (%s) rootless", monitorSockPath)
+			return nil, err
+		}
+	}
+
+	VMFd, err := qmpListener.(*net.UnixListener).File()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			VMFd.Close()
+		}
+	}()
+
+	// This socket will be used to establish the initial QMP connection
+	dialer := net.Dialer{Cancel: q.qmpMonitorCh.ctx.Done()}
+	conn, err := dialer.Dial("unix", monitorSockPath)
+	if err != nil {
+		q.Logger().WithError(err).Errorf("Unable to connect to unix socket (%s)", monitorSockPath)
+		return nil, err
+	}
+
+	// We need to keep the socket file around to be able to re-connect
+	qmpListener.(*net.UnixListener).SetUnlinkOnClose(false)
+
+	// Pass the duplicated fd of the listener socket to QEMU
+	q.qemuConfig.QMPSockets[0].FD = VMFd
+	q.fds = append(q.fds, q.qemuConfig.QMPSockets[0].FD)
+
+	return conn, nil
+}
+
+func (q *qemu) LogAndWait(qemuCmd *exec.Cmd, reader io.ReadCloser) {
+	pid := qemuCmd.Process.Pid
+	q.Logger().Infof("Start logging QEMU (qemuPid=%d)", pid)
+	scanner := bufio.NewScanner(reader)
+	warnRE := regexp.MustCompile("(^[^:]+: )warning: ")
+	for scanner.Scan() {
+		text := scanner.Text()
+		if warnRE.MatchString(text) {
+			text = warnRE.ReplaceAllString(text, "$1")
+			q.Logger().WithField("qemuPid", pid).Warning(text)
+		} else {
+			q.Logger().WithField("qemuPid", pid).Error(text)
+		}
+	}
+	q.Logger().Infof("Stop logging QEMU (qemuPid=%d)", pid)
+	qemuCmd.Wait()
+}
+
+// StartVM will start the Sandbox's VM.
+func (q *qemu) StartVM(ctx context.Context, timeout int) error {
+	span, ctx := katatrace.Trace(ctx, q.Logger(), "StartVM", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
 	if q.config.Debug {
@@ -800,15 +1027,12 @@ func (q *qemu) startSandbox(timeout int) error {
 		q.fds = []*os.File{}
 	}()
 
-	vmPath := filepath.Join(q.store.RunVMStoragePath(), q.id)
-	err := os.MkdirAll(vmPath, DirMode)
+	vmPath := filepath.Join(q.config.VMStorePath, q.id)
+	err := utils.MkdirAllWithInheritedOwner(vmPath, DirMode)
 	if err != nil {
 		return err
 	}
-	// append logfile only on debug
-	if q.config.Debug {
-		q.qemuConfig.LogFile = filepath.Join(vmPath, "qemu.log")
-	}
+	q.Logger().WithField("vm path", vmPath).Info("created vm path")
 
 	defer func() {
 		if err != nil {
@@ -818,37 +1042,54 @@ func (q *qemu) startSandbox(timeout int) error {
 		}
 	}()
 
+	var qmpConn net.Conn
+	qmpConn, err = q.setupEarlyQmpConnection()
+	if err != nil {
+		return err
+	}
+
 	// This needs to be done as late as possible, just before launching
 	// virtiofsd are executed by kata-runtime after this call, run with
 	// the SELinux label. If these processes require privileged, we do
 	// notwant to run them under confinement.
-	if err := label.SetProcessLabel(q.config.SELinuxProcessLabel); err != nil {
-		return err
+	if !q.config.DisableSeLinux {
+		if err := label.SetProcessLabel(q.config.SELinuxProcessLabel); err != nil {
+			return err
+		}
+		defer label.SetProcessLabel("")
 	}
-	defer label.SetProcessLabel("")
-
-	if q.config.SharedFS == config.VirtioFS {
-		err = q.setupVirtiofsd()
+	if q.config.SharedFS == config.VirtioFS || q.config.SharedFS == config.VirtioFSNydus {
+		err = q.setupVirtiofsDaemon(ctx)
 		if err != nil {
 			return err
 		}
-	}
-
-	var strErr string
-	strErr, err = govmmQemu.LaunchQemu(q.qemuConfig, newQMPLogger())
-	if err != nil {
-		if q.config.Debug && q.qemuConfig.LogFile != "" {
-			b, err := ioutil.ReadFile(q.qemuConfig.LogFile)
-			if err == nil {
-				strErr += string(b)
+		defer func() {
+			if err != nil {
+				if shutdownErr := q.stopVirtiofsDaemon(ctx); shutdownErr != nil {
+					q.Logger().WithError(shutdownErr).Warn("failed to stop virtiofsDaemon")
+				}
 			}
-		}
+		}()
 
-		q.Logger().WithError(err).Errorf("failed to launch qemu: %s", strErr)
-		return fmt.Errorf("failed to launch qemu: %s, error messages from qemu log: %s", err, strErr)
 	}
 
-	err = q.waitSandbox(timeout)
+	qemuCmd, reader, err := govmmQemu.LaunchQemu(q.qemuConfig, newQMPLogger())
+	if err != nil {
+		q.Logger().WithError(err).Error("failed to launch qemu")
+		return fmt.Errorf("failed to launch qemu: %s", err)
+	}
+	if q.qemuConfig.Knobs.Daemonize {
+		// LaunchQemu returns a handle on the upper QEMU process.
+		// Wait for it to exit to assume that the QEMU daemon was
+		// actually started.
+		qemuCmd.Wait()
+	} else {
+		// Log QEMU errors and ensure the QEMU process is reaped after
+		// termination.
+		go q.LogAndWait(qemuCmd, reader)
+	}
+
+	err = q.waitVM(ctx, qmpConn, timeout)
 	if err != nil {
 		return err
 	}
@@ -860,7 +1101,7 @@ func (q *qemu) startSandbox(timeout int) error {
 	}
 
 	if q.config.VirtioMem {
-		err = q.setupVirtioMem()
+		err = q.setupVirtioMem(ctx)
 	}
 
 	return err
@@ -885,9 +1126,9 @@ func (q *qemu) bootFromTemplate() error {
 	return q.waitMigration()
 }
 
-// waitSandbox will wait for the Sandbox's VM to be up and running.
-func (q *qemu) waitSandbox(timeout int) error {
-	span, _ := q.trace("waitSandbox")
+// waitVM will wait for the Sandbox's VM to be up and running.
+func (q *qemu) waitVM(ctx context.Context, qmpConn net.Conn, timeout int) error {
+	span, _ := katatrace.Trace(ctx, q.Logger(), "waitVM", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
 	if timeout < 0 {
@@ -906,7 +1147,7 @@ func (q *qemu) waitSandbox(timeout int) error {
 	timeStart := time.Now()
 	for {
 		disconnectCh = make(chan struct{})
-		qmp, ver, err = govmmQemu.QMPStart(q.qmpMonitorCh.ctx, q.qmpMonitorCh.path, cfg, disconnectCh)
+		qmp, ver, err = govmmQemu.QMPStartWithConn(q.qmpMonitorCh.ctx, qmpConn, cfg, disconnectCh)
 		if err == nil {
 			break
 		}
@@ -921,14 +1162,11 @@ func (q *qemu) waitSandbox(timeout int) error {
 	q.qmpMonitorCh.disconn = disconnectCh
 	defer q.qmpShutdown()
 
-	qemuMajorVersion = ver.Major
-	qemuMinorVersion = ver.Minor
-
 	q.Logger().WithFields(logrus.Fields{
 		"qmp-major-version": ver.Major,
 		"qmp-minor-version": ver.Minor,
 		"qmp-micro-version": ver.Micro,
-		"qmp-capabilities":  strings.Join(ver.Capabilities, ","),
+		"qmp-Capabilities":  strings.Join(ver.Capabilities, ","),
 	}).Infof("QMP details")
 
 	if err = q.qmpMonitorCh.qmp.ExecuteQMPCapabilities(q.qmpMonitorCh.ctx); err != nil {
@@ -939,43 +1177,53 @@ func (q *qemu) waitSandbox(timeout int) error {
 	return nil
 }
 
-// stopSandbox will stop the Sandbox's VM.
-func (q *qemu) stopSandbox() error {
-	span, _ := q.trace("stopSandbox")
+// StopVM will stop the Sandbox's VM.
+func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	span, _ := katatrace.Trace(ctx, q.Logger(), "StopVM", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
 	q.Logger().Info("Stopping Sandbox")
-	if q.stopped {
+	if atomic.LoadInt32(&q.stopped) != 0 {
 		q.Logger().Info("Already stopped")
 		return nil
 	}
 
 	defer func() {
 		q.cleanupVM()
-		q.stopped = true
-	}()
-
-	if q.config.Debug && q.qemuConfig.LogFile != "" {
-		f, err := os.OpenFile(q.qemuConfig.LogFile, os.O_RDONLY, 0)
 		if err == nil {
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				q.Logger().Debug(scanner.Text())
-			}
-			if err := scanner.Err(); err != nil {
-				q.Logger().WithError(err).Debug("read qemu log failed")
-			}
+			atomic.StoreInt32(&q.stopped, 1)
 		}
-	}
+	}()
 
 	if err := q.qmpSetup(); err != nil {
 		return err
 	}
 
-	err := q.qmpMonitorCh.qmp.ExecuteQuit(q.qmpMonitorCh.ctx)
-	if err != nil {
-		q.Logger().WithError(err).Error("Fail to execute qmp QUIT")
-		return err
+	pids := q.GetPids()
+	if len(pids) == 0 {
+		return errors.New("cannot determine QEMU PID")
+	}
+	pid := pids[0]
+
+	if waitOnly {
+		err := utils.WaitLocalProcess(pid, qemuStopSandboxTimeoutSecs, syscall.Signal(0), q.Logger())
+		if err != nil {
+			return err
+		}
+	} else {
+		err = syscall.Kill(pid, syscall.SIGKILL)
+		if err != nil {
+			q.Logger().WithError(err).Error("Fail to send SIGKILL to qemu")
+			return err
+		}
+	}
+
+	if q.config.SharedFS == config.VirtioFS || q.config.SharedFS == config.VirtioFSNydus {
+		if err := q.stopVirtiofsDaemon(ctx); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -983,17 +1231,17 @@ func (q *qemu) stopSandbox() error {
 
 func (q *qemu) cleanupVM() error {
 
-	// cleanup vm path
-	dir := filepath.Join(q.store.RunVMStoragePath(), q.id)
+	// Cleanup vm path
+	dir := filepath.Join(q.config.VMStorePath, q.id)
 
 	// If it's a symlink, remove both dir and the target.
 	// This can happen when vm template links a sandbox to a vm.
 	link, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		// Well, it's just cleanup failure. Let's ignore it.
+		// Well, it's just Cleanup failure. Let's ignore it.
 		q.Logger().WithError(err).WithField("dir", dir).Warn("failed to resolve vm path")
 	}
-	q.Logger().WithField("link", link).WithField("dir", dir).Infof("cleanup vm path")
+	q.Logger().WithField("link", link).WithField("dir", dir).Infof("Cleanup vm path")
 
 	if err := os.RemoveAll(dir); err != nil {
 		q.Logger().WithError(err).Warnf("failed to remove vm path %s", dir)
@@ -1005,17 +1253,42 @@ func (q *qemu) cleanupVM() error {
 	}
 
 	if q.config.VMid != "" {
-		dir = filepath.Join(q.store.RunStoragePath(), q.config.VMid)
+		dir = filepath.Join(q.config.RunStorePath, q.config.VMid)
 		if err := os.RemoveAll(dir); err != nil {
 			q.Logger().WithError(err).WithField("path", dir).Warnf("failed to remove vm path")
 		}
 	}
 
+	if rootless.IsRootless() {
+		if _, err := user.Lookup(q.config.User); err != nil {
+			q.Logger().WithError(err).WithFields(
+				logrus.Fields{
+					"user": q.config.User,
+					"uid":  q.config.Uid,
+				}).Warn("failed to find the user, it might have been removed")
+			return nil
+		}
+
+		if err := pkgUtils.RemoveVmmUser(q.config.User); err != nil {
+			q.Logger().WithError(err).WithFields(
+				logrus.Fields{
+					"user": q.config.User,
+					"uid":  q.config.Uid,
+				}).Warn("failed to delete the user")
+			return nil
+		}
+		q.Logger().WithFields(
+			logrus.Fields{
+				"user": q.config.User,
+				"uid":  q.config.Uid,
+			}).Debug("successfully removed the non root user")
+	}
+
 	return nil
 }
 
-func (q *qemu) togglePauseSandbox(pause bool) error {
-	span, _ := q.trace("togglePauseSandbox")
+func (q *qemu) togglePauseSandbox(ctx context.Context, pause bool) error {
+	span, _ := katatrace.Trace(ctx, q.Logger(), "togglePauseSandbox", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
 	if err := q.qmpSetup(); err != nil {
@@ -1024,9 +1297,8 @@ func (q *qemu) togglePauseSandbox(pause bool) error {
 
 	if pause {
 		return q.qmpMonitorCh.qmp.ExecuteStop(q.qmpMonitorCh.ctx)
-	} else {
-		return q.qmpMonitorCh.qmp.ExecuteCont(q.qmpMonitorCh.ctx)
 	}
+	return q.qmpMonitorCh.qmp.ExecuteCont(q.qmpMonitorCh.ctx)
 }
 
 func (q *qemu) qmpSetup() error {
@@ -1067,19 +1339,13 @@ func (q *qemu) qmpSetup() error {
 }
 
 func (q *qemu) loopQMPEvent(event chan govmmQemu.QMPEvent) {
-	for {
-		select {
-		case e, open := <-event:
-			if !open {
-				q.Logger().Infof("QMP event channel closed")
-				return
-			}
-			q.Logger().WithField("event", e).Debug("got QMP event")
-			if e.Name == "GUEST_PANICKED" {
-				go q.handleGuestPanic()
-			}
+	for e := range event {
+		q.Logger().WithField("event", e).Debug("got QMP event")
+		if e.Name == "GUEST_PANICKED" {
+			go q.handleGuestPanic()
 		}
 	}
+	q.Logger().Infof("QMP event channel closed")
 }
 
 func (q *qemu) handleGuestPanic() {
@@ -1116,38 +1382,37 @@ func (q *qemu) canDumpGuestMemory(dumpSavePath string) error {
 	exceptMemorySize := guestMemorySizeInBytes * 2
 	if availSpaceInBytes >= exceptMemorySize {
 		return nil
-	} else {
-		return fmt.Errorf("there are not enough free space to store memory dump file. Except %d bytes, but only %d bytes available", exceptMemorySize, availSpaceInBytes)
 	}
+	return fmt.Errorf("there are not enough free space to store memory dump file. Except %d bytes, but only %d bytes available", exceptMemorySize, availSpaceInBytes)
 }
 
 // dumpSandboxMetaInfo save meta information for debug purpose, includes:
-// hypervisor verison, sandbox/container state, hypervisor config
+// hypervisor version, sandbox/container state, hypervisor config
 func (q *qemu) dumpSandboxMetaInfo(dumpSavePath string) {
 	dumpStatePath := filepath.Join(dumpSavePath, "state")
 
 	// copy state from /run/vc/sbs to memory dump directory
-	statePath := filepath.Join(q.store.RunStoragePath(), q.id)
+	statePath := filepath.Join(q.config.RunStorePath, q.id)
 	command := []string{"/bin/cp", "-ar", statePath, dumpStatePath}
-	q.Logger().WithField("command", command).Info("try to save sandbox state")
+	q.Logger().WithField("command", command).Info("try to Save sandbox state")
 	if output, err := pkgUtils.RunCommandFull(command, true); err != nil {
-		q.Logger().WithError(err).WithField("output", output).Error("failed to save state")
+		q.Logger().WithError(err).WithField("output", output).Error("failed to Save state")
 	}
-	// save hypervisor meta information
+	// Save hypervisor meta information
 	fileName := filepath.Join(dumpSavePath, "hypervisor.conf")
 	data, _ := json.MarshalIndent(q.config, "", " ")
-	if err := ioutil.WriteFile(fileName, data, defaultFilePerms); err != nil {
+	if err := os.WriteFile(fileName, data, defaultFilePerms); err != nil {
 		q.Logger().WithError(err).WithField("hypervisor.conf", data).Error("write to hypervisor.conf file failed")
 	}
 
-	// save hypervisor version
+	// Save hypervisor version
 	hyperVisorVersion, err := pkgUtils.RunCommand([]string{q.config.HypervisorPath, "--version"})
 	if err != nil {
 		q.Logger().WithError(err).WithField("HypervisorPath", data).Error("failed to get hypervisor version")
 	}
 
 	fileName = filepath.Join(dumpSavePath, "hypervisor.version")
-	if err := ioutil.WriteFile(fileName, []byte(hyperVisorVersion), defaultFilePerms); err != nil {
+	if err := os.WriteFile(fileName, []byte(hyperVisorVersion), defaultFilePerms); err != nil {
 		q.Logger().WithError(err).WithField("hypervisor.version", data).Error("write to hypervisor.version file failed")
 	}
 }
@@ -1168,11 +1433,11 @@ func (q *qemu) dumpGuestMemory(dumpSavePath string) error {
 		return err
 	}
 
-	// save meta information for sandbox
+	// Save meta information for sandbox
 	q.dumpSandboxMetaInfo(dumpSavePath)
 	q.Logger().Info("dump sandbox meta information completed")
 
-	// check device free space and estimated dump size
+	// Check device free space and estimated dump size
 	if err := q.canDumpGuestMemory(dumpSavePath); err != nil {
 		q.Logger().Warnf("can't dump guest memory: %s", err.Error())
 		return err
@@ -1210,7 +1475,7 @@ func (q *qemu) qmpShutdown() {
 	}
 }
 
-func (q *qemu) hotplugAddBlockDevice(drive *config.BlockDrive, op operation, devID string) (err error) {
+func (q *qemu) hotplugAddBlockDevice(ctx context.Context, drive *config.BlockDrive, op Operation, devID string) (err error) {
 	// drive can be a pmem device, in which case it's used as backing file for a nvdimm device
 	if q.config.BlockDeviceDriver == config.Nvdimm || drive.Pmem {
 		var blocksize int64
@@ -1241,10 +1506,19 @@ func (q *qemu) hotplugAddBlockDevice(drive *config.BlockDrive, op operation, dev
 		return nil
 	}
 
-	if q.config.BlockDeviceCacheSet {
-		err = q.qmpMonitorCh.qmp.ExecuteBlockdevAddWithCache(q.qmpMonitorCh.ctx, drive.File, drive.ID, q.config.BlockDeviceCacheDirect, q.config.BlockDeviceCacheNoflush, drive.ReadOnly)
+	qblkDevice := govmmQemu.BlockDevice{
+		ID:       drive.ID,
+		File:     drive.File,
+		ReadOnly: drive.ReadOnly,
+		AIO:      govmmQemu.BlockDeviceAIO(q.config.BlockDeviceAIO),
+	}
+
+	if drive.Swap {
+		err = q.qmpMonitorCh.qmp.ExecuteBlockdevAddWithDriverCache(q.qmpMonitorCh.ctx, "file", &qblkDevice, false, false)
+	} else if q.config.BlockDeviceCacheSet {
+		err = q.qmpMonitorCh.qmp.ExecuteBlockdevAddWithCache(q.qmpMonitorCh.ctx, &qblkDevice, q.config.BlockDeviceCacheDirect, q.config.BlockDeviceCacheNoflush)
 	} else {
-		err = q.qmpMonitorCh.qmp.ExecuteBlockdevAdd(q.qmpMonitorCh.ctx, drive.File, drive.ID, drive.ReadOnly)
+		err = q.qmpMonitorCh.qmp.ExecuteBlockdevAdd(q.qmpMonitorCh.ctx, &qblkDevice)
 	}
 	if err != nil {
 		return err
@@ -1257,10 +1531,43 @@ func (q *qemu) hotplugAddBlockDevice(drive *config.BlockDrive, op operation, dev
 	}()
 
 	switch {
+	case drive.Swap:
+		fallthrough
+	case q.config.BlockDeviceDriver == config.VirtioBlock:
+		driver := "virtio-blk-pci"
+		addr, bridge, err := q.arch.addDeviceToBridge(ctx, drive.ID, types.PCI)
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			if err != nil {
+				q.arch.removeDeviceFromBridge(drive.ID)
+			}
+		}()
+
+		bridgeSlot, err := types.PciSlotFromInt(bridge.Addr)
+		if err != nil {
+			return err
+		}
+		devSlot, err := types.PciSlotFromString(addr)
+		if err != nil {
+			return err
+		}
+		drive.PCIPath, err = types.PciPathFromSlots(bridgeSlot, devSlot)
+		if err != nil {
+			return err
+		}
+
+		queues := int(q.config.NumVCPUs)
+
+		if err = q.qmpMonitorCh.qmp.ExecutePCIDeviceAdd(q.qmpMonitorCh.ctx, drive.ID, devID, driver, addr, bridge.ID, romFile, queues, true, defaultDisableModern); err != nil {
+			return err
+		}
 	case q.config.BlockDeviceDriver == config.VirtioBlockCCW:
 		driver := "virtio-blk-ccw"
 
-		addr, bridge, err := q.arch.addDeviceToBridge(drive.ID, types.CCW)
+		addr, bridge, err := q.arch.addDeviceToBridge(ctx, drive.ID, types.CCW)
 		if err != nil {
 			return err
 		}
@@ -1274,35 +1581,6 @@ func (q *qemu) hotplugAddBlockDevice(drive *config.BlockDrive, op operation, dev
 			return err
 		}
 		if err = q.qmpMonitorCh.qmp.ExecuteDeviceAdd(q.qmpMonitorCh.ctx, drive.ID, devID, driver, devNoHotplug, "", true, false); err != nil {
-			return err
-		}
-	case q.config.BlockDeviceDriver == config.VirtioBlock:
-		driver := "virtio-blk-pci"
-		addr, bridge, err := q.arch.addDeviceToBridge(drive.ID, types.PCI)
-		if err != nil {
-			return err
-		}
-
-		defer func() {
-			if err != nil {
-				q.arch.removeDeviceFromBridge(drive.ID)
-			}
-		}()
-
-		bridgeSlot, err := vcTypes.PciSlotFromInt(bridge.Addr)
-		if err != nil {
-			return err
-		}
-		devSlot, err := vcTypes.PciSlotFromString(addr)
-		if err != nil {
-			return err
-		}
-		drive.PCIPath, err = vcTypes.PciPathFromSlots(bridgeSlot, devSlot)
-		if err != nil {
-			return err
-		}
-
-		if err = q.qmpMonitorCh.qmp.ExecutePCIDeviceAdd(q.qmpMonitorCh.ctx, drive.ID, devID, driver, addr, bridge.ID, romFile, 0, true, defaultDisableModern); err != nil {
 			return err
 		}
 	case q.config.BlockDeviceDriver == config.VirtioSCSI:
@@ -1327,8 +1605,9 @@ func (q *qemu) hotplugAddBlockDevice(drive *config.BlockDrive, op operation, dev
 	return nil
 }
 
-func (q *qemu) hotplugAddVhostUserBlkDevice(vAttr *config.VhostUserDeviceAttrs, op operation, devID string) (err error) {
-	err = q.qmpMonitorCh.qmp.ExecuteCharDevUnixSocketAdd(q.qmpMonitorCh.ctx, vAttr.DevID, vAttr.SocketPath, false, false)
+func (q *qemu) hotplugAddVhostUserBlkDevice(ctx context.Context, vAttr *config.VhostUserDeviceAttrs, op Operation, devID string) (err error) {
+
+	err = q.qmpMonitorCh.qmp.ExecuteCharDevUnixSocketAdd(q.qmpMonitorCh.ctx, vAttr.DevID, vAttr.SocketPath, false, false, vAttr.ReconnectTime)
 	if err != nil {
 		return err
 	}
@@ -1340,75 +1619,112 @@ func (q *qemu) hotplugAddVhostUserBlkDevice(vAttr *config.VhostUserDeviceAttrs, 
 	}()
 
 	driver := "vhost-user-blk-pci"
-	addr, bridge, err := q.arch.addDeviceToBridge(vAttr.DevID, types.PCI)
-	if err != nil {
-		return err
-	}
 
-	defer func() {
+	machineType := q.HypervisorConfig().HypervisorMachineType
+
+	switch machineType {
+	case QemuVirt:
+		//The addr of a dev is corresponding with device:function for PCIe in qemu which starting from 0
+		//Since the dev is the first and only one on this bus(root port), it should be 0.
+		addr := "00"
+
+		bridgeID := fmt.Sprintf("%s%d", config.PCIeRootPortPrefix, len(config.PCIeDevices[config.RootPort]))
+		config.PCIeDevices[config.RootPort][devID] = true
+
+		bridgeQomPath := fmt.Sprintf("%s%s", qomPathPrefix, bridgeID)
+		bridgeSlot, err := q.arch.qomGetSlot(bridgeQomPath, &q.qmpMonitorCh)
 		if err != nil {
-			q.arch.removeDeviceFromBridge(vAttr.DevID)
+			return err
 		}
-	}()
 
-	bridgeSlot, err := vcTypes.PciSlotFromInt(bridge.Addr)
-	if err != nil {
-		return err
-	}
-	devSlot, err := vcTypes.PciSlotFromString(addr)
-	if err != nil {
-		return err
-	}
-	vAttr.PCIPath, err = vcTypes.PciPathFromSlots(bridgeSlot, devSlot)
+		devSlot, err := types.PciSlotFromString(addr)
+		if err != nil {
+			return err
+		}
 
-	if err = q.qmpMonitorCh.qmp.ExecutePCIVhostUserDevAdd(q.qmpMonitorCh.ctx, driver, devID, vAttr.DevID, addr, bridge.ID); err != nil {
-		return err
-	}
+		vAttr.PCIPath, err = types.PciPathFromSlots(bridgeSlot, devSlot)
+		if err != nil {
+			return err
+		}
 
+		if err = q.qmpMonitorCh.qmp.ExecutePCIVhostUserDevAdd(q.qmpMonitorCh.ctx, driver, devID, vAttr.DevID, addr, bridgeID); err != nil {
+			return err
+		}
+
+	default:
+		addr, bridge, err := q.arch.addDeviceToBridge(ctx, vAttr.DevID, types.PCI)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err != nil {
+				q.arch.removeDeviceFromBridge(vAttr.DevID)
+			}
+		}()
+
+		bridgeSlot, err := types.PciSlotFromInt(bridge.Addr)
+		if err != nil {
+			return err
+		}
+
+		devSlot, err := types.PciSlotFromString(addr)
+		if err != nil {
+			return err
+		}
+		vAttr.PCIPath, err = types.PciPathFromSlots(bridgeSlot, devSlot)
+
+		if err = q.qmpMonitorCh.qmp.ExecutePCIVhostUserDevAdd(q.qmpMonitorCh.ctx, driver, devID, vAttr.DevID, addr, bridge.ID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (q *qemu) hotplugBlockDevice(drive *config.BlockDrive, op operation) error {
+func (q *qemu) hotplugBlockDevice(ctx context.Context, drive *config.BlockDrive, op Operation) error {
 	if err := q.qmpSetup(); err != nil {
 		return err
 	}
 
 	devID := "virtio-" + drive.ID
 
-	if op == addDevice {
-		return q.hotplugAddBlockDevice(drive, op, devID)
-	} else {
-		if q.config.BlockDeviceDriver == config.VirtioBlock {
-			if err := q.arch.removeDeviceFromBridge(drive.ID); err != nil {
-				return err
-			}
-		}
-
-		if err := q.qmpMonitorCh.qmp.ExecuteDeviceDel(q.qmpMonitorCh.ctx, devID); err != nil {
+	if op == AddDevice {
+		return q.hotplugAddBlockDevice(ctx, drive, op, devID)
+	}
+	if !drive.Swap && q.config.BlockDeviceDriver == config.VirtioBlock {
+		if err := q.arch.removeDeviceFromBridge(drive.ID); err != nil {
 			return err
 		}
-
-		return q.qmpMonitorCh.qmp.ExecuteBlockdevDel(q.qmpMonitorCh.ctx, drive.ID)
 	}
+
+	if err := q.qmpMonitorCh.qmp.ExecuteDeviceDel(q.qmpMonitorCh.ctx, devID); err != nil {
+		return err
+	}
+
+	return q.qmpMonitorCh.qmp.ExecuteBlockdevDel(q.qmpMonitorCh.ctx, drive.ID)
 }
 
-func (q *qemu) hotplugVhostUserDevice(vAttr *config.VhostUserDeviceAttrs, op operation) error {
+func (q *qemu) hotplugVhostUserDevice(ctx context.Context, vAttr *config.VhostUserDeviceAttrs, op Operation) error {
 	if err := q.qmpSetup(); err != nil {
 		return err
 	}
 
 	devID := "virtio-" + vAttr.DevID
 
-	if op == addDevice {
+	if op == AddDevice {
 		switch vAttr.Type {
 		case config.VhostUserBlk:
-			return q.hotplugAddVhostUserBlkDevice(vAttr, op, devID)
+			return q.hotplugAddVhostUserBlkDevice(ctx, vAttr, op, devID)
 		default:
 			return fmt.Errorf("Incorrect vhost-user device type found")
 		}
 	} else {
-		if err := q.arch.removeDeviceFromBridge(vAttr.DevID); err != nil {
-			return err
+
+		machineType := q.HypervisorConfig().HypervisorMachineType
+
+		if machineType != QemuVirt {
+			if err := q.arch.removeDeviceFromBridge(vAttr.DevID); err != nil {
+				return err
+			}
 		}
 
 		if err := q.qmpMonitorCh.qmp.ExecuteDeviceDel(q.qmpMonitorCh.ctx, devID); err != nil {
@@ -1419,85 +1735,102 @@ func (q *qemu) hotplugVhostUserDevice(vAttr *config.VhostUserDeviceAttrs, op ope
 	}
 }
 
-func (q *qemu) hotplugVFIODevice(device *config.VFIODev, op operation) (err error) {
+func (q *qemu) hotplugVFIODeviceRootPort(ctx context.Context, device *config.VFIODev) (err error) {
+	return q.executeVFIODeviceAdd(device)
+}
+
+func (q *qemu) hotplugVFIODeviceSwitchPort(ctx context.Context, device *config.VFIODev) (err error) {
+	return q.executeVFIODeviceAdd(device)
+}
+
+func (q *qemu) hotplugVFIODeviceBridgePort(ctx context.Context, device *config.VFIODev) (err error) {
+	addr, bridge, err := q.arch.addDeviceToBridge(ctx, device.ID, types.PCI)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			q.arch.removeDeviceFromBridge(device.ID)
+		}
+	}()
+	return q.executePCIVFIODeviceAdd(device, addr, bridge.ID)
+}
+
+func (q *qemu) executePCIVFIODeviceAdd(device *config.VFIODev, addr string, bridgeID string) error {
+	switch device.Type {
+	case config.VFIOPCIDeviceNormalType:
+		return q.qmpMonitorCh.qmp.ExecutePCIVFIODeviceAdd(q.qmpMonitorCh.ctx, device.ID, device.BDF, addr, bridgeID, romFile)
+	case config.VFIOPCIDeviceMediatedType:
+		return q.qmpMonitorCh.qmp.ExecutePCIVFIOMediatedDeviceAdd(q.qmpMonitorCh.ctx, device.ID, device.SysfsDev, addr, bridgeID, romFile)
+	case config.VFIOAPDeviceMediatedType:
+		return q.qmpMonitorCh.qmp.ExecuteAPVFIOMediatedDeviceAdd(q.qmpMonitorCh.ctx, device.SysfsDev, device.ID)
+	default:
+		return fmt.Errorf("Incorrect VFIO device type found")
+	}
+}
+
+func (q *qemu) executeVFIODeviceAdd(device *config.VFIODev) error {
+	switch device.Type {
+	case config.VFIOPCIDeviceNormalType:
+		return q.qmpMonitorCh.qmp.ExecuteVFIODeviceAdd(q.qmpMonitorCh.ctx, device.ID, device.BDF, device.Bus, romFile)
+	case config.VFIOPCIDeviceMediatedType:
+		return q.qmpMonitorCh.qmp.ExecutePCIVFIOMediatedDeviceAdd(q.qmpMonitorCh.ctx, device.ID, device.SysfsDev, "", device.Bus, romFile)
+	case config.VFIOAPDeviceMediatedType:
+		return q.qmpMonitorCh.qmp.ExecuteAPVFIOMediatedDeviceAdd(q.qmpMonitorCh.ctx, device.SysfsDev, device.ID)
+	default:
+		return fmt.Errorf("Incorrect VFIO device type found")
+	}
+}
+
+func (q *qemu) hotplugVFIODevice(ctx context.Context, device *config.VFIODev, op Operation) (err error) {
 	if err = q.qmpSetup(); err != nil {
 		return err
 	}
 
-	devID := device.ID
-	machineType := q.hypervisorConfig().HypervisorMachineType
-
-	if op == addDevice {
-
+	if op == AddDevice {
 		buf, _ := json.Marshal(device)
 		q.Logger().WithFields(logrus.Fields{
-			"machine-type":             machineType,
-			"hotplug-vfio-on-root-bus": q.state.HotplugVFIOOnRootBus,
-			"pcie-root-port":           q.state.PCIeRootPort,
-			"device-info":              string(buf),
+			"machine-type":  q.HypervisorConfig().HypervisorMachineType,
+			"hot-plug-vfio": q.state.HotPlugVFIO,
+			"device-info":   string(buf),
 		}).Info("Start hot-plug VFIO device")
 
+		err = fmt.Errorf("Incorrect hot plug configuration %v for device %v found", q.state.HotPlugVFIO, device)
 		// In case HotplugVFIOOnRootBus is true, devices are hotplugged on the root bus
 		// for pc machine type instead of bridge. This is useful for devices that require
 		// a large PCI BAR which is a currently a limitation with PCI bridges.
-		if q.state.HotplugVFIOOnRootBus {
-
-			// In case MachineType is q35, a PCIe device is hotplugged on a PCIe Root Port.
-			switch machineType {
-			case QemuQ35:
-				if device.IsPCIe && q.state.PCIeRootPort <= 0 {
-					q.Logger().WithField("dev-id", device.ID).Warn("VFIO device is a PCIe device. It's recommended to add the PCIe Root Port by setting the pcie_root_port parameter in the configuration for q35")
-					device.Bus = ""
-				}
-			default:
-				device.Bus = ""
-			}
-
-			switch device.Type {
-			case config.VFIODeviceNormalType:
-				return q.qmpMonitorCh.qmp.ExecuteVFIODeviceAdd(q.qmpMonitorCh.ctx, devID, device.BDF, device.Bus, romFile)
-			case config.VFIODeviceMediatedType:
-				if utils.IsAPVFIOMediatedDevice(device.SysfsDev) {
-					return q.qmpMonitorCh.qmp.ExecuteAPVFIOMediatedDeviceAdd(q.qmpMonitorCh.ctx, device.SysfsDev)
-				}
-				return q.qmpMonitorCh.qmp.ExecutePCIVFIOMediatedDeviceAdd(q.qmpMonitorCh.ctx, devID, device.SysfsDev, "", device.Bus, romFile)
-			default:
-				return fmt.Errorf("Incorrect VFIO device type found")
-			}
+		if q.state.HotPlugVFIO == config.RootPort {
+			err = q.hotplugVFIODeviceRootPort(ctx, device)
+		} else if q.state.HotPlugVFIO == config.SwitchPort {
+			err = q.hotplugVFIODeviceSwitchPort(ctx, device)
+		} else if q.state.HotPlugVFIO == config.BridgePort {
+			err = q.hotplugVFIODeviceBridgePort(ctx, device)
 		}
-
-		addr, bridge, err := q.arch.addDeviceToBridge(devID, types.PCI)
 		if err != nil {
 			return err
 		}
 
-		defer func() {
-			if err != nil {
-				q.arch.removeDeviceFromBridge(devID)
-			}
-		}()
+		// Depending on whether we're doing root port or
+		// bridge hotplug, and how the bridge is set up in
+		// other parts of the code, we may or may not already
+		// have information about the slot number of the
+		// bridge and or the device.  For simplicity, just
+		// query both of them back from qemu based on the arch
+		device.GuestPciPath, err = q.arch.qomGetPciPath(device.ID, &q.qmpMonitorCh)
 
-		switch device.Type {
-		case config.VFIODeviceNormalType:
-			return q.qmpMonitorCh.qmp.ExecutePCIVFIODeviceAdd(q.qmpMonitorCh.ctx, devID, device.BDF, addr, bridge.ID, romFile)
-		case config.VFIODeviceMediatedType:
-			if utils.IsAPVFIOMediatedDevice(device.SysfsDev) {
-				return q.qmpMonitorCh.qmp.ExecuteAPVFIOMediatedDeviceAdd(q.qmpMonitorCh.ctx, device.SysfsDev)
-			}
-			return q.qmpMonitorCh.qmp.ExecutePCIVFIOMediatedDeviceAdd(q.qmpMonitorCh.ctx, devID, device.SysfsDev, addr, bridge.ID, romFile)
-		default:
-			return fmt.Errorf("Incorrect VFIO device type found")
-		}
+		return err
 	} else {
-		q.Logger().WithField("dev-id", devID).Info("Start hot-unplug VFIO device")
 
-		if !q.state.HotplugVFIOOnRootBus {
-			if err := q.arch.removeDeviceFromBridge(devID); err != nil {
+		q.Logger().WithField("dev-id", device.ID).Info("Start hot-unplug VFIO device")
+
+		if q.state.HotPlugVFIO == config.BridgePort {
+			if err := q.arch.removeDeviceFromBridge(device.ID); err != nil {
 				return err
 			}
 		}
 
-		return q.qmpMonitorCh.qmp.ExecuteDeviceDel(q.qmpMonitorCh.ctx, devID)
+		return q.qmpMonitorCh.qmp.ExecuteDeviceDel(q.qmpMonitorCh.ctx, device.ID)
 	}
 }
 
@@ -1524,7 +1857,7 @@ func (q *qemu) hotAddNetDevice(name, hardAddr string, VMFds, VhostFds []*os.File
 	return q.qmpMonitorCh.qmp.ExecuteNetdevAddByFds(q.qmpMonitorCh.ctx, "tap", name, VMFdNames, VhostFdNames)
 }
 
-func (q *qemu) hotplugNetDevice(endpoint Endpoint, op operation) (err error) {
+func (q *qemu) hotplugNetDevice(ctx context.Context, endpoint Endpoint, op Operation) (err error) {
 	if err = q.qmpSetup(); err != nil {
 		return err
 	}
@@ -1542,7 +1875,7 @@ func (q *qemu) hotplugNetDevice(endpoint Endpoint, op operation) (err error) {
 	}
 
 	devID := "virtio-" + tap.ID
-	if op == addDevice {
+	if op == AddDevice {
 		if err = q.hotAddNetDevice(tap.Name, endpoint.HardwareAddr(), tap.VMFds, tap.VhostFds); err != nil {
 			return err
 		}
@@ -1553,7 +1886,7 @@ func (q *qemu) hotplugNetDevice(endpoint Endpoint, op operation) (err error) {
 			}
 		}()
 
-		addr, bridge, err := q.arch.addDeviceToBridge(tap.ID, types.PCI)
+		addr, bridge, err := q.arch.addDeviceToBridge(ctx, tap.ID, types.PCI)
 		if err != nil {
 			return err
 		}
@@ -1564,15 +1897,15 @@ func (q *qemu) hotplugNetDevice(endpoint Endpoint, op operation) (err error) {
 			}
 		}()
 
-		bridgeSlot, err := vcTypes.PciSlotFromInt(bridge.Addr)
+		bridgeSlot, err := types.PciSlotFromInt(bridge.Addr)
 		if err != nil {
 			return err
 		}
-		devSlot, err := vcTypes.PciSlotFromString(addr)
+		devSlot, err := types.PciSlotFromString(addr)
 		if err != nil {
 			return err
 		}
-		pciPath, err := vcTypes.PciPathFromSlots(bridgeSlot, devSlot)
+		pciPath, err := types.PciPathFromSlots(bridgeSlot, devSlot)
 		endpoint.SetPciPath(pciPath)
 
 		var machine govmmQemu.Machine
@@ -1599,36 +1932,37 @@ func (q *qemu) hotplugNetDevice(endpoint Endpoint, op operation) (err error) {
 	return q.qmpMonitorCh.qmp.ExecuteNetdevDel(q.qmpMonitorCh.ctx, tap.Name)
 }
 
-func (q *qemu) hotplugDevice(devInfo interface{}, devType deviceType, op operation) (interface{}, error) {
+func (q *qemu) hotplugDevice(ctx context.Context, devInfo interface{}, devType DeviceType, op Operation) (interface{}, error) {
 	switch devType {
-	case blockDev:
+	case BlockDev:
 		drive := devInfo.(*config.BlockDrive)
-		return nil, q.hotplugBlockDevice(drive, op)
-	case cpuDev:
+		return nil, q.hotplugBlockDevice(ctx, drive, op)
+	case CpuDev:
 		vcpus := devInfo.(uint32)
 		return q.hotplugCPUs(vcpus, op)
-	case vfioDev:
+	case VfioDev:
 		device := devInfo.(*config.VFIODev)
-		return nil, q.hotplugVFIODevice(device, op)
-	case memoryDev:
-		memdev := devInfo.(*memoryDevice)
+		return nil, q.hotplugVFIODevice(ctx, device, op)
+	case MemoryDev:
+		memdev := devInfo.(*MemoryDevice)
 		return q.hotplugMemory(memdev, op)
-	case netDev:
+	case NetDev:
 		device := devInfo.(Endpoint)
-		return nil, q.hotplugNetDevice(device, op)
-	case vhostuserDev:
+		return nil, q.hotplugNetDevice(ctx, device, op)
+	case VhostuserDev:
 		vAttr := devInfo.(*config.VhostUserDeviceAttrs)
-		return nil, q.hotplugVhostUserDevice(vAttr, op)
+		return nil, q.hotplugVhostUserDevice(ctx, vAttr, op)
 	default:
 		return nil, fmt.Errorf("cannot hotplug device: unsupported device type '%v'", devType)
 	}
 }
 
-func (q *qemu) hotplugAddDevice(devInfo interface{}, devType deviceType) (interface{}, error) {
-	span, _ := q.trace("hotplugAddDevice")
+func (q *qemu) HotplugAddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error) {
+	span, ctx := katatrace.Trace(ctx, q.Logger(), "HotplugAddDevice", qemuTracingTags)
+	katatrace.AddTags(span, "sandbox_id", q.id, "device", devInfo)
 	defer span.End()
 
-	data, err := q.hotplugDevice(devInfo, devType, addDevice)
+	data, err := q.hotplugDevice(ctx, devInfo, devType, AddDevice)
 	if err != nil {
 		return data, err
 	}
@@ -1636,11 +1970,12 @@ func (q *qemu) hotplugAddDevice(devInfo interface{}, devType deviceType) (interf
 	return data, nil
 }
 
-func (q *qemu) hotplugRemoveDevice(devInfo interface{}, devType deviceType) (interface{}, error) {
-	span, _ := q.trace("hotplugRemoveDevice")
+func (q *qemu) HotplugRemoveDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error) {
+	span, ctx := katatrace.Trace(ctx, q.Logger(), "HotplugRemoveDevice", qemuTracingTags)
+	katatrace.AddTags(span, "sandbox_id", q.id, "device", devInfo)
 	defer span.End()
 
-	data, err := q.hotplugDevice(devInfo, devType, removeDevice)
+	data, err := q.hotplugDevice(ctx, devInfo, devType, RemoveDevice)
 	if err != nil {
 		return data, err
 	}
@@ -1648,7 +1983,7 @@ func (q *qemu) hotplugRemoveDevice(devInfo interface{}, devType deviceType) (int
 	return data, nil
 }
 
-func (q *qemu) hotplugCPUs(vcpus uint32, op operation) (uint32, error) {
+func (q *qemu) hotplugCPUs(vcpus uint32, op Operation) (uint32, error) {
 	if vcpus == 0 {
 		q.Logger().Warnf("cannot hotplug 0 vCPUs")
 		return 0, nil
@@ -1658,7 +1993,7 @@ func (q *qemu) hotplugCPUs(vcpus uint32, op operation) (uint32, error) {
 		return 0, err
 	}
 
-	if op == addDevice {
+	if op == AddDevice {
 		return q.hotplugAddCPUs(vcpus)
 	}
 
@@ -1706,20 +2041,21 @@ func (q *qemu) hotplugAddCPUs(amount uint32) (uint32, error) {
 		coreID := fmt.Sprintf("%d", hc.Properties.Core)
 		threadID := fmt.Sprintf("%d", hc.Properties.Thread)
 
-		// If CPU type is IBM pSeries or Z, we do not set socketID and threadID
-		if machine.Type == "pseries" || machine.Type == "s390-ccw-virtio" {
+		// If CPU type is IBM pSeries, Z or arm virt, we do not set socketID and threadID
+		if machine.Type == "pseries" || machine.Type == QemuCCWVirtio || machine.Type == "virt" {
 			socketID = ""
 			threadID = ""
 			dieID = ""
 		}
 
 		if err := q.qmpMonitorCh.qmp.ExecuteCPUDeviceAdd(q.qmpMonitorCh.ctx, driver, cpuID, socketID, dieID, coreID, threadID, romFile); err != nil {
+			q.Logger().WithField("hotplug", "cpu").Warnf("qmp hotplug cpu, cpuID=%s socketID=%s, error: %v", cpuID, socketID, err)
 			// don't fail, let's try with other CPU
 			continue
 		}
 
-		// a new vCPU was added, update list of hotplugged vCPUs and check if all vCPUs were added
-		q.state.HotpluggedVCPUs = append(q.state.HotpluggedVCPUs, CPUDevice{cpuID})
+		// a new vCPU was added, update list of hotplugged vCPUs and Check if all vCPUs were added
+		q.state.HotpluggedVCPUs = append(q.state.HotpluggedVCPUs, hv.CPUDevice{ID: cpuID})
 		hotpluggedVCPUs++
 		if hotpluggedVCPUs == amount {
 			// All vCPUs were hotplugged
@@ -1753,47 +2089,35 @@ func (q *qemu) hotplugRemoveCPUs(amount uint32) (uint32, error) {
 	return amount, nil
 }
 
-func (q *qemu) hotplugMemory(memDev *memoryDevice, op operation) (int, error) {
+func (q *qemu) hotplugMemory(memDev *MemoryDevice, op Operation) (int, error) {
 
 	if !q.arch.supportGuestMemoryHotplug() {
-		return 0, fmt.Errorf("guest memory hotplug not supported")
+		return 0, noGuestMemHotplugErr
 	}
-	if memDev.sizeMB < 0 {
-		return 0, fmt.Errorf("cannot hotplug negative size (%d) memory", memDev.sizeMB)
+	if memDev.SizeMB < 0 {
+		return 0, fmt.Errorf("cannot hotplug negative size (%d) memory", memDev.SizeMB)
 	}
 	memLog := q.Logger().WithField("hotplug", "memory")
 
-	memLog.WithField("hotplug-memory-mb", memDev.sizeMB).Debug("requested memory hotplug")
+	memLog.WithField("hotplug-memory-mb", memDev.SizeMB).Debug("requested memory hotplug")
 	if err := q.qmpSetup(); err != nil {
 		return 0, err
 	}
 
-	currentMemory := int(q.config.MemorySize) + q.state.HotpluggedMemory
-
-	if memDev.sizeMB == 0 {
+	if memDev.SizeMB == 0 {
 		memLog.Debug("hotplug is not required")
 		return 0, nil
 	}
 
 	switch op {
-	case removeDevice:
-		memLog.WithField("operation", "remove").Debugf("Requested to remove memory: %d MB", memDev.sizeMB)
+	case RemoveDevice:
+		memLog.WithField("operation", "remove").Debugf("Requested to remove memory: %d MB", memDev.SizeMB)
 		// Dont fail but warn that this is not supported.
 		memLog.Warn("hot-remove VM memory not supported")
 		return 0, nil
-	case addDevice:
-		memLog.WithField("operation", "add").Debugf("Requested to add memory: %d MB", memDev.sizeMB)
-		maxMem, err := q.hostMemMB()
-		if err != nil {
-			return 0, err
-		}
+	case AddDevice:
+		memLog.WithField("operation", "add").Debugf("Requested to add memory: %d MB", memDev.SizeMB)
 
-		// Don't exceed the maximum amount of memory
-		if currentMemory+memDev.sizeMB > int(maxMem) {
-			// Fixme: return a typed error
-			return 0, fmt.Errorf("Unable to hotplug %d MiB memory, the SB has %d MiB and the maximum amount is %d MiB",
-				memDev.sizeMB, currentMemory, maxMem)
-		}
 		memoryAdded, err := q.hotplugAddMemory(memDev)
 		if err != nil {
 			return memoryAdded, err
@@ -1805,7 +2129,7 @@ func (q *qemu) hotplugMemory(memDev *memoryDevice, op operation) (int, error) {
 
 }
 
-func (q *qemu) hotplugAddMemory(memDev *memoryDevice) (int, error) {
+func (q *qemu) hotplugAddMemory(memDev *MemoryDevice) (int, error) {
 	memoryDevices, err := q.qmpMonitorCh.qmp.ExecQueryMemoryDevices(q.qmpMonitorCh.ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query memory devices: %v", err)
@@ -1818,7 +2142,7 @@ func (q *qemu) hotplugAddMemory(memDev *memoryDevice) (int, error) {
 				maxSlot = device.Data.Slot
 			}
 		}
-		memDev.slot = maxSlot + 1
+		memDev.Slot = maxSlot + 1
 	}
 
 	share, target, memoryBack, err := q.getMemArgs()
@@ -1826,51 +2150,52 @@ func (q *qemu) hotplugAddMemory(memDev *memoryDevice) (int, error) {
 		return 0, err
 	}
 
-	err = q.qmpMonitorCh.qmp.ExecHotplugMemory(q.qmpMonitorCh.ctx, memoryBack, "mem"+strconv.Itoa(memDev.slot), target, memDev.sizeMB, share)
+	err = q.qmpMonitorCh.qmp.ExecHotplugMemory(q.qmpMonitorCh.ctx, memoryBack, "mem"+strconv.Itoa(memDev.Slot), target, memDev.SizeMB, share)
 	if err != nil {
 		q.Logger().WithError(err).Error("hotplug memory")
 		return 0, err
 	}
 	// if guest kernel only supports memory hotplug via probe interface, we need to get address of hot-add memory device
-	if memDev.probe {
+	if memDev.Probe {
 		memoryDevices, err := q.qmpMonitorCh.qmp.ExecQueryMemoryDevices(q.qmpMonitorCh.ctx)
 		if err != nil {
 			return 0, fmt.Errorf("failed to query memory devices: %v", err)
 		}
 		if len(memoryDevices) != 0 {
 			q.Logger().WithField("addr", fmt.Sprintf("0x%x", memoryDevices[len(memoryDevices)-1].Data.Addr)).Debug("recently hot-add memory device")
-			memDev.addr = memoryDevices[len(memoryDevices)-1].Data.Addr
+			memDev.Addr = memoryDevices[len(memoryDevices)-1].Data.Addr
 		} else {
 			return 0, fmt.Errorf("failed to probe address of recently hot-add memory device, no device exists")
 		}
 	}
-	q.state.HotpluggedMemory += memDev.sizeMB
-	return memDev.sizeMB, nil
+	q.state.HotpluggedMemory += memDev.SizeMB
+	return memDev.SizeMB, nil
 }
 
-func (q *qemu) pauseSandbox() error {
-	span, _ := q.trace("pauseSandbox")
+func (q *qemu) PauseVM(ctx context.Context) error {
+	span, ctx := katatrace.Trace(ctx, q.Logger(), "PauseVM", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
-	return q.togglePauseSandbox(true)
+	return q.togglePauseSandbox(ctx, true)
 }
 
-func (q *qemu) resumeSandbox() error {
-	span, _ := q.trace("resumeSandbox")
+func (q *qemu) ResumeVM(ctx context.Context) error {
+	span, ctx := katatrace.Trace(ctx, q.Logger(), "ResumeVM", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
-	return q.togglePauseSandbox(false)
+	return q.togglePauseSandbox(ctx, false)
 }
 
-// addDevice will add extra devices to Qemu command line.
-func (q *qemu) addDevice(devInfo interface{}, devType deviceType) error {
+// AddDevice will add extra devices to Qemu command line.
+func (q *qemu) AddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) error {
 	var err error
-	span, _ := q.trace("addDevice")
+	span, _ := katatrace.Trace(ctx, q.Logger(), "AddDevice", qemuTracingTags)
+	katatrace.AddTags(span, "sandbox_id", q.id, "device", devInfo)
 	defer span.End()
 
 	switch v := devInfo.(type) {
 	case types.Volume:
-		if q.config.SharedFS == config.VirtioFS {
+		if q.config.SharedFS == config.VirtioFS || q.config.SharedFS == config.VirtioFSNydus {
 			q.Logger().WithField("volume-type", "virtio-fs").Info("adding volume")
 
 			var randBytes []byte
@@ -1891,26 +2216,27 @@ func (q *qemu) addDevice(devInfo interface{}, devType deviceType) error {
 				Type:      config.VhostUserFS,
 				CacheSize: q.config.VirtioFSCacheSize,
 				Cache:     q.config.VirtioFSCache,
+				QueueSize: q.config.VirtioFSQueueSize,
 			}
 			vhostDev.SocketPath = sockPath
 			vhostDev.DevID = id
 
-			q.qemuConfig.Devices, err = q.arch.appendVhostUserDevice(q.qemuConfig.Devices, vhostDev)
+			q.qemuConfig.Devices, err = q.arch.appendVhostUserDevice(ctx, q.qemuConfig.Devices, vhostDev)
 		} else {
 			q.Logger().WithField("volume-type", "virtio-9p").Info("adding volume")
-			q.qemuConfig.Devices, err = q.arch.append9PVolume(q.qemuConfig.Devices, v)
+			q.qemuConfig.Devices, err = q.arch.append9PVolume(ctx, q.qemuConfig.Devices, v)
 		}
 	case types.Socket:
 		q.qemuConfig.Devices = q.arch.appendSocket(q.qemuConfig.Devices, v)
 	case types.VSock:
 		q.fds = append(q.fds, v.VhostFd)
-		q.qemuConfig.Devices, err = q.arch.appendVSock(q.qemuConfig.Devices, v)
+		q.qemuConfig.Devices, err = q.arch.appendVSock(ctx, q.qemuConfig.Devices, v)
 	case Endpoint:
-		q.qemuConfig.Devices, err = q.arch.appendNetwork(q.qemuConfig.Devices, v)
+		q.qemuConfig.Devices, err = q.arch.appendNetwork(ctx, q.qemuConfig.Devices, v)
 	case config.BlockDrive:
-		q.qemuConfig.Devices, err = q.arch.appendBlockDevice(q.qemuConfig.Devices, v)
+		q.qemuConfig.Devices, err = q.arch.appendBlockDevice(ctx, q.qemuConfig.Devices, v)
 	case config.VhostUserDeviceAttrs:
-		q.qemuConfig.Devices, err = q.arch.appendVhostUserDevice(q.qemuConfig.Devices, v)
+		q.qemuConfig.Devices, err = q.arch.appendVhostUserDevice(ctx, q.qemuConfig.Devices, v)
 	case config.VFIODev:
 		q.qemuConfig.Devices = q.arch.appendVFIODevice(q.qemuConfig.Devices, v)
 	default:
@@ -1920,13 +2246,13 @@ func (q *qemu) addDevice(devInfo interface{}, devType deviceType) error {
 	return err
 }
 
-// getSandboxConsole builds the path of the console where we can read
-// logs coming from the sandbox.
-func (q *qemu) getSandboxConsole(id string) (string, string, error) {
-	span, _ := q.trace("getSandboxConsole")
+// GetVMConsole builds the path of the console where we can read logs coming
+// from the sandbox.
+func (q *qemu) GetVMConsole(ctx context.Context, id string) (string, string, error) {
+	span, _ := katatrace.Trace(ctx, q.Logger(), "GetVMConsole", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
-	consoleURL, err := utils.BuildSocketPath(q.store.RunVMStoragePath(), id, consoleSocket)
+	consoleURL, err := utils.BuildSocketPath(q.config.VMStorePath, id, consoleSocket)
 	if err != nil {
 		return consoleProtoUnix, "", err
 	}
@@ -1934,8 +2260,8 @@ func (q *qemu) getSandboxConsole(id string) (string, string, error) {
 	return consoleProtoUnix, consoleURL, nil
 }
 
-func (q *qemu) saveSandbox() error {
-	q.Logger().Info("save sandbox")
+func (q *qemu) SaveVM() error {
+	q.Logger().Info("Save sandbox")
 
 	if err := q.qmpSetup(); err != nil {
 		return err
@@ -1987,14 +2313,18 @@ func (q *qemu) waitMigration() error {
 	return nil
 }
 
-func (q *qemu) disconnect() {
-	span, _ := q.trace("disconnect")
+func (q *qemu) Disconnect(ctx context.Context) {
+	span, _ := katatrace.Trace(ctx, q.Logger(), "Disconnect", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
 	q.qmpShutdown()
 }
 
-// resizeMemory get a request to update the VM memory to reqMemMB
+func (q *qemu) GetTotalMemoryMB(ctx context.Context) uint32 {
+	return q.config.MemorySize + uint32(q.state.HotpluggedMemory)
+}
+
+// ResizeMemory gets a request to update the VM memory to reqMemMB
 // Memory update is managed with two approaches
 // Add memory to VM:
 // When memory is required to be added we hotplug memory
@@ -2005,37 +2335,43 @@ func (q *qemu) disconnect() {
 // the memory to remove has to be at least the size of one slot.
 // To return memory back we are resizing the VM memory balloon.
 // A longer term solution is evaluate solutions like virtio-mem
-func (q *qemu) resizeMemory(reqMemMB uint32, memoryBlockSizeMB uint32, probe bool) (uint32, memoryDevice, error) {
+func (q *qemu) ResizeMemory(ctx context.Context, reqMemMB uint32, memoryBlockSizeMB uint32, probe bool) (uint32, MemoryDevice, error) {
 
-	currentMemory := q.config.MemorySize + uint32(q.state.HotpluggedMemory)
+	currentMemory := q.GetTotalMemoryMB(ctx)
 	if err := q.qmpSetup(); err != nil {
-		return 0, memoryDevice{}, err
+		return 0, MemoryDevice{}, err
 	}
-	var addMemDevice memoryDevice
+	var addMemDevice MemoryDevice
 	if q.config.VirtioMem && currentMemory != reqMemMB {
 		q.Logger().WithField("hotplug", "memory").Debugf("resize memory from %dMB to %dMB", currentMemory, reqMemMB)
-		sizeByte := (reqMemMB - q.config.MemorySize) * 1024 * 1024
-		err := q.qmpMonitorCh.qmp.ExecQomSet(q.qmpMonitorCh.ctx, "virtiomem0", "requested-size", uint64(sizeByte))
+		sizeByte := uint64(reqMemMB - q.config.MemorySize)
+		sizeByte = sizeByte * 1024 * 1024
+		err := q.qmpMonitorCh.qmp.ExecQomSet(q.qmpMonitorCh.ctx, "virtiomem0", "requested-size", sizeByte)
 		if err != nil {
-			return 0, memoryDevice{}, err
+			return 0, MemoryDevice{}, err
 		}
 		q.state.HotpluggedMemory = int(sizeByte / 1024 / 1024)
-		return reqMemMB, memoryDevice{}, nil
+		return reqMemMB, MemoryDevice{}, nil
 	}
 
 	switch {
 	case currentMemory < reqMemMB:
 		//hotplug
 		addMemMB := reqMemMB - currentMemory
-		memHotplugMB, err := calcHotplugMemMiBSize(addMemMB, memoryBlockSizeMB)
-		if err != nil {
-			return currentMemory, memoryDevice{}, err
+
+		if currentMemory+addMemMB > uint32(q.config.DefaultMaxMemorySize) {
+			addMemMB = uint32(q.config.DefaultMaxMemorySize) - currentMemory
 		}
 
-		addMemDevice.sizeMB = int(memHotplugMB)
-		addMemDevice.probe = probe
+		memHotplugMB, err := calcHotplugMemMiBSize(addMemMB, memoryBlockSizeMB)
+		if err != nil {
+			return currentMemory, MemoryDevice{}, err
+		}
 
-		data, err := q.hotplugAddDevice(&addMemDevice, memoryDev)
+		addMemDevice.SizeMB = int(memHotplugMB)
+		addMemDevice.Probe = probe
+
+		data, err := q.HotplugAddDevice(ctx, &addMemDevice, MemoryDev)
 		if err != nil {
 			return currentMemory, addMemDevice, err
 		}
@@ -2049,13 +2385,13 @@ func (q *qemu) resizeMemory(reqMemMB uint32, memoryBlockSizeMB uint32, probe boo
 		addMemMB := currentMemory - reqMemMB
 		memHotunplugMB, err := calcHotplugMemMiBSize(addMemMB, memoryBlockSizeMB)
 		if err != nil {
-			return currentMemory, memoryDevice{}, err
+			return currentMemory, MemoryDevice{}, err
 		}
 
-		addMemDevice.sizeMB = int(memHotunplugMB)
-		addMemDevice.probe = probe
+		addMemDevice.SizeMB = int(memHotunplugMB)
+		addMemDevice.Probe = probe
 
-		data, err := q.hotplugRemoveDevice(&addMemDevice, memoryDev)
+		data, err := q.HotplugRemoveDevice(ctx, &addMemDevice, MemoryDev)
 		if err != nil {
 			return currentMemory, addMemDevice, err
 		}
@@ -2063,7 +2399,7 @@ func (q *qemu) resizeMemory(reqMemMB uint32, memoryBlockSizeMB uint32, probe boo
 		if !ok {
 			return currentMemory, addMemDevice, fmt.Errorf("Could not get the memory removed, got %+v", data)
 		}
-		//FIXME: This is to check memory hotplugRemoveDevice reported 0, as this is not supported.
+		//FIXME: This is to Check memory HotplugRemoveDevice reported 0, as this is not supported.
 		// In the future if this is implemented this validation should be removed.
 		if memoryRemoved != 0 {
 			return currentMemory, addMemDevice, fmt.Errorf("memory hot unplug is not supported, something went wrong")
@@ -2103,8 +2439,23 @@ func genericAppendBridges(devices []govmmQemu.Device, bridges []types.Bridge, ma
 				ID:   b.ID,
 				// Each bridge is required to be assigned a unique chassis id > 0
 				Chassis: idx + 1,
-				SHPC:    true,
+				SHPC:    false,
 				Addr:    strconv.FormatInt(int64(bridges[idx].Addr), 10),
+				// Certain guest BIOS versions think
+				// !SHPC means no hotplug, and won't
+				// reserve the IO and memory windows
+				// that will be needed for devices
+				// added underneath this bridge.  This
+				// will only break for certain
+				// combinations of exact qemu, BIOS
+				// and guest kernel versions, but for
+				// consistency, just hint the usual
+				// default windows for a bridge (as
+				// the BIOS would use with SHPC) so
+				// that we can do ACPI hotplug.
+				IOReserve:     "4k",
+				MemReserve:    "1m",
+				Pref64Reserve: "1m",
 			},
 		)
 	}
@@ -2120,8 +2471,6 @@ func genericBridges(number uint32, machineType string) []types.Bridge {
 	case QemuQ35:
 		// currently only pci bridges are supported
 		// qemu-2.10 will introduce pcie bridges
-		fallthrough
-	case QemuPC:
 		bt = types.PCI
 	case QemuVirt:
 		bt = types.PCI
@@ -2141,12 +2490,12 @@ func genericBridges(number uint32, machineType string) []types.Bridge {
 }
 
 // nolint: unused, deadcode
-func genericMemoryTopology(memoryMb, hostMemoryMb uint64, slots uint8, memoryOffset uint32) govmmQemu.Memory {
+func genericMemoryTopology(memoryMb, hostMemoryMb uint64, slots uint8, memoryOffset uint64) govmmQemu.Memory {
 	// image NVDIMM device needs memory space 1024MB
 	// See https://github.com/clearcontainers/runtime/issues/380
 	memoryOffset += 1024
 
-	memMax := fmt.Sprintf("%dM", hostMemoryMb+uint64(memoryOffset))
+	memMax := fmt.Sprintf("%dM", hostMemoryMb+memoryOffset)
 
 	mem := fmt.Sprintf("%dM", memoryMb)
 
@@ -2160,7 +2509,7 @@ func genericMemoryTopology(memoryMb, hostMemoryMb uint64, slots uint8, memoryOff
 }
 
 // genericAppendPCIeRootPort appends to devices the given pcie-root-port
-func genericAppendPCIeRootPort(devices []govmmQemu.Device, number uint32, machineType string) []govmmQemu.Device {
+func genericAppendPCIeRootPort(devices []govmmQemu.Device, number uint32, machineType string, memSize32bit uint64, memSize64bit uint64) []govmmQemu.Device {
 	var (
 		bus           string
 		chassis       string
@@ -2168,7 +2517,7 @@ func genericAppendPCIeRootPort(devices []govmmQemu.Device, number uint32, machin
 		addr          string
 	)
 	switch machineType {
-	case QemuQ35:
+	case QemuQ35, QemuVirt:
 		bus = defaultBridgeBus
 		chassis = "0"
 		multiFunction = false
@@ -2180,28 +2529,103 @@ func genericAppendPCIeRootPort(devices []govmmQemu.Device, number uint32, machin
 	for i := uint32(0); i < number; i++ {
 		devices = append(devices,
 			govmmQemu.PCIeRootPortDevice{
-				ID:            fmt.Sprintf("%s%d", pcieRootPortPrefix, i),
+				ID:            fmt.Sprintf("%s%d", config.PCIeRootPortPrefix, i),
 				Bus:           bus,
 				Chassis:       chassis,
 				Slot:          strconv.FormatUint(uint64(i), 10),
 				Multifunction: multiFunction,
 				Addr:          addr,
+				MemReserve:    fmt.Sprintf("%dB", memSize32bit),
+				Pref64Reserve: fmt.Sprintf("%dB", memSize64bit),
 			},
 		)
 	}
 	return devices
 }
 
-func (q *qemu) getThreadIDs() (vcpuThreadIDs, error) {
-	span, _ := q.trace("getThreadIDs")
+// gollangci-lint enforces multi-line comments to be a block comment
+// not multiple single line comments ...
+/*  pcie.0 bus
+//  -------------------------------------------------
+//                           |
+//                     -------------
+//                     | Root Port |
+//                     -------------
+//  -------------------------|------------------------
+//  |                 -----------------              |
+//  |    PCI Express  | Upstream Port |              |
+//  |      Switch     -----------------              |
+//  |                  |            |                |
+//  |    -------------------    -------------------  |
+//  |    | Downstream Port |    | Downstream Port |  |
+//  |    -------------------    -------------------  |
+//  -------------|-----------------------|------------
+//          -------------           --------------
+//          | GPU/ACCEL |           | IB/ETH NIC |
+//          -------------           --------------
+*/
+// genericAppendPCIeSwitch adds a PCIe Swtich
+func genericAppendPCIeSwitchPort(devices []govmmQemu.Device, number uint32, machineType string, memSize32bit uint64, memSize64bit uint64) []govmmQemu.Device {
+
+	// Q35, Virt have the correct PCIe support,
+	// hence ignore all other machines
+	if machineType != QemuQ35 && machineType != QemuVirt {
+		return devices
+	}
+
+	// Using an own ID for the root port, so we do not clash with already
+	// existing root ports adding "s" for switch prefix
+	pcieRootPort := govmmQemu.PCIeRootPortDevice{
+		ID:            fmt.Sprintf("%s%s%d", config.PCIeSwitchPortPrefix, config.PCIeRootPortPrefix, 0),
+		Bus:           defaultBridgeBus,
+		Chassis:       "1",
+		Slot:          strconv.FormatUint(uint64(0), 10),
+		Multifunction: false,
+		Addr:          "0",
+		MemReserve:    fmt.Sprintf("%dB", memSize32bit),
+		Pref64Reserve: fmt.Sprintf("%dB", memSize64bit),
+	}
+
+	devices = append(devices, pcieRootPort)
+
+	pcieSwitchUpstreamPort := govmmQemu.PCIeSwitchUpstreamPortDevice{
+		ID:  fmt.Sprintf("%s%d", config.PCIeSwitchUpstreamPortPrefix, 0),
+		Bus: pcieRootPort.ID,
+	}
+	devices = append(devices, pcieSwitchUpstreamPort)
+
+	currentChassis, err := strconv.Atoi(pcieRootPort.Chassis)
+	if err != nil {
+		return devices
+	}
+	nextChassis := currentChassis + 1
+
+	for i := uint32(0); i < number; i++ {
+
+		pcieSwitchDownstreamPort := govmmQemu.PCIeSwitchDownstreamPortDevice{
+			ID:      fmt.Sprintf("%s%d", config.PCIeSwitchhDownstreamPortPrefix, i),
+			Bus:     pcieSwitchUpstreamPort.ID,
+			Chassis: fmt.Sprintf("%d", nextChassis),
+			Slot:    strconv.FormatUint(uint64(i), 10),
+			// TODO: MemReserve:    fmt.Sprintf("%dB", memSize32bit),
+			// TODO: Pref64Reserve: fmt.Sprintf("%dB", memSize64bit),
+		}
+		devices = append(devices, pcieSwitchDownstreamPort)
+	}
+
+	return devices
+}
+
+func (q *qemu) GetThreadIDs(ctx context.Context) (VcpuThreadIDs, error) {
+	span, _ := katatrace.Trace(ctx, q.Logger(), "GetThreadIDs", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
-	tid := vcpuThreadIDs{}
+	tid := VcpuThreadIDs{}
 	if err := q.qmpSetup(); err != nil {
 		return tid, err
 	}
 
-	cpuInfos, err := q.qmpMonitorCh.qmp.ExecQueryCpus(q.qmpMonitorCh.ctx)
+	cpuInfos, err := q.qmpMonitorCh.qmp.ExecQueryCpusFast(q.qmpMonitorCh.ctx)
 	if err != nil {
 		q.Logger().WithError(err).Error("failed to query cpu infos")
 		return tid, err
@@ -2210,7 +2634,7 @@ func (q *qemu) getThreadIDs() (vcpuThreadIDs, error) {
 	tid.vcpus = make(map[int]int, len(cpuInfos))
 	for _, i := range cpuInfos {
 		if i.ThreadID > 0 {
-			tid.vcpus[i.CPU] = i.ThreadID
+			tid.vcpus[i.CPUIndex] = i.ThreadID
 		}
 	}
 	return tid, nil
@@ -2221,11 +2645,10 @@ func calcHotplugMemMiBSize(mem uint32, memorySectionSizeMB uint32) (uint32, erro
 		return mem, nil
 	}
 
-	// TODO: hot add memory aligned to memory section should be more properly. See https://github.com/kata-containers/runtime/pull/624#issuecomment-419656853
 	return uint32(math.Ceil(float64(mem)/float64(memorySectionSizeMB))) * memorySectionSizeMB, nil
 }
 
-func (q *qemu) resizeVCPUs(reqVCPUs uint32) (currentVCPUs uint32, newVCPUs uint32, err error) {
+func (q *qemu) ResizeVCPUs(ctx context.Context, reqVCPUs uint32) (currentVCPUs uint32, newVCPUs uint32, err error) {
 
 	currentVCPUs = q.config.NumVCPUs + uint32(len(q.state.HotpluggedVCPUs))
 	newVCPUs = currentVCPUs
@@ -2233,7 +2656,7 @@ func (q *qemu) resizeVCPUs(reqVCPUs uint32) (currentVCPUs uint32, newVCPUs uint3
 	case currentVCPUs < reqVCPUs:
 		//hotplug
 		addCPUs := reqVCPUs - currentVCPUs
-		data, err := q.hotplugAddDevice(addCPUs, cpuDev)
+		data, err := q.HotplugAddDevice(ctx, addCPUs, CpuDev)
 		if err != nil {
 			return currentVCPUs, newVCPUs, err
 		}
@@ -2245,7 +2668,7 @@ func (q *qemu) resizeVCPUs(reqVCPUs uint32) (currentVCPUs uint32, newVCPUs uint3
 	case currentVCPUs > reqVCPUs:
 		//hotunplug
 		removeCPUs := currentVCPUs - reqVCPUs
-		data, err := q.hotplugRemoveDevice(removeCPUs, cpuDev)
+		data, err := q.HotplugRemoveDevice(ctx, removeCPUs, CpuDev)
 		if err != nil {
 			return currentVCPUs, newVCPUs, err
 		}
@@ -2258,8 +2681,8 @@ func (q *qemu) resizeVCPUs(reqVCPUs uint32) (currentVCPUs uint32, newVCPUs uint3
 	return currentVCPUs, newVCPUs, nil
 }
 
-func (q *qemu) cleanup() error {
-	span, _ := q.trace("cleanup")
+func (q *qemu) Cleanup(ctx context.Context) error {
+	span, _ := katatrace.Trace(ctx, q.Logger(), "Cleanup", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
 	for _, fd := range q.fds {
@@ -2272,8 +2695,8 @@ func (q *qemu) cleanup() error {
 	return nil
 }
 
-func (q *qemu) getPids() []int {
-	data, err := ioutil.ReadFile(q.qemuConfig.PidFile)
+func (q *qemu) GetPids() []int {
+	data, err := os.ReadFile(q.qemuConfig.PidFile)
 	if err != nil {
 		q.Logger().WithError(err).Error("Could not read qemu pid file")
 		return []int{0}
@@ -2285,13 +2708,16 @@ func (q *qemu) getPids() []int {
 		return []int{0}
 	}
 
-	var pids []int
-	pids = append(pids, pid)
-	if q.state.VirtiofsdPid != 0 {
-		pids = append(pids, q.state.VirtiofsdPid)
+	pids := []int{pid}
+	if q.state.VirtiofsDaemonPid != 0 {
+		pids = append(pids, q.state.VirtiofsDaemonPid)
 	}
 
 	return pids
+}
+
+func (q *qemu) GetVirtioFsPid() *int {
+	return &q.state.VirtiofsDaemonPid
 }
 
 type qemuGrpc struct {
@@ -2333,10 +2759,10 @@ func (q *qemu) fromGrpc(ctx context.Context, hypervisorConfig *HypervisorConfig,
 	return nil
 }
 
-func (q *qemu) toGrpc() ([]byte, error) {
+func (q *qemu) toGrpc(ctx context.Context) ([]byte, error) {
 	q.qmpShutdown()
 
-	q.cleanup()
+	q.Cleanup(ctx)
 	qp := qemuGrpc{
 		ID:             q.id,
 		QmpChannelpath: q.qmpMonitorCh.path,
@@ -2349,26 +2775,24 @@ func (q *qemu) toGrpc() ([]byte, error) {
 	return json.Marshal(&qp)
 }
 
-func (q *qemu) save() (s persistapi.HypervisorState) {
+func (q *qemu) Save() (s hv.HypervisorState) {
 
-	// If QEMU isn't even running, there isn't any state to save
-	if q.stopped {
+	// If QEMU isn't even running, there isn't any state to Save
+	if atomic.LoadInt32(&q.stopped) != 0 {
 		return
 	}
 
-	pids := q.getPids()
+	pids := q.GetPids()
 	if len(pids) != 0 {
 		s.Pid = pids[0]
 	}
-	s.VirtiofsdPid = q.state.VirtiofsdPid
+	s.VirtiofsDaemonPid = q.state.VirtiofsDaemonPid
 	s.Type = string(QemuHypervisor)
 	s.UUID = q.state.UUID
 	s.HotpluggedMemory = q.state.HotpluggedMemory
-	s.HotplugVFIOOnRootBus = q.state.HotplugVFIOOnRootBus
-	s.PCIeRootPort = q.state.PCIeRootPort
 
 	for _, bridge := range q.arch.getBridges() {
-		s.Bridges = append(s.Bridges, persistapi.Bridge{
+		s.Bridges = append(s.Bridges, hv.Bridge{
 			DeviceAddr: bridge.Devices,
 			Type:       string(bridge.Type),
 			ID:         bridge.ID,
@@ -2377,32 +2801,34 @@ func (q *qemu) save() (s persistapi.HypervisorState) {
 	}
 
 	for _, cpu := range q.state.HotpluggedVCPUs {
-		s.HotpluggedVCPUs = append(s.HotpluggedVCPUs, persistapi.CPUDevice{
+		s.HotpluggedVCPUs = append(s.HotpluggedVCPUs, hv.CPUDevice{
 			ID: cpu.ID,
 		})
 	}
 	return
 }
 
-func (q *qemu) load(s persistapi.HypervisorState) {
+func (q *qemu) Load(s hv.HypervisorState) {
 	q.state.UUID = s.UUID
 	q.state.HotpluggedMemory = s.HotpluggedMemory
-	q.state.HotplugVFIOOnRootBus = s.HotplugVFIOOnRootBus
-	q.state.VirtiofsdPid = s.VirtiofsdPid
-	q.state.PCIeRootPort = s.PCIeRootPort
+	q.state.VirtiofsDaemonPid = s.VirtiofsDaemonPid
 
 	for _, bridge := range s.Bridges {
 		q.state.Bridges = append(q.state.Bridges, types.NewBridge(types.Type(bridge.Type), bridge.ID, bridge.DeviceAddr, bridge.Addr))
 	}
 
 	for _, cpu := range s.HotpluggedVCPUs {
-		q.state.HotpluggedVCPUs = append(q.state.HotpluggedVCPUs, CPUDevice{
+		q.state.HotpluggedVCPUs = append(q.state.HotpluggedVCPUs, hv.CPUDevice{
 			ID: cpu.ID,
 		})
 	}
 }
 
-func (q *qemu) check() error {
+func (q *qemu) Check() error {
+	if atomic.LoadInt32(&q.stopped) != 0 {
+		return fmt.Errorf("qemu is not running")
+	}
+
 	q.memoryDumpFlag.Lock()
 	defer q.memoryDumpFlag.Unlock()
 
@@ -2422,13 +2848,10 @@ func (q *qemu) check() error {
 	return nil
 }
 
-func (q *qemu) generateSocket(id string) (interface{}, error) {
-	return generateVMSocket(id, q.store.RunVMStoragePath())
+func (q *qemu) GenerateSocket(id string) (interface{}, error) {
+	return generateVMSocket(id, q.config.VMStorePath)
 }
 
-func (q *qemu) isRateLimiterBuiltin() bool {
+func (q *qemu) IsRateLimiterBuiltin() bool {
 	return false
-}
-
-func (q *qemu) setSandbox(sandbox *Sandbox) {
 }

@@ -1,16 +1,3 @@
-* [Introduction](#introduction)
-* [Maintenance warning](#maintenance-warning)
-* [Determine current version](#determine-current-version)
-* [Determine latest version](#determine-latest-version)
-* [Configuration changes](#configuration-changes)
-* [Upgrade Kata Containers](#upgrade-kata-containers)
-    * [Upgrade native distribution packaged version](#upgrade-native-distribution-packaged-version)
-    * [Static installation](#static-installation)
-        * [Determine if you are using a static installation](#determine-if-you-are-using-a-static-installation)
-        * [Remove a static installation](#remove-a-static-installation)
-        * [Upgrade a static installation](#upgrade-a-static-installation)
-* [Custom assets](#custom-assets)
-
 # Introduction
 
 This document outlines the options for upgrading from a
@@ -115,7 +102,7 @@ first
 [install the latest release](#determine-latest-version).
 
 See the
-[manual installation installation documentation](install/README.md#manual-installation)
+[manual installation documentation](install/README.md#manual-installation)
 for details on how to automatically install and configuration a static release
 with containerd.
 
@@ -127,7 +114,7 @@ with containerd.
 > kernel or image.
 
 If you are using custom
-[guest assets](design/architecture.md#guest-assets),
+[guest assets](design/architecture/README.md#guest-assets),
 you must upgrade them to work with Kata Containers 2.x since Kata
 Containers 1.x assets will **not** work.
 

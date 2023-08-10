@@ -12,12 +12,19 @@ on:
       - reopened
       - labeled
       - unlabeled
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check-pr-porting-labels:
     runs-on: ubuntu-latest
     steps:
       - name: Install hub
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
         run: |
           HUB_ARCH="amd64"
           HUB_VER=$(curl -sL "https://api.github.com/repos/github/hub/releases/latest" |\
@@ -28,9 +35,8 @@ jobs:
           sudo install hub /usr/local/bin
 
       - name: Checkout code to allow hub to communicate with the project
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
         uses: actions/checkout@v2
-        with:
-          token: ${{ secrets.KATA_GITHUB_ACTIONS_TOKEN }}
 
       - name: Install porting checker script
         run: |
@@ -42,6 +48,7 @@ jobs:
           popd &>/dev/null
 
       - name: Stop PR being merged unless it has a correct set of porting labels
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
         env:
           GITHUB_TOKEN: ${{ secrets.KATA_GITHUB_ACTIONS_TOKEN }}
         run: |

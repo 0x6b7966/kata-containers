@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -8,9 +10,11 @@ package virtcontainers
 import (
 	"context"
 	"fmt"
+	"os"
+	"runtime"
 	"time"
 
-	govmmQemu "github.com/kata-containers/govmm/qemu"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
@@ -27,33 +31,13 @@ const qmpMigrationWaitTimeout = 10 * time.Second
 
 const defaultQemuMachineOptions = "usb=off,accel=kvm,gic-version=host"
 
-var defaultGICVersion = uint32(3)
-
 var kernelParams = []Param{
-	{"console", "hvc0"},
-	{"console", "hvc1"},
 	{"iommu.passthrough", "0"},
 }
 
 var supportedQemuMachine = govmmQemu.Machine{
 	Type:    QemuVirt,
 	Options: defaultQemuMachineOptions,
-}
-
-//In qemu, maximum number of vCPUs depends on the GIC version, or on how
-//many redistributors we can fit into the memory map.
-//related codes are under github.com/qemu/qemu/hw/arm/virt.c(Line 135 and 1306 in stable-2.11)
-//for now, qemu only supports v2 and v3, we treat v4 as v3 based on
-//backward compatibility.
-var gicList = map[uint32]uint32{
-	uint32(2): uint32(8),
-	uint32(3): uint32(123),
-	uint32(4): uint32(123),
-}
-
-// MaxQemuVCPUs returns the maximum number of vCPUs supported
-func MaxQemuVCPUs() uint32 {
-	return gicList[defaultGICVersion]
 }
 
 func newQemuArch(config HypervisorConfig) (qemuArch, error) {
@@ -76,10 +60,14 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 			kernelParams:         kernelParams,
 			disableNvdimm:        config.DisableImageNvdimm,
 			dax:                  true,
+			protection:           noneProtection,
+			legacySerial:         config.LegacySerial,
 		},
 	}
 
-	q.handleImagePath(config)
+	if err := q.handleImagePath(config); err != nil {
+		return nil, err
+	}
 
 	return q, nil
 }
@@ -88,16 +76,40 @@ func (q *qemuArm64) bridges(number uint32) {
 	q.Bridges = genericBridges(number, q.qemuMachine.Type)
 }
 
-// appendBridges appends to devices the given bridges
-func (q *qemuArm64) appendBridges(devices []govmmQemu.Device) []govmmQemu.Device {
-	return genericAppendBridges(devices, q.Bridges, q.qemuMachine.Type)
-}
-
-func (q *qemuArm64) appendImage(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
+func (q *qemuArm64) appendImage(ctx context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
 	if !q.disableNvdimm {
 		return q.appendNvdimmImage(devices, path)
 	}
-	return q.appendBlockImage(devices, path)
+	return q.appendBlockImage(ctx, devices, path)
+}
+
+// There is no nvdimm/readonly feature in qemu 5.1 which is used by arm64 for now,
+// so we temporarily add this specific implementation for arm64 here until
+// the qemu used by arm64 is capable for that feature
+func (q *qemuArm64) appendNvdimmImage(devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
+	imageFile, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer imageFile.Close()
+
+	imageStat, err := imageFile.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	object := govmmQemu.Object{
+		Driver:   govmmQemu.NVDIMM,
+		Type:     govmmQemu.MemoryBackendFile,
+		DeviceID: "nv0",
+		ID:       "mem0",
+		MemPath:  path,
+		Size:     (uint64)(imageStat.Size()),
+	}
+
+	devices = append(devices, object)
+
+	return devices, nil
 }
 
 func (q *qemuArm64) setIgnoreSharedMemoryMigrationCaps(_ context.Context, _ *govmmQemu.QMP) error {
@@ -109,7 +121,7 @@ func (q *qemuArm64) appendIOMMU(devices []govmmQemu.Device) ([]govmmQemu.Device,
 	return devices, fmt.Errorf("Arm64 architecture does not support vIOMMU")
 }
 
-func (q *qemuArm64) append9PVolume(devices []govmmQemu.Device, volume types.Volume) ([]govmmQemu.Device, error) {
+func (q *qemuArm64) append9PVolume(_ context.Context, devices []govmmQemu.Device, volume types.Volume) ([]govmmQemu.Device, error) {
 	d, err := genericAppend9PVolume(devices, volume, q.nestedRun)
 	if err != nil {
 		return nil, err
@@ -131,4 +143,19 @@ func (q *qemuArm64) getPFlash() ([]string, error) {
 	} else {
 		return nil, fmt.Errorf("too many pflash images for arm64")
 	}
+}
+
+func (q *qemuArm64) enableProtection() error {
+	q.protection, _ = availableGuestProtection()
+	if q.protection != noneProtection {
+		return fmt.Errorf("Protection %v is not supported on arm64", q.protection)
+	}
+
+	return nil
+}
+
+func (q *qemuArm64) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error) {
+	err := q.enableProtection()
+	hvLogger.WithField("arch", runtime.GOARCH).Warnf("%v", err)
+	return devices, firmware, err
 }

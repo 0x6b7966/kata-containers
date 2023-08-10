@@ -6,19 +6,24 @@ package models
 // Editing this file might prove futile when you re-run the swagger generate command
 
 import (
-	strfmt "github.com/go-openapi/strfmt"
+	"context"
 
 	"github.com/go-openapi/errors"
+	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
 	"github.com/go-openapi/validate"
 )
 
 // BootSource Boot source descriptor.
+//
 // swagger:model BootSource
 type BootSource struct {
 
 	// Kernel boot arguments
 	BootArgs string `json:"boot_args,omitempty"`
+
+	// Host level path to the initrd image used to boot the guest
+	InitrdPath string `json:"initrd_path,omitempty"`
 
 	// Host level path to the kernel image used to boot the guest
 	// Required: true
@@ -45,6 +50,11 @@ func (m *BootSource) validateKernelImagePath(formats strfmt.Registry) error {
 		return err
 	}
 
+	return nil
+}
+
+// ContextValidate validates this boot source based on context it is used
+func (m *BootSource) ContextValidate(ctx context.Context, formats strfmt.Registry) error {
 	return nil
 }
 

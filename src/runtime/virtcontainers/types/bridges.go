@@ -5,7 +5,10 @@
 
 package types
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // Type represents a type of bus and bridge.
 type Type string
@@ -33,11 +36,11 @@ type Bridge struct {
 	// ID is used to identify the bridge in the hypervisor
 	ID string
 
-	// Addr is the slot of the bridge
-	Addr int
-
 	// Type is the type of the bridge (pci, pcie, etc)
 	Type Type
+
+	// Addr is the slot of the bridge
+	Addr int
 
 	// MaxCapacity is the max capacity of the bridge
 	MaxCapacity uint32
@@ -64,7 +67,7 @@ func NewBridge(bt Type, id string, devices map[uint32]string, addr int) Bridge {
 	}
 }
 
-func (b *Bridge) AddDevice(ID string) (uint32, error) {
+func (b *Bridge) AddDevice(ctx context.Context, ID string) (uint32, error) {
 	var addr uint32
 
 	// looking for the first available address

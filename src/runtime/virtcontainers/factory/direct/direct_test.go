@@ -12,14 +12,12 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 )
 
 func TestTemplateFactory(t *testing.T) {
 	assert := assert.New(t)
 
-	testDir := fs.MockStorageRootPath()
-	defer fs.MockStorageDestroy()
+	testDir := t.TempDir()
 
 	hyperConfig := vc.HypervisorConfig{
 		KernelPath: testDir,
@@ -42,7 +40,7 @@ func TestTemplateFactory(t *testing.T) {
 	vm, err := f.GetBaseVM(ctx, vmConfig)
 	assert.Nil(err)
 
-	err = vm.Stop()
+	err = vm.Stop(ctx)
 	assert.Nil(err)
 
 	// CloseFactory

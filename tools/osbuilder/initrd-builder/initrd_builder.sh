@@ -1,12 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright (c) 2018 HyperHQ Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 
-set -e
+[ -z "${DEBUG}" ] || set -x
 
-[ -n "$DEBUG" ] && set -x
+set -o errexit
+# set -o nounset
+set -o pipefail
 
 script_name="${0##*/}"
 script_dir="$(dirname $(readlink -f $0))"
@@ -21,7 +23,7 @@ AGENT_INIT=${AGENT_INIT:-no}
 usage()
 {
 	error="${1:-0}"
-	cat <<EOT
+	cat <<EOF
 Usage: ${script_name} [options] <rootfs-dir>
 	This script creates a Kata Containers initrd image file based on the
 	<rootfs-dir> directory.
@@ -36,7 +38,7 @@ Extra environment variables:
 		    DEFAULT: kata-agent
 	AGENT_INIT: use kata agent as init process
 		    DEFAULT: no
-EOT
+EOF
 exit "${error}"
 }
 

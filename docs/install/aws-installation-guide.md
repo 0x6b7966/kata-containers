@@ -1,10 +1,5 @@
 # Install Kata Containers on Amazon Web Services
 
-* [Install and Configure AWS CLI](#install-and-configure-aws-cli)
-* [Create or Import an EC2 SSH key pair](#create-or-import-an-ec2-ssh-key-pair)
-* [Launch i3.metal instance](#launch-i3metal-instance)
-* [Install Kata](#install-kata)
-
 Kata Containers on Amazon Web Services (AWS) makes use of [i3.metal](https://aws.amazon.com/ec2/instance-types/i3/) instances. Most of the installation procedure is identical to that for Kata on your preferred distribution, except that you have to run it on bare metal instances since AWS doesn't support nested virtualization yet. This guide walks you through creating an i3.metal instance.
 
 ## Install and Configure AWS CLI
@@ -128,7 +123,7 @@ Refer to [this guide](https://docs.aws.amazon.com/cli/latest/userguide/cli-ec2-l
 SSH into the machine
 
 ```bash
-$ ssh -i MyKeyPair.pen ubuntu@${IP}
+$ ssh -i MyKeyPair.pem ubuntu@${IP}
 ```
 
 Go onto the next step.

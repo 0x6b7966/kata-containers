@@ -17,26 +17,34 @@
 package shim
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/containerd/containerd/namespaces"
-	"github.com/pkg/errors"
+	"github.com/gogo/protobuf/proto"
+	"github.com/gogo/protobuf/types"
+	exec "golang.org/x/sys/execabs"
 )
 
-const shimBinaryFormat = "containerd-shim-%s-%s"
-
-var runtimePaths sync.Map
+type CommandConfig struct {
+	Runtime      string
+	Address      string
+	TTRPCAddress string
+	Path         string
+	SchedCore    bool
+	Args         []string
+	Opts         *types.Any
+}
 
 // Command returns the shim command with the provided args and configuration
-func Command(ctx context.Context, runtime, containerdAddress, path string, cmdArgs ...string) (*exec.Cmd, error) {
+func Command(ctx context.Context, config *CommandConfig) (*exec.Cmd, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return nil, err
@@ -47,42 +55,28 @@ func Command(ctx context.Context, runtime, containerdAddress, path string, cmdAr
 	}
 	args := []string{
 		"-namespace", ns,
-		"-address", containerdAddress,
+		"-address", config.Address,
 		"-publish-binary", self,
 	}
-	args = append(args, cmdArgs...)
-	name := BinaryName(runtime)
-	if name == "" {
-		return nil, fmt.Errorf("invalid runtime name %s, correct runtime name should format like io.containerd.runc.v1", runtime)
+	args = append(args, config.Args...)
+	cmd := exec.CommandContext(ctx, config.Runtime, args...)
+	cmd.Dir = config.Path
+	cmd.Env = append(
+		os.Environ(),
+		"GOMAXPROCS=2",
+		fmt.Sprintf("%s=%s", ttrpcAddressEnv, config.TTRPCAddress),
+	)
+	if config.SchedCore {
+		cmd.Env = append(cmd.Env, "SCHED_CORE=1")
 	}
-
-	var cmdPath string
-	cmdPathI, cmdPathFound := runtimePaths.Load(name)
-	if cmdPathFound {
-		cmdPath = cmdPathI.(string)
-	} else {
-		var lerr error
-		if cmdPath, lerr = exec.LookPath(name); lerr != nil {
-			if eerr, ok := lerr.(*exec.Error); ok {
-				if eerr.Err == exec.ErrNotFound {
-					return nil, errors.Wrapf(os.ErrNotExist, "runtime %q binary not installed %q", runtime, name)
-				}
-			}
-		}
-		cmdPath, err = filepath.Abs(cmdPath)
+	cmd.SysProcAttr = getSysProcAttr()
+	if config.Opts != nil {
+		d, err := proto.Marshal(config.Opts)
 		if err != nil {
 			return nil, err
 		}
-		if cmdPathI, cmdPathFound = runtimePaths.LoadOrStore(name, cmdPath); cmdPathFound {
-			// We didn't store cmdPath we loaded an already cached value. Use it.
-			cmdPath = cmdPathI.(string)
-		}
+		cmd.Stdin = bytes.NewReader(d)
 	}
-
-	cmd := exec.Command(cmdPath, args...)
-	cmd.Dir = path
-	cmd.Env = append(os.Environ(), "GOMAXPROCS=2")
-	cmd.SysProcAttr = getSysProcAttr()
 	return cmd, nil
 }
 
@@ -96,6 +90,20 @@ func BinaryName(runtime string) string {
 	}
 
 	return fmt.Sprintf(shimBinaryFormat, parts[len(parts)-2], parts[len(parts)-1])
+}
+
+// BinaryPath returns the full path for the shim binary from the runtime name,
+// empty string returns means runtime name is invalid
+func BinaryPath(runtime string) string {
+	dir := filepath.Dir(runtime)
+	binary := BinaryName(runtime)
+
+	path, err := filepath.Abs(filepath.Join(dir, binary))
+	if err != nil {
+		return ""
+	}
+
+	return path
 }
 
 // Connect to the provided address
@@ -139,4 +147,23 @@ func WriteAddress(path, address string) error {
 		return err
 	}
 	return os.Rename(tempPath, path)
+}
+
+// ErrNoAddress is returned when the address file has no content
+var ErrNoAddress = errors.New("no shim address")
+
+// ReadAddress returns the shim's socket address from the path
+func ReadAddress(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", ErrNoAddress
+	}
+	return string(data), nil
 }

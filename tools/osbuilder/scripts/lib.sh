@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright (c) 2018-2020 Intel Corporation
 #
@@ -7,7 +7,6 @@
 set -e
 
 KATA_REPO=${KATA_REPO:-github.com/kata-containers/kata-containers}
-MUSL_VERSION=${MUSL_VERSION:-"null"}
 # Give preference to variable set by CI
 yq_file="${script_dir}/../../../ci/install_yq.sh"
 kata_versions_file="${script_dir}/../../../versions.yaml"
@@ -57,38 +56,18 @@ check_root()
 
 generate_dnf_config()
 {
-	REPO_NAME=${REPO_NAME:-"base"}
-	CACHE_DIR=${CACHE_DIR:-"/var/cache/dnf"}
 	cat > "${DNF_CONF}" << EOF
 [main]
-cachedir=${CACHE_DIR}
-logfile=${LOG_FILE}
-keepcache=0
-debuglevel=2
-exactarch=1
-obsoletes=1
-plugins=0
-installonly_limit=3
 reposdir=/root/mash
-retries=5
+
+[base]
+name=${OS_NAME}-${OS_VERSION} base
+releasever=${OS_VERSION}
 EOF
 	if [ "$BASE_URL" != "" ]; then
-		cat >> "${DNF_CONF}" << EOF
-
-[base]
-name=${OS_NAME}-${OS_VERSION} ${REPO_NAME}
-failovermethod=priority
-baseurl=${BASE_URL}
-enabled=1
-EOF
-	elif [ "$MIRROR_LIST" != "" ]; then
-		cat >> "${DNF_CONF}" << EOF
-
-[base]
-name=${OS_NAME}-${OS_VERSION} ${REPO_NAME}
-mirrorlist=${MIRROR_LIST}
-enabled=1
-EOF
+		echo "baseurl=$BASE_URL" >> "$DNF_CONF"
+	elif [ "$METALINK" != "" ]; then
+		echo "metalink=$METALINK" >> "$DNF_CONF"
 	fi
 
 	if [ -n "$GPG_KEY_URL" ]; then
@@ -100,16 +79,23 @@ gpgcheck=1
 gpgkey=file://${CONFIG_DIR}/${GPG_KEY_FILE}
 EOF
 	fi
-
-	if [ -n "$GPG_KEY_ARCH_URL" ]; then
-		if [ ! -f "${CONFIG_DIR}/${GPG_KEY_ARCH_FILE}" ]; then
-			 curl -L "${GPG_KEY_ARCH_URL}" -o "${CONFIG_DIR}/${GPG_KEY_ARCH_FILE}"
-		fi
-		cat >> "${DNF_CONF}" << EOF
-       file://${CONFIG_DIR}/${GPG_KEY_ARCH_FILE}
+	if [ "$SELINUX" == "yes" ]; then
+		cat > "${DNF_CONF}" << EOF
+[appstream]
+name=${OS_NAME}-${OS_VERSION} upstream
+releasever=${OS_VERSION}
 EOF
+		echo "metalink=$METALINK_APPSTREAM" >> "$DNF_CONF"
+		if [ -n "$GPG_KEY_URL" ]; then
+			if [ ! -f "${CONFIG_DIR}/${GPG_KEY_FILE}" ]; then
+				curl -L "${GPG_KEY_URL}" -o "${CONFIG_DIR}/${GPG_KEY_FILE}"
+			fi
+			cat >> "${DNF_CONF}" << EOF
+gpgcheck=1
+gpgkey=file://${CONFIG_DIR}/${GPG_KEY_FILE}
+EOF
+		fi
 	fi
-
 }
 
 build_rootfs()
@@ -150,7 +136,11 @@ build_rootfs()
 	else
 		DNF="${DNF} --releasever=${OS_VERSION}"
 	fi
+
+	info "install packages for rootfs"
 	$DNF install ${EXTRA_PKGS} ${PACKAGES}
+
+	rm -rf ${ROOTFS_DIR}/usr/share/{bash-completion,cracklib,doc,info,locale,man,misc,pixmaps,terminfo,zoneinfo,zsh}
 }
 
 # Create a YAML metadata file inside the rootfs.
@@ -190,16 +180,10 @@ create_summary_file()
 	local agent="${AGENT_DEST}"
 	[ "$AGENT_INIT" = yes ] && agent="${init}"
 
-	local agent_version
-	if [ "${RUST_AGENT}" == "no" ]; then
-		agent_version=$("$agent" --version|awk '{print $NF}')
-	else
-		local -r agentdir="${script_dir}/../../../"
-		agent_version=$(cat ${agentdir}/VERSION)
-	fi
+	local -r agentdir="${script_dir}/../../../"
+	local -r agent_version=$(cat ${agentdir}/VERSION)
 
-
-	cat >"$file"<<-EOT
+	cat >"$file"<<-EOF
 	---
 	osbuilder:
 	  url: "${osbuilder_url}"
@@ -221,7 +205,7 @@ ${extra}
 	  name: "${AGENT_BIN}"
 	  version: "${agent_version}"
 	  agent-is-init-daemon: "${AGENT_INIT}"
-EOT
+EOF
 
 	local rootfs_file="${file_dir}/$(basename "${file}")"
 	info "Created summary file '${rootfs_file}' inside rootfs"
@@ -235,185 +219,84 @@ generate_dockerfile()
 	dir="$1"
 	[ -d "${dir}" ] || die "${dir}: not a directory"
 
-	local architecture=$(uname -m)
-	local rustarch=${architecture}
-	local muslarch=${architecture}
-	local libc=musl
-	case "$(uname -m)" in
-		"ppc64le")
-			goarch=ppc64le
-			rustarch=powerpc64le
-			muslarch=powerpc64
-			;;
-
-		"aarch64")
-			goarch=arm64
-			;;
-		"s390x")
-			goarch=s390x
-			libc=gnu
-			;;
-
-		*)
-			goarch=amd64
-			;;
-	esac
+	local rustarch="$ARCH"
+	[ "$ARCH" = ppc64le ] && rustarch=powerpc64le
 
 	[ -n "${http_proxy:-}" ] && readonly set_proxy="RUN sed -i '$ a proxy="${http_proxy:-}"' /etc/dnf/dnf.conf /etc/yum.conf; true"
 
-	curlOptions=("-OL")
-	[ -n "${http_proxy:-}" ] && curlOptions+=("-x ${http_proxy:-}")
-
-	readonly install_go="
-RUN cd /tmp ; curl ${curlOptions[@]} https://storage.googleapis.com/golang/go${GO_VERSION}.linux-${goarch}.tar.gz
-RUN tar -C /usr/ -xzf /tmp/go${GO_VERSION}.linux-${goarch}.tar.gz
-ENV GOROOT=/usr/go
-ENV PATH=\$PATH:\$GOROOT/bin:\$GOPATH/bin
-"
-
 	# Rust agent
-	# rust installer should set path apropiately, just in case
-	# install musl for compiling rust-agent
-	local musl_source_url="https://git.zv.io/toolchains/musl-cross-make.git"
-	local musl_source_dir="musl-cross-make"
-	install_musl=
-	if [ "${muslarch}" == "aarch64" ]; then
-		local musl_tar="${muslarch}-linux-musl-native.tgz"
-		local musl_dir="${muslarch}-linux-musl-native"
-		local aarch64_musl_target="aarch64-linux-musl"
-		install_musl="
-RUN cd /tmp; \
-	mkdir -p /usr/local/musl/; \
-	if curl -sLO --fail https://musl.cc/${musl_tar}; then \
-		tar -zxf ${musl_tar}; \
-		cp -r ${musl_dir}/* /usr/local/musl/; \
-	else \
-		git clone ${musl_source_url}; \
-		TARGET=${aarch64_musl_target} make -j$(nproc) -C ${musl_source_dir} install; \
-		cp -r ${musl_source_dir}/output/* /usr/local/musl/; \
-		cp /usr/local/musl/bin/aarch64-linux-musl-g++ /usr/local/musl/bin/g++; \
-	fi
-ENV PATH=\$PATH:/usr/local/musl/bin
-RUN ln -sf /usr/local/musl/bin/g++ /usr/bin/g++
-"
-	else
-		local musl_tar="musl-${MUSL_VERSION}.tar.gz"
-		local musl_dir="musl-${MUSL_VERSION}"
-		install_musl="
-RUN pushd /root; \
-    curl -sLO https://www.musl-libc.org/releases/${musl_tar}; tar -zxf ${musl_tar}; \
-	cd ${musl_dir}; \
-	sed -i \"s/^ARCH = .*/ARCH = ${muslarch}/g\" dist/config.mak; \
-	./configure > /dev/null 2>\&1; \
-	make > /dev/null 2>\&1; \
-	make install > /dev/null 2>\&1; \
-	echo \"/usr/local/musl/lib\" > /etc/ld-musl-${muslarch}.path; \
-	popd
-ENV PATH=\$PATH:/usr/local/musl/bin
-"
-	fi
-
 	readonly install_rust="
-RUN curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSLf --output /tmp/rust-init; \
-    chmod a+x /tmp/rust-init; \
-	export http_proxy=${http_proxy:-}; \
-	export https_proxy=${http_proxy:-}; \
-	/tmp/rust-init -y --default-toolchain ${RUST_VERSION}
-RUN . /root/.cargo/env; \
-    export http_proxy=${http_proxy:-}; \
-	export https_proxy=${http_proxy:-}; \
-	cargo install cargo-when; \
-	rustup target install ${rustarch}-unknown-linux-${libc}
-RUN ln -sf /usr/bin/g++ /bin/musl-g++
+ENV http_proxy=${http_proxy:-}
+ENV https_proxy=${http_proxy:-}
+RUN curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSLf | \
+    sh -s -- -y --default-toolchain ${RUST_VERSION} -t ${rustarch}-unknown-linux-${LIBC}
+RUN . /root/.cargo/env; cargo install cargo-when
 "
-	# rust agent still need go to build
-	# because grpc-sys need go to build
 	pushd "${dir}"
-	dockerfile_template="Dockerfile.in"
-	dockerfile_arch_template="Dockerfile-${architecture}.in"
-	# if arch-specific docker file exists, swap the univesal one with it.
-        if [ -f "${dockerfile_arch_template}" ]; then
-                dockerfile_template="${dockerfile_arch_template}"
-        else
-                [ -f "${dockerfile_template}" ] || die "${dockerfile_template}: file not found"
-        fi
 
-	# powerpc have no musl target, don't setup rust enviroment
-	# since we cannot static link agent. Besides, there is
-	# also long double representation problem when building musl-libc
-	if [ "${architecture}" == "ppc64le" ]; then
-		sed \
-			-e "s|@GO_VERSION@|${GO_VERSION}|g" \
-			-e "s|@OS_VERSION@|${OS_VERSION:-}|g" \
-			-e "s|@INSTALL_MUSL@||g" \
-			-e "s|@INSTALL_GO@|${install_go//$'\n'/\\n}|g" \
-			-e "s|@INSTALL_RUST@||g" \
-			-e "s|@SET_PROXY@|${set_proxy:-}|g" \
-			"${dockerfile_template}" > Dockerfile
-	# no musl target on s390x, will use GNU
-	elif [ "${architecture}" == "s390x" ]; then
-		sed \
-			-e "s|@GO_VERSION@|${GO_VERSION}|g" \
-			-e "s|@OS_VERSION@|${OS_VERSION:-}|g" \
-			-e "s|@INSTALL_CMAKE@|${install_cmake//$'\n'/\\n}|g" \
-			-e "s|@INSTALL_MUSL@||g" \
-			-e "s|@INSTALL_GO@|${install_go//$'\n'/\\n}|g" \
-			-e "s|@INSTALL_RUST@|${install_rust//$'\n'/\\n}|g" \
-			-e "s|@SET_PROXY@|${set_proxy:-}|g" \
-			"${dockerfile_template}" > Dockerfile
-	else
-		sed \
-			-e "s|@GO_VERSION@|${GO_VERSION}|g" \
-			-e "s|@OS_VERSION@|${OS_VERSION:-}|g" \
-			-e "s|@INSTALL_MUSL@|${install_musl//$'\n'/\\n}|g" \
-			-e "s|@INSTALL_GO@|${install_go//$'\n'/\\n}|g" \
-			-e "s|@INSTALL_RUST@|${install_rust//$'\n'/\\n}|g" \
-			-e "s|@SET_PROXY@|${set_proxy:-}|g" \
-			"${dockerfile_template}" > Dockerfile
-	fi
+	sed \
+		-e "s#@OS_VERSION@#${OS_VERSION:-}#g" \
+		-e "s#@ARCH@#$ARCH#g" \
+		-e "s#@INSTALL_RUST@#${install_rust//$'\n'/\\n}#g" \
+		-e "s#@SET_PROXY@#${set_proxy:-}#g" \
+		Dockerfile.in > Dockerfile
 	popd
 }
 
-detect_go_version()
+get_package_version_from_kata_yaml()
 {
-	info "Detecting go version"
-	typeset yq=$(command -v yq || command -v ${GOPATH}/bin/yq || echo "${GOPATH}/bin/yq")
+    local yq_path="$1"
+    local yq_version
+    local yq_args
+
+	typeset -r yq=$(command -v yq || command -v "${GOPATH}/bin/yq" || echo "${GOPATH}/bin/yq")
 	if [ ! -f "$yq" ]; then
 		source "$yq_file"
 	fi
 
-	info "Get Go version from ${kata_versions_file}"
-	GO_VERSION="$(cat "${kata_versions_file}"  | $yq r -X - "languages.golang.meta.newest-version")"
+    yq_version=$($yq -V)
+    case $yq_version in
+    *"version "[1-3]*)
+        yq_args="r -X - ${yq_path}"
+        ;;
+    *)
+        yq_args="e .${yq_path} -"
+        ;;
+    esac
 
-	[ "$?" == "0" ] && [ "$GO_VERSION" != "null" ]
+	PKG_VERSION="$(cat "${kata_versions_file}" | $yq ${yq_args})"
+
+	[ "$?" == "0" ] && [ "$PKG_VERSION" != "null" ] && echo "$PKG_VERSION" || echo ""
 }
 
 detect_rust_version()
 {
 	info "Detecting agent rust version"
-	typeset -r yq=$(command -v yq || command -v "${GOPATH}/bin/yq" || echo "${GOPATH}/bin/yq")
-	if [ ! -f "$yq" ]; then
-		source "$yq_file"
-	fi
+    local yq_path="languages.rust.meta.newest-version"
 
 	info "Get rust version from ${kata_versions_file}"
-	RUST_VERSION="$(cat "${kata_versions_file}"  | $yq r -X - "languages.rust.meta.newest-version")"
+	RUST_VERSION="$(get_package_version_from_kata_yaml "$yq_path")"
 
-	[ "$?" == "0" ] && [ "$RUST_VERSION" != "null" ]
+	[ -n "$RUST_VERSION" ]
 }
 
-detect_musl_version()
+detect_libseccomp_info()
 {
-	info "Detecting musl version"
-	typeset -r yq=$(command -v yq || command -v "${GOPATH}/bin/yq" || echo "${GOPATH}/bin/yq")
-	if [ ! -f "$yq" ]; then
-		source "$yq_file"
-	fi
+	info "Detecting libseccomp version"
 
-	info "Get musl version from ${kata_versions_file}"
-	MUSL_VERSION="$(cat "${kata_versions_file}"  | $yq r -X - "externals.musl.version")"
+	info "Get libseccomp version and url from ${kata_versions_file}"
+	local libseccomp_ver_yq_path="externals.libseccomp.version"
+	local libseccomp_url_yq_path="externals.libseccomp.url"
+	export LIBSECCOMP_VERSION="$(get_package_version_from_kata_yaml "$libseccomp_ver_yq_path")"
+	export LIBSECCOMP_URL="$(get_package_version_from_kata_yaml "$libseccomp_url_yq_path")"
 
-	[ "$?" == "0" ] && [ "$MUSL_VERSION" != "null" ]
+	info "Get gperf version and url from ${kata_versions_file}"
+	local gperf_ver_yq_path="externals.gperf.version"
+	local gperf_url_yq_path="externals.gperf.url"
+	export GPERF_VERSION="$(get_package_version_from_kata_yaml "$gperf_ver_yq_path")"
+	export GPERF_URL="$(get_package_version_from_kata_yaml "$gperf_url_yq_path")"
+
+	[ -n "$LIBSECCOMP_VERSION" ] && [ -n $GPERF_VERSION ] && [ -n "$LIBSECCOMP_URL" ] && [ -n $GPERF_URL ]
 }
 
 before_starting_container() {

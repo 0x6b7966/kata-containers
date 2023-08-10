@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -6,19 +8,22 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
+
+var ipvlanTrace = getNetworkTrace(IPVlanEndpointType)
 
 // IPVlanEndpoint represents a ipvlan endpoint that is bridged to the VM
 type IPVlanEndpoint struct {
-	NetPair            NetworkInterfacePair
-	EndpointProperties NetworkInfo
 	EndpointType       EndpointType
 	PCIPath            vcTypes.PciPath
+	EndpointProperties NetworkInfo
+	NetPair            NetworkInterfacePair
 	RxRateLimiter      bool
 	TxRateLimiter      bool
 }
@@ -63,7 +68,7 @@ func (endpoint *IPVlanEndpoint) HardwareAddr() string {
 	return endpoint.NetPair.TAPIface.HardAddr
 }
 
-// Type identifies the endpoint as a virtual endpoint.
+// Type identifies the endpoint as a ipvlan endpoint.
 func (endpoint *IPVlanEndpoint) Type() EndpointType {
 	return endpoint.EndpointType
 }
@@ -88,39 +93,45 @@ func (endpoint *IPVlanEndpoint) NetworkPair() *NetworkInterfacePair {
 	return &endpoint.NetPair
 }
 
-// Attach for virtual endpoint bridges the network pair and adds the
+// Attach for ipvlan endpoint bridges the network pair and adds the
 // tap interface of the network pair to the hypervisor.
-func (endpoint *IPVlanEndpoint) Attach(s *Sandbox) error {
+func (endpoint *IPVlanEndpoint) Attach(ctx context.Context, s *Sandbox) error {
+	span, ctx := ipvlanTrace(ctx, "Attach", endpoint)
+	defer span.End()
+
 	h := s.hypervisor
-	if err := xConnectVMNetwork(endpoint, h); err != nil {
-		networkLogger().WithError(err).Error("Error bridging virtual ep")
+	if err := xConnectVMNetwork(ctx, endpoint, h); err != nil {
+		networkLogger().WithError(err).Error("Error bridging ipvlan ep")
 		return err
 	}
 
-	return h.addDevice(endpoint, netDev)
+	return h.AddDevice(ctx, endpoint, NetDev)
 }
 
-// Detach for the virtual endpoint tears down the tap and bridge
+// Detach for the ipvlan endpoint tears down the tap and bridge
 // created for the veth interface.
-func (endpoint *IPVlanEndpoint) Detach(netNsCreated bool, netNsPath string) error {
+func (endpoint *IPVlanEndpoint) Detach(ctx context.Context, netNsCreated bool, netNsPath string) error {
 	// The network namespace would have been deleted at this point
 	// if it has not been created by virtcontainers.
 	if !netNsCreated {
 		return nil
 	}
 
+	span, ctx := ipvlanTrace(ctx, "Detach", endpoint)
+	defer span.End()
+
 	return doNetNS(netNsPath, func(_ ns.NetNS) error {
-		return xDisconnectVMNetwork(endpoint)
+		return xDisconnectVMNetwork(ctx, endpoint)
 	})
 }
 
-// HotAttach for physical endpoint not supported yet
-func (endpoint *IPVlanEndpoint) HotAttach(h hypervisor) error {
+// HotAttach for ipvlan endpoint not supported yet
+func (endpoint *IPVlanEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
 	return fmt.Errorf("IPVlanEndpoint does not support Hot attach")
 }
 
-// HotDetach for physical endpoint not supported yet
-func (endpoint *IPVlanEndpoint) HotDetach(h hypervisor, netNsCreated bool, netNsPath string) error {
+// HotDetach for ipvlan endpoint not supported yet
+func (endpoint *IPVlanEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
 	return fmt.Errorf("IPVlanEndpoint does not support Hot detach")
 }
 

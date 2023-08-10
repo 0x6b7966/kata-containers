@@ -2,14 +2,6 @@
 
 This document describes how to run `kata-monitor` in a Kubernetes cluster using Prometheus's service discovery to scrape metrics from `kata-agent`.
 
-- [Introduction](#introduction)
-- [Pre-requisites](#pre-requisites)
-- [Configure Prometheus](#configure-prometheus)
-- [Configure `kata-monitor`](#configure-kata-monitor)
-- [Setup Grafana](#setup-grafana)
-  * [Create `datasource`](#create-datasource)
-  * [Import dashboard](#import-dashboard)
-
 > **Warning**: This how-to is only for evaluation purpose, you **SHOULD NOT** running it in production using this configurations.
 
 ## Introduction
@@ -27,7 +19,7 @@ Also you should ensure that `kubectl` working correctly.
 > **Note**: More information about Kubernetes integrations:
 >   - [Run Kata Containers with Kubernetes](run-kata-with-k8s.md)
 >   - [How to use Kata Containers and Containerd](containerd-kata.md)
->   - [How to use Kata Containers and CRI (containerd plugin) with Kubernetes](how-to-use-k8s-with-cri-containerd-and-kata.md)
+>   - [How to use Kata Containers and containerd with Kubernetes](how-to-use-k8s-with-containerd-and-kata.md)
 
 ## Configure Prometheus
 

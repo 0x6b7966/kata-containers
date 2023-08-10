@@ -3,9 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use libc::uid_t;
-use nix::errno::Errno;
 use nix::fcntl::{self, OFlag};
 #[cfg(not(test))]
 use nix::mount;
@@ -13,19 +12,20 @@ use nix::mount::{MntFlags, MsFlags};
 use nix::sys::stat::{self, Mode, SFlag};
 use nix::unistd::{self, Gid, Uid};
 use nix::NixPath;
-use oci::{LinuxDevice, Mount, Spec};
+use oci::{LinuxDevice, Mount, Process, Spec};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::mem::MaybeUninit;
 use std::os::unix;
 use std::os::unix::io::RawFd;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use path_absolutize::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use crate::container::DEFAULT_DEVICES;
+use crate::selinux;
 use crate::sync::write_count;
 use std::string::ToString;
 
@@ -33,85 +33,83 @@ use crate::log_child;
 
 // Info reveals information about a particular mounted filesystem. This
 // struct is populated from the content in the /proc/<pid>/mountinfo file.
-#[derive(std::fmt::Debug)]
+#[derive(std::fmt::Debug, PartialEq)]
 pub struct Info {
-    id: i32,
-    parent: i32,
-    major: i32,
-    minor: i32,
-    root: String,
-    mount_point: String,
-    opts: String,
+    pub mount_point: String,
     optional: String,
     fstype: String,
-    source: String,
-    vfs_opts: String,
 }
 
-const MOUNTINFOFORMAT: &str = "{d} {d} {d}:{d} {} {} {} {}";
+const MOUNTINFO_FORMAT: &str = "{d} {d} {d}:{d} {} {} {} {}";
+const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
 const PROC_PATH: &str = "/proc";
 
+const ERR_FAILED_PARSE_MOUNTINFO: &str = "failed to parse mountinfo file";
+const ERR_FAILED_PARSE_MOUNTINFO_FINAL_FIELDS: &str =
+    "failed to parse final fields in mountinfo file";
+
 // since libc didn't defined this const for musl, thus redefined it here.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", not(target_arch = "s390x")))]
 const PROC_SUPER_MAGIC: libc::c_long = 0x00009fa0;
 #[cfg(all(target_os = "linux", target_env = "musl"))]
 const PROC_SUPER_MAGIC: libc::c_ulong = 0x00009fa0;
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "s390x"))]
+const PROC_SUPER_MAGIC: libc::c_uint = 0x00009fa0;
 
 lazy_static! {
     static ref PROPAGATION: HashMap<&'static str, MsFlags> = {
         let mut m = HashMap::new();
-        m.insert("shared", MsFlags::MS_SHARED);
-        m.insert("rshared", MsFlags::MS_SHARED | MsFlags::MS_REC);
         m.insert("private", MsFlags::MS_PRIVATE);
         m.insert("rprivate", MsFlags::MS_PRIVATE | MsFlags::MS_REC);
-        m.insert("slave", MsFlags::MS_SLAVE);
+        m.insert("rshared", MsFlags::MS_SHARED | MsFlags::MS_REC);
         m.insert("rslave", MsFlags::MS_SLAVE | MsFlags::MS_REC);
+        m.insert("runbindable", MsFlags::MS_UNBINDABLE | MsFlags::MS_REC);
+        m.insert("shared", MsFlags::MS_SHARED);
+        m.insert("slave", MsFlags::MS_SLAVE);
+        m.insert("unbindable", MsFlags::MS_UNBINDABLE);
         m
     };
     static ref OPTIONS: HashMap<&'static str, (bool, MsFlags)> = {
         let mut m = HashMap::new();
+        m.insert("acl", (false, MsFlags::MS_POSIXACL));
+        m.insert("async", (true, MsFlags::MS_SYNCHRONOUS));
+        m.insert("atime", (true, MsFlags::MS_NOATIME));
+        m.insert("bind", (false, MsFlags::MS_BIND));
         m.insert("defaults", (false, MsFlags::empty()));
+        m.insert("dev", (true, MsFlags::MS_NODEV));
+        m.insert("diratime", (true, MsFlags::MS_NODIRATIME));
+        m.insert("dirsync", (false, MsFlags::MS_DIRSYNC));
+        m.insert("exec", (true, MsFlags::MS_NOEXEC));
+        m.insert("iversion", (false, MsFlags::MS_I_VERSION));
+        m.insert("lazytime", (false, MsFlags::MS_LAZYTIME));
+        m.insert("loud", (true, MsFlags::MS_SILENT));
+        m.insert("mand", (false, MsFlags::MS_MANDLOCK));
+        m.insert("noacl", (true, MsFlags::MS_POSIXACL));
+        m.insert("noatime", (false, MsFlags::MS_NOATIME));
+        m.insert("nodev", (false, MsFlags::MS_NODEV));
+        m.insert("nodiratime", (false, MsFlags::MS_NODIRATIME));
+        m.insert("noexec", (false, MsFlags::MS_NOEXEC));
+        m.insert("noiversion", (true, MsFlags::MS_I_VERSION));
+        m.insert("nolazytime", (true, MsFlags::MS_LAZYTIME));
+        m.insert("nomand", (true, MsFlags::MS_MANDLOCK));
+        m.insert("norelatime", (true, MsFlags::MS_RELATIME));
+        m.insert("nostrictatime", (true, MsFlags::MS_STRICTATIME));
+        m.insert("nosuid", (false, MsFlags::MS_NOSUID));
+        m.insert("rbind", (false, MsFlags::MS_BIND | MsFlags::MS_REC));
+        m.insert("relatime", (false, MsFlags::MS_RELATIME));
+        m.insert("remount", (false, MsFlags::MS_REMOUNT));
         m.insert("ro", (false, MsFlags::MS_RDONLY));
         m.insert("rw", (true, MsFlags::MS_RDONLY));
-        m.insert("suid", (true, MsFlags::MS_NOSUID));
-        m.insert("nosuid", (false, MsFlags::MS_NOSUID));
-        m.insert("dev", (true, MsFlags::MS_NODEV));
-        m.insert("nodev", (false, MsFlags::MS_NODEV));
-        m.insert("exec", (true, MsFlags::MS_NOEXEC));
-        m.insert("noexec", (false, MsFlags::MS_NOEXEC));
-        m.insert("sync", (false, MsFlags::MS_SYNCHRONOUS));
-        m.insert("async", (true, MsFlags::MS_SYNCHRONOUS));
-        m.insert("dirsync", (false, MsFlags::MS_DIRSYNC));
-        m.insert("remount", (false, MsFlags::MS_REMOUNT));
-        m.insert("mand", (false, MsFlags::MS_MANDLOCK));
-        m.insert("nomand", (true, MsFlags::MS_MANDLOCK));
-        m.insert("atime", (true, MsFlags::MS_NOATIME));
-        m.insert("noatime", (false, MsFlags::MS_NOATIME));
-        m.insert("diratime", (true, MsFlags::MS_NODIRATIME));
-        m.insert("nodiratime", (false, MsFlags::MS_NODIRATIME));
-        m.insert("bind", (false, MsFlags::MS_BIND));
-        m.insert("rbind", (false, MsFlags::MS_BIND | MsFlags::MS_REC));
-        m.insert("unbindable", (false, MsFlags::MS_UNBINDABLE));
-        m.insert(
-            "runbindable",
-            (false, MsFlags::MS_UNBINDABLE | MsFlags::MS_REC),
-        );
-        m.insert("private", (false, MsFlags::MS_PRIVATE));
-        m.insert("rprivate", (false, MsFlags::MS_PRIVATE | MsFlags::MS_REC));
-        m.insert("shared", (false, MsFlags::MS_SHARED));
-        m.insert("rshared", (false, MsFlags::MS_SHARED | MsFlags::MS_REC));
-        m.insert("slave", (false, MsFlags::MS_SLAVE));
-        m.insert("rslave", (false, MsFlags::MS_SLAVE | MsFlags::MS_REC));
-        m.insert("relatime", (false, MsFlags::MS_RELATIME));
-        m.insert("norelatime", (true, MsFlags::MS_RELATIME));
+        m.insert("silent", (false, MsFlags::MS_SILENT));
         m.insert("strictatime", (false, MsFlags::MS_STRICTATIME));
-        m.insert("nostrictatime", (true, MsFlags::MS_STRICTATIME));
+        m.insert("suid", (true, MsFlags::MS_NOSUID));
+        m.insert("sync", (false, MsFlags::MS_SYNCHRONOUS));
         m
     };
 }
 
 #[inline(always)]
-#[allow(unused_variables)]
+#[cfg(not(test))]
 pub fn mount<
     P1: ?Sized + NixPath,
     P2: ?Sized + NixPath,
@@ -124,22 +122,42 @@ pub fn mount<
     flags: MsFlags,
     data: Option<&P4>,
 ) -> std::result::Result<(), nix::Error> {
-    #[cfg(not(test))]
-    return mount::mount(source, target, fstype, flags, data);
-    #[cfg(test)]
-    return Ok(());
+    mount::mount(source, target, fstype, flags, data)
 }
 
 #[inline(always)]
-#[allow(unused_variables)]
+#[cfg(test)]
+pub fn mount<
+    P1: ?Sized + NixPath,
+    P2: ?Sized + NixPath,
+    P3: ?Sized + NixPath,
+    P4: ?Sized + NixPath,
+>(
+    _source: Option<&P1>,
+    _target: &P2,
+    _fstype: Option<&P3>,
+    _flags: MsFlags,
+    _data: Option<&P4>,
+) -> std::result::Result<(), nix::Error> {
+    Ok(())
+}
+
+#[inline(always)]
+#[cfg(not(test))]
 pub fn umount2<P: ?Sized + NixPath>(
     target: &P,
     flags: MntFlags,
 ) -> std::result::Result<(), nix::Error> {
-    #[cfg(not(test))]
-    return mount::umount2(target, flags);
-    #[cfg(test)]
-    return Ok(());
+    mount::umount2(target, flags)
+}
+
+#[inline(always)]
+#[cfg(test)]
+pub fn umount2<P: ?Sized + NixPath>(
+    _target: &P,
+    _flags: MntFlags,
+) -> std::result::Result<(), nix::Error> {
+    Ok(())
 }
 
 pub fn init_rootfs(
@@ -163,6 +181,8 @@ pub fn init_rootfs(
         Some(fl) => flags |= *fl,
         None => flags |= MsFlags::MS_SLAVE,
     }
+
+    let label = &linux.mount_label;
 
     let root = spec
         .root
@@ -190,7 +210,7 @@ pub fn init_rootfs(
 
     let mut bind_mount_dev = false;
     for m in &spec.mounts {
-        let (mut flags, data) = parse_mount(&m);
+        let (mut flags, pgflags, data) = parse_mount(m);
         if !m.destination.starts_with('/') || m.destination.contains("..") {
             return Err(anyhow!(
                 "the mount destination {} is invalid",
@@ -199,7 +219,7 @@ pub fn init_rootfs(
         }
 
         if m.r#type == "cgroup" {
-            mount_cgroups(cfd_log, &m, rootfs, flags, &data, cpath, mounts)?;
+            mount_cgroups(cfd_log, m, rootfs, flags, &data, cpath, mounts)?;
         } else {
             if m.destination == "/dev" {
                 if m.r#type == "bind" {
@@ -227,18 +247,20 @@ pub fn init_rootfs(
                 }
             }
 
-            mount_from(cfd_log, &m, &rootfs, flags, &data, "")?;
+            mount_from(cfd_log, m, rootfs, flags, &data, label)?;
             // bind mount won't change mount options, we need remount to make mount options
             // effective.
             // first check that we have non-default options required before attempting a
             // remount
-            if m.r#type == "bind" {
-                for o in &m.options {
-                    if let Some(fl) = PROPAGATION.get(o.as_str()) {
-                        let dest = secure_join(rootfs, &m.destination);
-                        mount(None::<&str>, dest.as_str(), None::<&str>, *fl, None::<&str>)?;
-                    }
-                }
+            if m.r#type == "bind" && !pgflags.is_empty() {
+                let dest = secure_join(rootfs, &m.destination);
+                mount(
+                    None::<&str>,
+                    dest.as_str(),
+                    None::<&str>,
+                    pgflags,
+                    None::<&str>,
+                )?;
             }
         }
     }
@@ -355,7 +377,7 @@ fn mount_cgroups(
     mounts: &HashMap<String, String>,
 ) -> Result<()> {
     if cgroups::hierarchies::is_cgroup2_unified_mode() {
-        return mount_cgroups_v2(cfd_log, &m, rootfs, flags);
+        return mount_cgroups_v2(cfd_log, m, rootfs, flags);
     }
     // mount tmpfs
     let ctm = Mount {
@@ -449,15 +471,20 @@ fn mount_cgroups(
     Ok(())
 }
 
-#[allow(unused_variables)]
+#[cfg(not(test))]
 fn pivot_root<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
     new_root: &P1,
     put_old: &P2,
 ) -> anyhow::Result<(), nix::Error> {
-    #[cfg(not(test))]
-    return unistd::pivot_root(new_root, put_old);
-    #[cfg(test)]
-    return Ok(());
+    unistd::pivot_root(new_root, put_old)
+}
+
+#[cfg(test)]
+fn pivot_root<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
+    _new_root: &P1,
+    _put_old: &P2,
+) -> anyhow::Result<(), nix::Error> {
+    Ok(())
 }
 
 pub fn pivot_rootfs<P: ?Sized + NixPath + std::fmt::Debug>(path: &P) -> Result<()> {
@@ -499,8 +526,7 @@ pub fn pivot_rootfs<P: ?Sized + NixPath + std::fmt::Debug>(path: &P) -> Result<(
 }
 
 fn rootfs_parent_mount_private(path: &str) -> Result<()> {
-    let mount_infos = parse_mount_table()?;
-
+    let mount_infos = parse_mount_table(MOUNTINFO_PATH)?;
     let mut max_len = 0;
     let mut mount_point = String::from("");
     let mut options = String::from("");
@@ -527,17 +553,30 @@ fn rootfs_parent_mount_private(path: &str) -> Result<()> {
 
 // Parse /proc/self/mountinfo because comparing Dev and ino does not work from
 // bind mounts
-fn parse_mount_table() -> Result<Vec<Info>> {
-    let file = File::open("/proc/self/mountinfo")?;
+pub fn parse_mount_table(mountinfo_path: &str) -> Result<Vec<Info>> {
+    let file = File::open(mountinfo_path)?;
     let reader = BufReader::new(file);
     let mut infos = Vec::new();
 
     for (_index, line) in reader.lines().enumerate() {
         let line = line?;
 
-        let (id, parent, major, minor, root, mount_point, opts, optional) = scan_fmt!(
+        //Example mountinfo format:
+        // id
+        // |  / parent
+        // |  |   / major:minor
+        // |  |   |   / root
+        // |  |   |   |  / mount_point
+        // |  |   |   |  |        / opts
+        // |  |   |   |  |        |                           / optional
+        // |  |   |   |  |        |                           |          / fstype
+        // |  |   |   |  |        |                           |          |     / source
+        // |  |   |   |  |        |                           |          |     |      / vfs_opts
+        // 22 96 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw,seclabel
+
+        let (_id, _parent, _major, _minor, _root, mount_point, _opts, optional) = scan_fmt!(
             &line,
-            MOUNTINFOFORMAT,
+            MOUNTINFO_FORMAT,
             i32,
             i32,
             i32,
@@ -546,12 +585,17 @@ fn parse_mount_table() -> Result<Vec<Info>> {
             String,
             String,
             String
-        )?;
+        )
+        .map_err(|_| anyhow!(ERR_FAILED_PARSE_MOUNTINFO))?;
 
         let fields: Vec<&str> = line.split(" - ").collect();
         if fields.len() == 2 {
-            let (fstype, source, vfs_opts) =
-                scan_fmt!(fields[1], "{} {} {}", String, String, String)?;
+            let final_fields: Vec<&str> = fields[1].split_whitespace().collect();
+
+            if final_fields.len() != 3 {
+                return Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO_FINAL_FIELDS));
+            }
+            let fstype = final_fields[0].to_string();
 
             let mut optional_new = String::new();
             if optional != "-" {
@@ -559,22 +603,14 @@ fn parse_mount_table() -> Result<Vec<Info>> {
             }
 
             let info = Info {
-                id,
-                parent,
-                major,
-                minor,
-                root,
                 mount_point,
-                opts,
                 optional: optional_new,
                 fstype,
-                source,
-                vfs_opts,
             };
 
             infos.push(info);
         } else {
-            return Err(anyhow!("failed to parse mount info file".to_string()));
+            return Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO));
         }
     }
 
@@ -582,17 +618,20 @@ fn parse_mount_table() -> Result<Vec<Info>> {
 }
 
 #[inline(always)]
-#[allow(unused_variables)]
+#[cfg(not(test))]
 fn chroot<P: ?Sized + NixPath>(path: &P) -> Result<(), nix::Error> {
-    #[cfg(not(test))]
-    return unistd::chroot(path);
-    #[cfg(test)]
-    return Ok(());
+    unistd::chroot(path)
+}
+
+#[inline(always)]
+#[cfg(test)]
+fn chroot<P: ?Sized + NixPath>(_path: &P) -> Result<(), nix::Error> {
+    Ok(())
 }
 
 pub fn ms_move_root(rootfs: &str) -> Result<bool> {
     unistd::chdir(rootfs)?;
-    let mount_infos = parse_mount_table()?;
+    let mount_infos = parse_mount_table(MOUNTINFO_PATH)?;
 
     let root_path = Path::new(rootfs);
     let abs_root_buf = root_path.absolutize()?;
@@ -624,7 +663,7 @@ pub fn ms_move_root(rootfs: &str) -> Result<bool> {
             None::<&str>,
         )?;
         umount2(abs_mount_point, MntFlags::MNT_DETACH).or_else(|e| {
-            if e.ne(&nix::Error::from(Errno::EINVAL)) && e.ne(&nix::Error::from(Errno::EPERM)) {
+            if e.ne(&nix::Error::EINVAL) && e.ne(&nix::Error::EPERM) {
                 return Err(anyhow!(e));
             }
 
@@ -655,26 +694,27 @@ pub fn ms_move_root(rootfs: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn parse_mount(m: &Mount) -> (MsFlags, String) {
+fn parse_mount(m: &Mount) -> (MsFlags, MsFlags, String) {
     let mut flags = MsFlags::empty();
+    let mut pgflags = MsFlags::empty();
     let mut data = Vec::new();
 
     for o in &m.options {
-        match OPTIONS.get(o.as_str()) {
-            Some(v) => {
-                let (clear, fl) = *v;
-                if clear {
-                    flags &= !fl;
-                } else {
-                    flags |= fl;
-                }
+        if let Some(v) = OPTIONS.get(o.as_str()) {
+            let (clear, fl) = *v;
+            if clear {
+                flags &= !fl;
+            } else {
+                flags |= fl;
             }
-
-            None => data.push(o.clone()),
+        } else if let Some(fl) = PROPAGATION.get(o.as_str()) {
+            pgflags |= *fl;
+        } else {
+            data.push(o.clone());
         }
     }
 
-    (flags, data.join(","))
+    (flags, pgflags, data.join(","))
 }
 
 // This function constructs a canonicalized path by combining the `rootfs` and `unsafe_path` elements.
@@ -700,7 +740,7 @@ fn secure_join(rootfs: &str, unsafe_path: &str) -> String {
         path.push(it);
         if let Ok(v) = path.read_link() {
             if v.is_absolute() {
-                path = PathBuf::from(format!("{}{}", rootfs, v.to_str().unwrap().to_string()));
+                path = PathBuf::from(format!("{}{}", rootfs, v.to_str().unwrap()));
             } else {
                 path.pop();
                 for it in v.iter() {
@@ -729,9 +769,9 @@ fn mount_from(
     rootfs: &str,
     flags: MsFlags,
     data: &str,
-    _label: &str,
+    label: &str,
 ) -> Result<()> {
-    let d = String::from(data);
+    let mut d = String::from(data);
     let dest = secure_join(rootfs, &m.destination);
 
     let src = if m.r#type.as_str() == "bind" {
@@ -742,18 +782,31 @@ fn mount_from(
             Path::new(&dest).parent().unwrap()
         };
 
-        let _ = fs::create_dir_all(&dir).map_err(|e| {
+        fs::create_dir_all(dir).map_err(|e| {
             log_child!(
                 cfd_log,
-                "creat dir {}: {}",
+                "create dir {}: {}",
                 dir.to_str().unwrap(),
                 e.to_string()
-            )
-        });
+            );
+            e
+        })?;
 
         // make sure file exists so we can bind over it
         if !src.is_dir() {
-            let _ = OpenOptions::new().create(true).write(true).open(&dest);
+            let _ = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&dest)
+                .map_err(|e| {
+                    log_child!(
+                        cfd_log,
+                        "open/create dest error. {}: {:?}",
+                        dest.as_str(),
+                        e
+                    );
+                    e
+                })?;
         }
         src.to_str().unwrap().to_string()
     } else {
@@ -767,13 +820,40 @@ fn mount_from(
     };
 
     let _ = stat::stat(dest.as_str()).map_err(|e| {
-        log_child!(
-            cfd_log,
-            "dest stat error. {}: {:?}",
-            dest.as_str(),
-            e.as_errno()
-        )
-    });
+        log_child!(cfd_log, "dest stat error. {}: {:?}", dest.as_str(), e);
+        e
+    })?;
+
+    // Set the SELinux context for the mounts
+    let mut use_xattr = false;
+    if !label.is_empty() {
+        if selinux::is_enabled()? {
+            let device = Path::new(&m.source)
+                .file_name()
+                .ok_or_else(|| anyhow!("invalid device source path: {}", &m.source))?
+                .to_str()
+                .ok_or_else(|| anyhow!("failed to convert device source path: {}", &m.source))?;
+
+            match device {
+                // SELinux does not support labeling of /proc or /sys
+                "proc" | "sysfs" => (),
+                // SELinux does not support mount labeling against /dev/mqueue,
+                // so we use setxattr instead
+                "mqueue" => {
+                    use_xattr = true;
+                }
+                _ => {
+                    log_child!(cfd_log, "add SELinux mount label to {}", dest.as_str());
+                    selinux::add_mount_label(&mut d, label);
+                }
+            }
+        } else {
+            log_child!(
+                cfd_log,
+                "SELinux label for the mount is provided but SELinux is not enabled on the running kernel"
+            );
+        }
+    }
 
     mount(
         Some(src.as_str()),
@@ -783,9 +863,13 @@ fn mount_from(
         Some(d.as_str()),
     )
     .map_err(|e| {
-        log_child!(cfd_log, "mount error: {:?}", e.as_errno());
+        log_child!(cfd_log, "mount error: {:?}", e);
         e
     })?;
+
+    if !label.is_empty() && selinux::is_enabled()? && use_xattr {
+        xattr::set(dest.as_str(), "security.selinux", label.as_bytes())?;
+    }
 
     if flags.contains(MsFlags::MS_BIND)
         && flags.intersects(
@@ -805,7 +889,7 @@ fn mount_from(
             None::<&str>,
         )
         .map_err(|e| {
-            log_child!(cfd_log, "remout {}: {:?}", dest.as_str(), e.as_errno());
+            log_child!(cfd_log, "remout {}: {:?}", dest.as_str(), e);
             e
         })?;
     }
@@ -828,18 +912,35 @@ fn default_symlinks() -> Result<()> {
     }
     Ok(())
 }
+
+fn dev_rel_path(path: &str) -> Option<&Path> {
+    let path = Path::new(path);
+
+    if !path.starts_with("/dev")
+        || path == Path::new("/dev")
+        || path.components().any(|c| c == Component::ParentDir)
+    {
+        return None;
+    }
+    path.strip_prefix("/").ok()
+}
+
 fn create_devices(devices: &[LinuxDevice], bind: bool) -> Result<()> {
-    let op: fn(&LinuxDevice) -> Result<()> = if bind { bind_dev } else { mknod_dev };
+    let op: fn(&LinuxDevice, &Path) -> Result<()> = if bind { bind_dev } else { mknod_dev };
     let old = stat::umask(Mode::from_bits_truncate(0o000));
     for dev in DEFAULT_DEVICES.iter() {
-        op(dev)?;
+        let path = Path::new(&dev.path[1..]);
+        op(dev, path).context(format!("Creating container device {:?}", dev))?;
     }
     for dev in devices {
-        if !dev.path.starts_with("/dev") || dev.path.contains("..") {
+        let path = dev_rel_path(&dev.path).ok_or_else(|| {
             let msg = format!("{} is not a valid device path", dev.path);
-            bail!(anyhow!(msg));
+            anyhow!(msg)
+        })?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).context(format!("Creating container device {:?}", dev))?;
         }
-        op(dev)?;
+        op(dev, path).context(format!("Creating container device {:?}", dev))?;
     }
     stat::umask(old);
     Ok(())
@@ -861,21 +962,21 @@ lazy_static! {
     };
 }
 
-fn mknod_dev(dev: &LinuxDevice) -> Result<()> {
+fn mknod_dev(dev: &LinuxDevice, relpath: &Path) -> Result<()> {
     let f = match LINUXDEVICETYPE.get(dev.r#type.as_str()) {
         Some(v) => v,
         None => return Err(anyhow!("invalid spec".to_string())),
     };
 
     stat::mknod(
-        &dev.path[1..],
+        relpath,
         *f,
         Mode::from_bits_truncate(dev.file_mode.unwrap_or(0)),
         nix::sys::stat::makedev(dev.major as u64, dev.minor as u64),
     )?;
 
     unistd::chown(
-        &dev.path[1..],
+        relpath,
         Some(Uid::from_raw(dev.uid.unwrap_or(0) as uid_t)),
         Some(Gid::from_raw(dev.gid.unwrap_or(0) as uid_t)),
     )?;
@@ -883,9 +984,9 @@ fn mknod_dev(dev: &LinuxDevice) -> Result<()> {
     Ok(())
 }
 
-fn bind_dev(dev: &LinuxDevice) -> Result<()> {
+fn bind_dev(dev: &LinuxDevice, relpath: &Path) -> Result<()> {
     let fd = fcntl::open(
-        &dev.path[1..],
+        relpath,
         OFlag::O_RDWR | OFlag::O_CREAT,
         Mode::from_bits_truncate(0o644),
     )?;
@@ -894,7 +995,7 @@ fn bind_dev(dev: &LinuxDevice) -> Result<()> {
 
     mount(
         Some(&*dev.path),
-        &dev.path[1..],
+        relpath,
         None::<&str>,
         MsFlags::MS_BIND,
         None::<&str>,
@@ -902,10 +1003,21 @@ fn bind_dev(dev: &LinuxDevice) -> Result<()> {
     Ok(())
 }
 
-pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec) -> Result<()> {
+pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec, process: &Process) -> Result<()> {
     let olddir = unistd::getcwd()?;
     log_child!(cfd_log, "old cwd: {}", olddir.to_str().unwrap());
     unistd::chdir("/")?;
+
+    if !process.cwd.is_empty() {
+        // Although the process.cwd string can be unclean/malicious (../../dev, etc),
+        // we are running on our own mount namespace and we just chrooted into the
+        // container's root. It's safe to create CWD from there.
+        log_child!(cfd_log, "Creating CWD {}", process.cwd.as_str());
+        // Unconditionally try to create CWD, create_dir_all will not fail if
+        // it already exists.
+        fs::create_dir_all(process.cwd.as_str())?;
+    }
+
     if spec.linux.is_some() {
         let linux = spec.linux.as_ref().unwrap();
 
@@ -920,7 +1032,7 @@ pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec) -> Result<()> {
 
     for m in spec.mounts.iter() {
         if m.destination == "/dev" {
-            let (flags, _) = parse_mount(m);
+            let (flags, _, _) = parse_mount(m);
             if flags.contains(MsFlags::MS_RDONLY) {
                 mount(
                     Some("/dev"),
@@ -945,9 +1057,7 @@ pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec) -> Result<()> {
 }
 
 fn mask_path(path: &str) -> Result<()> {
-    if !path.starts_with('/') || path.contains("..") {
-        return Err(nix::Error::Sys(Errno::EINVAL).into());
-    }
+    check_paths(path)?;
 
     match mount(
         Some("/dev/null"),
@@ -956,49 +1066,28 @@ fn mask_path(path: &str) -> Result<()> {
         MsFlags::MS_BIND,
         None::<&str>,
     ) {
-        Err(nix::Error::Sys(e)) => {
-            if e != Errno::ENOENT && e != Errno::ENOTDIR {
-                //info!("{}: {}", path, e.desc());
-                return Err(nix::Error::Sys(e).into());
-            }
-        }
-
-        Err(e) => {
-            return Err(e.into());
-        }
-
-        Ok(_) => {}
+        Err(e) => match e {
+            nix::Error::ENOENT | nix::Error::ENOTDIR => Ok(()),
+            _ => Err(e.into()),
+        },
+        Ok(_) => Ok(()),
     }
-
-    Ok(())
 }
 
 fn readonly_path(path: &str) -> Result<()> {
-    if !path.starts_with('/') || path.contains("..") {
-        return Err(nix::Error::Sys(Errno::EINVAL).into());
-    }
+    check_paths(path)?;
 
-    match mount(
+    if let Err(e) = mount(
         Some(&path[1..]),
         path,
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
     ) {
-        Err(nix::Error::Sys(e)) => {
-            if e == Errno::ENOENT {
-                return Ok(());
-            } else {
-                //info!("{}: {}", path, e.desc());
-                return Err(nix::Error::Sys(e).into());
-            }
-        }
-
-        Err(e) => {
-            return Err(e.into());
-        }
-
-        Ok(_) => {}
+        match e {
+            nix::Error::ENOENT => return Ok(()),
+            _ => return Err(e.into()),
+        };
     }
 
     mount(
@@ -1012,16 +1101,29 @@ fn readonly_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+fn check_paths(path: &str) -> Result<()> {
+    if !path.starts_with('/') || path.contains("..") {
+        return Err(anyhow!(
+            "Cannot mount {} (path does not start with '/' or contains '..').",
+            path
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skip_if_not_root;
+    use crate::assert_result;
     use std::fs::create_dir;
     use std::fs::create_dir_all;
     use std::fs::remove_dir_all;
+    use std::fs::remove_file;
+    use std::io;
     use std::os::unix::fs;
     use std::os::unix::io::AsRawFd;
     use tempfile::tempdir;
+    use test_utils::skip_if_not_root;
 
     #[test]
     #[serial(chdir)]
@@ -1211,7 +1313,7 @@ mod tests {
             options: vec!["ro".to_string(), "shared".to_string()],
         }];
 
-        let ret = finish_rootfs(stdout_fd, &spec);
+        let ret = finish_rootfs(stdout_fd, &spec, &oci::Process::default());
         assert!(ret.is_ok(), "Should pass. Got: {:?}", ret);
     }
 
@@ -1232,14 +1334,9 @@ mod tests {
     fn test_mknod_dev() {
         skip_if_not_root!();
 
-        let tempdir = tempdir().unwrap();
-
-        let olddir = unistd::getcwd().unwrap();
-        defer!(let _ = unistd::chdir(&olddir););
-        let _ = unistd::chdir(tempdir.path());
-
+        let path = "/dev/fifo-test";
         let dev = oci::LinuxDevice {
-            path: "/fifo".to_string(),
+            path: path.to_string(),
             r#type: "c".to_string(),
             major: 0,
             minor: 0,
@@ -1248,12 +1345,172 @@ mod tests {
             gid: Some(unistd::getgid().as_raw()),
         };
 
-        let ret = mknod_dev(&dev);
+        let ret = mknod_dev(&dev, Path::new(path));
         assert!(ret.is_ok(), "Should pass. Got: {:?}", ret);
 
-        let ret = stat::stat("fifo");
+        let ret = stat::stat(path);
         assert!(ret.is_ok(), "Should pass. Got: {:?}", ret);
+
+        // clear test device node
+        let ret = remove_file(path);
+        assert!(ret.is_ok(), "Should pass, Got: {:?}", ret);
     }
+
+    #[test]
+    fn test_mount_from() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            source: &'a str,
+            destination: &'a str,
+            r#type: &'a str,
+            flags: MsFlags,
+            error_contains: &'a str,
+
+            // if true, a directory will be created at path in source
+            make_source_directory: bool,
+            // if true, a file will be created at path in source
+            make_source_file: bool,
+        }
+
+        impl Default for TestData<'_> {
+            fn default() -> Self {
+                TestData {
+                    source: "tmp",
+                    destination: "dest",
+                    r#type: "tmpfs",
+                    flags: MsFlags::empty(),
+                    error_contains: "",
+                    make_source_directory: true,
+                    make_source_file: false,
+                }
+            }
+        }
+
+        let tests = &[
+            TestData {
+                ..Default::default()
+            },
+            TestData {
+                flags: MsFlags::MS_BIND,
+                ..Default::default()
+            },
+            TestData {
+                r#type: "bind",
+                ..Default::default()
+            },
+            TestData {
+                r#type: "cgroup2",
+                ..Default::default()
+            },
+            TestData {
+                r#type: "bind",
+                make_source_directory: false,
+                error_contains: &format!("{}", std::io::Error::from_raw_os_error(libc::ENOENT)),
+                ..Default::default()
+            },
+            TestData {
+                r#type: "bind",
+                make_source_directory: false,
+                make_source_file: true,
+                ..Default::default()
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{}]: {:?}", i, d);
+            let tempdir = tempdir().unwrap();
+
+            let (rfd, wfd) = unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+            defer!({
+                unistd::close(rfd).unwrap();
+                unistd::close(wfd).unwrap();
+            });
+
+            let source_path = tempdir.path().join(d.source).to_str().unwrap().to_string();
+            if d.make_source_directory {
+                std::fs::create_dir_all(&source_path).unwrap();
+            } else if d.make_source_file {
+                std::fs::write(&source_path, []).unwrap();
+            }
+
+            let mount = Mount {
+                source: source_path,
+                destination: d.destination.to_string(),
+                r#type: d.r#type.to_string(),
+                options: vec![],
+            };
+
+            let result = mount_from(
+                wfd,
+                &mount,
+                tempdir.path().to_str().unwrap(),
+                d.flags,
+                "",
+                "",
+            );
+
+            let msg = format!("{}: result: {:?}", msg, result);
+
+            if d.error_contains.is_empty() {
+                assert!(result.is_ok(), "{}", msg);
+            } else {
+                assert!(result.is_err(), "{}", msg);
+
+                let error_msg = format!("{}", result.unwrap_err());
+                assert!(error_msg.contains(d.error_contains), "{}", msg);
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_paths() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            name: &'a str,
+            path: &'a str,
+            result: Result<()>,
+        }
+
+        let tests = &[
+            TestData {
+                name: "valid path",
+                path: "/foo/bar",
+                result: Ok(()),
+            },
+            TestData {
+                name: "does not starts with /",
+                path: "foo/bar",
+                result: Err(anyhow!(
+                    "Cannot mount foo/bar (path does not start with '/' or contains '..')."
+                )),
+            },
+            TestData {
+                name: "contains ..",
+                path: "../foo/bar",
+                result: Err(anyhow!(
+                    "Cannot mount ../foo/bar (path does not start with '/' or contains '..')."
+                )),
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{}]: {:?}", i, d.name);
+
+            let result = check_paths(d.path);
+
+            let msg = format!("{}: result: {:?}", msg, result);
+
+            if d.result.is_ok() {
+                assert!(result.is_ok());
+                continue;
+            }
+
+            let expected_error = format!("{}", d.result.as_ref().unwrap_err());
+            let actual_error = format!("{}", result.unwrap_err());
+            assert!(actual_error == expected_error, "{}", msg);
+        }
+    }
+
     #[test]
     fn test_check_proc_mount() {
         let mount = oci::Mount {
@@ -1353,7 +1610,7 @@ mod tests {
 
         for (i, t) in tests.iter().enumerate() {
             // Create a string containing details of the test
-            let msg = format!("test[{}]: {:?}", i, t);
+            let msg = format!("test[{}]: {:?}", i, t.name);
 
             // if is_symlink, then should be prepare the softlink environment
             if t.symlink_path != "" {
@@ -1365,7 +1622,144 @@ mod tests {
             let msg = format!("{}, result: {:?}", msg, result);
 
             // Perform the checks
-            assert!(result == t.result, msg);
+            assert!(result == t.result, "{}", msg);
         }
+    }
+
+    #[test]
+    fn test_parse_mount_table() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            mountinfo_data: Option<&'a str>,
+            result: Result<Vec<Info>>,
+        }
+
+        let tests = &[
+            TestData {
+                mountinfo_data: Some(
+                    "22 933 0:20 / /sys rw,nodev shared:2 - sysfs sysfs rw,noexec",
+                ),
+                result: Ok(vec![Info {
+                    mount_point: "/sys".to_string(),
+                    optional: "shared:2".to_string(),
+                    fstype: "sysfs".to_string(),
+                }]),
+            },
+            TestData {
+                mountinfo_data: Some(
+                    r#"22 933 0:20 / /sys rw,nodev - sysfs sysfs rw,noexec
+                       81 13 1:2 / /tmp/dir rw shared:2 - tmpfs tmpfs rw"#,
+                ),
+                result: Ok(vec![
+                    Info {
+                        mount_point: "/sys".to_string(),
+                        optional: "".to_string(),
+                        fstype: "sysfs".to_string(),
+                    },
+                    Info {
+                        mount_point: "/tmp/dir".to_string(),
+                        optional: "shared:2".to_string(),
+                        fstype: "tmpfs".to_string(),
+                    },
+                ]),
+            },
+            TestData {
+                mountinfo_data: Some(
+                    "22 933 0:20 /foo\040-\040bar /sys rw,nodev shared:2 - sysfs sysfs rw,noexec",
+                ),
+                result: Ok(vec![Info {
+                    mount_point: "/sys".to_string(),
+                    optional: "shared:2".to_string(),
+                    fstype: "sysfs".to_string(),
+                }]),
+            },
+            TestData {
+                mountinfo_data: Some(""),
+                result: Ok(vec![]),
+            },
+            TestData {
+                mountinfo_data: Some("invalid line data - sysfs sysfs rw"),
+                result: Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO)),
+            },
+            TestData {
+                mountinfo_data: Some("22 96 0:21 / /sys rw,noexec - sysfs"),
+                result: Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO_FINAL_FIELDS)),
+            },
+            TestData {
+                mountinfo_data: Some("22 96 0:21 / /sys rw,noexec - sysfs sysfs rw rw"),
+                result: Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO_FINAL_FIELDS)),
+            },
+            TestData {
+                mountinfo_data: Some("22 96 0:21 / /sys rw,noexec shared:2 - x - x"),
+                result: Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO)),
+            },
+            TestData {
+                mountinfo_data: Some("-"),
+                result: Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO)),
+            },
+            TestData {
+                mountinfo_data: Some("--"),
+                result: Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO)),
+            },
+            TestData {
+                mountinfo_data: Some("- -"),
+                result: Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO)),
+            },
+            TestData {
+                mountinfo_data: Some(" - "),
+                result: Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO)),
+            },
+            TestData {
+                mountinfo_data: Some(
+                    r#"22 933 0:20 / /sys rw,nodev - sysfs sysfs rw,noexec
+                       invalid line
+                       81 13 1:2 / /tmp/dir rw shared:2 - tmpfs tmpfs rw"#,
+                ),
+                result: Err(anyhow!(ERR_FAILED_PARSE_MOUNTINFO)),
+            },
+            TestData {
+                mountinfo_data: None,
+                result: Err(anyhow!(io::Error::from_raw_os_error(libc::ENOENT))),
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{}]: {:?}", i, d);
+
+            let tempdir = tempdir().unwrap();
+            let mountinfo_path = tempdir.path().join("mountinfo");
+
+            if let Some(mountinfo_data) = d.mountinfo_data {
+                std::fs::write(&mountinfo_path, mountinfo_data).unwrap();
+            }
+
+            let result = parse_mount_table(mountinfo_path.to_str().unwrap());
+
+            let msg = format!("{}: result: {:?}", msg, result);
+
+            assert_result!(d.result, result, msg);
+        }
+    }
+
+    #[test]
+    fn test_dev_rel_path() {
+        // Valid device paths
+        assert_eq!(dev_rel_path("/dev/sda").unwrap(), Path::new("dev/sda"));
+        assert_eq!(dev_rel_path("//dev/sda").unwrap(), Path::new("dev/sda"));
+        assert_eq!(
+            dev_rel_path("/dev/vfio/99").unwrap(),
+            Path::new("dev/vfio/99")
+        );
+        assert_eq!(dev_rel_path("/dev/...").unwrap(), Path::new("dev/..."));
+        assert_eq!(dev_rel_path("/dev/a..b").unwrap(), Path::new("dev/a..b"));
+        assert_eq!(dev_rel_path("/dev//foo").unwrap(), Path::new("dev/foo"));
+
+        // Bad device paths
+        assert!(dev_rel_path("/devfoo").is_none());
+        assert!(dev_rel_path("/etc/passwd").is_none());
+        assert!(dev_rel_path("/dev/../etc/passwd").is_none());
+        assert!(dev_rel_path("dev/foo").is_none());
+        assert!(dev_rel_path("").is_none());
+        assert!(dev_rel_path("/dev").is_none());
     }
 }

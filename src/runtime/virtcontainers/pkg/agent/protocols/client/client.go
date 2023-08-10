@@ -20,7 +20,11 @@ import (
 
 	"github.com/mdlayher/vsock"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	otelLabel "go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	grpcStatus "google.golang.org/grpc/status"
 
 	"github.com/containerd/ttrpc"
@@ -33,8 +37,7 @@ const (
 	MockHybridVSockScheme = "mock"
 )
 
-var defaultDialTimeout = 15 * time.Second
-var defaultCloseTimeout = 5 * time.Second
+var defaultDialTimeout = 30 * time.Second
 
 var hybridVSockPort uint32
 
@@ -63,45 +66,26 @@ type dialer func(string, time.Duration) (net.Conn, error)
 //     model, and mediates communication between AF_UNIX sockets (on the host end)
 //     and AF_VSOCK sockets (on the guest end).
 //   - mock://<path>. just for test use.
-func NewAgentClient(ctx context.Context, sock string) (*AgentClient, error) {
+func NewAgentClient(ctx context.Context, sock string, timeout uint32) (*AgentClient, error) {
 	grpcAddr, parsedAddr, err := parse(sock)
 	if err != nil {
 		return nil, err
 	}
 
+	dialTimeout := defaultDialTimeout
+	if timeout > 0 {
+		dialTimeout = time.Duration(timeout) * time.Second
+		agentClientLog.WithField("timeout", timeout).Debug("custom dialing timeout has been set")
+	}
+
 	var conn net.Conn
-	var d dialer
-	d = agentDialer(parsedAddr)
-	conn, err = d(grpcAddr, defaultDialTimeout)
+	var d = agentDialer(parsedAddr)
+	conn, err = d(grpcAddr, dialTimeout)
 	if err != nil {
 		return nil, err
 	}
-	/*
-		dialOpts := []grpc.DialOption{grpc.WithInsecure(), grpc.WithBlock()}
-		dialOpts = append(dialOpts, grpc.WithDialer(agentDialer(parsedAddr, enableYamux)))
 
-		var tracer opentracing.Tracer
-
-		span := opentracing.SpanFromContext(ctx)
-
-		// If the context contains a trace span, trace all client comms
-		if span != nil {
-			tracer = span.Tracer()
-
-			dialOpts = append(dialOpts,
-				grpc.WithUnaryInterceptor(otgrpc.OpenTracingClientInterceptor(tracer)))
-			dialOpts = append(dialOpts,
-				grpc.WithStreamInterceptor(otgrpc.OpenTracingStreamClientInterceptor(tracer)))
-		}
-
-		ctx, cancel := context.WithTimeout(ctx, defaultDialTimeout)
-		defer cancel()
-		conn, err := grpc.DialContext(ctx, grpcAddr, dialOpts...)
-		if err != nil {
-			return nil, err
-		}
-	*/
-	client := ttrpc.NewClient(conn)
+	client := ttrpc.NewClient(conn, ttrpc.WithUnaryClientInterceptor(TraceUnaryClientInterceptor()))
 
 	return &AgentClient{
 		AgentServiceClient: agentgrpc.NewAgentServiceClient(client),
@@ -113,6 +97,98 @@ func NewAgentClient(ctx context.Context, sock string) (*AgentClient, error) {
 // Close an existing connection to the agent gRPC server.
 func (c *AgentClient) Close() error {
 	return c.conn.Close()
+}
+
+func TraceUnaryClientInterceptor() ttrpc.UnaryClientInterceptor {
+	return func(
+		ctx context.Context,
+		req *ttrpc.Request,
+		resp *ttrpc.Response,
+		ci *ttrpc.UnaryClientInfo,
+		invoker ttrpc.Invoker,
+	) error {
+		requestMetadata := make(ttrpc.MD)
+
+		tracer := otel.Tracer("kata")
+		var span trace.Span
+		ctx, span = tracer.Start(
+			ctx,
+			fmt.Sprintf("ttrpc.%s", req.Method),
+			trace.WithSpanKind(trace.SpanKindClient),
+		)
+		defer span.End()
+
+		inject(ctx, &requestMetadata)
+		ctx = ttrpc.WithMetadata(ctx, requestMetadata)
+		setRequest(req, &requestMetadata)
+
+		err := invoker(ctx, req, resp)
+
+		if err != nil {
+			span.SetAttributes(otelLabel.Key("RPC_ERROR").Bool(true))
+		}
+		// err can be nil, that will return an OK response code
+		if status, _ := status.FromError(err); status != nil {
+			span.SetAttributes(otelLabel.Key("RPC_CODE").Int((int)(status.Code())))
+			span.SetAttributes(otelLabel.Key("RPC_MESSAGE").String(status.Message()))
+		}
+
+		return err
+	}
+}
+
+type metadataSupplier struct {
+	metadata *ttrpc.MD
+}
+
+func (s *metadataSupplier) Get(key string) string {
+	values, ok := s.metadata.Get(key)
+	if !ok {
+		return ""
+	}
+	return values[0]
+}
+
+func (s *metadataSupplier) Set(key string, value string) {
+	s.metadata.Set(key, value)
+}
+
+// Required to satisfy Opentelemetry TextMapCarrier interface
+func (s *metadataSupplier) Keys() []string {
+	keys := make([]string, 0, len(*s.metadata))
+	for k := range *s.metadata {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func inject(ctx context.Context, metadata *ttrpc.MD) {
+	otel.GetTextMapPropagator().Inject(ctx, &metadataSupplier{
+		metadata: metadata,
+	})
+
+}
+
+func setRequest(req *ttrpc.Request, md *ttrpc.MD) {
+	newMD := make([]*ttrpc.KeyValue, 0)
+	for _, kv := range req.Metadata {
+		// not found in md, means that we can copy old kv
+		// otherwise, we will use the values in md to overwrite it
+		if _, found := md.Get(kv.Key); !found {
+			newMD = append(newMD, kv)
+		}
+	}
+
+	req.Metadata = newMD
+
+	for k, values := range *md {
+		for _, v := range values {
+			req.Metadata = append(req.Metadata, &ttrpc.KeyValue{
+				Key:   k,
+				Value: v,
+			})
+		}
+	}
 }
 
 // vsock scheme is self-defined to be kept from being parsed by grpc.
@@ -283,7 +359,7 @@ func VsockDialer(sock string, timeout time.Duration) (net.Conn, error) {
 	}
 
 	dialFunc := func() (net.Conn, error) {
-		return vsock.Dial(cid, port)
+		return vsock.Dial(cid, port, nil)
 	}
 
 	timeoutErr := grpcStatus.Errorf(codes.DeadlineExceeded, "timed out connecting to vsock %d:%d", cid, port)
@@ -361,9 +437,7 @@ func HybridVSockDialer(sock string, timeout time.Duration) (net.Conn, error) {
 
 // just for tests use.
 func MockHybridVSockDialer(sock string, timeout time.Duration) (net.Conn, error) {
-	if strings.HasPrefix(sock, "mock:") {
-		sock = strings.TrimPrefix(sock, "mock:")
-	}
+	sock = strings.TrimPrefix(sock, "mock:")
 
 	dialFunc := func() (net.Conn, error) {
 		return net.DialTimeout("unix", sock, timeout)

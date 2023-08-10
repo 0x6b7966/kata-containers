@@ -6,6 +6,11 @@
 
 package persistapi
 
+import (
+	dev "github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	hv "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
+)
+
 // ============= sandbox level resources =============
 
 // AgentState save agent state data
@@ -17,35 +22,28 @@ type AgentState struct {
 // SandboxState contains state information of sandbox
 // nolint: maligned
 type SandboxState struct {
-	// PersistVersion of persist data format, can be used for keeping compatibility later
-	PersistVersion uint
-
-	// State is sandbox running status
-	State string
-
-	// GuestMemoryBlockSizeMB is the size of memory block of guestos
-	GuestMemoryBlockSizeMB uint32
-
-	// GuestMemoryHotplugProbe determines whether guest kernel supports memory hotplug probe interface
-	GuestMemoryHotplugProbe bool
-
-	// SandboxContainer specifies which container is used to start the sandbox/vm
-	SandboxContainer string
-
-	// CgroupPath is the cgroup hierarchy where sandbox's processes
-	// including the hypervisor are placed.
-	// FIXME: sandbox can reuse "SandboxContainer"'s CgroupPath so we can remove this field.
-	CgroupPath string
-
 	// CgroupPath is the cgroup hierarchy where sandbox's processes
 	// including the hypervisor are placed.
 	CgroupPaths map[string]string
 
 	// Devices plugged to sandbox(hypervisor)
-	Devices []DeviceState
+	Devices []dev.DeviceState
+
+	// State is sandbox running status
+	State string
+
+	// SandboxContainer specifies which container is used to start the sandbox/vm
+	SandboxContainer string
+
+	// SandboxCgroupPath is the sandbox cgroup path
+	SandboxCgroupPath string
+
+	// OverheadCgroupPath is the sandbox overhead cgroup path.
+	// It can be an empty string if sandbox_cgroup_only is set.
+	OverheadCgroupPath string
 
 	// HypervisorState saves hypervisor specific data
-	HypervisorState HypervisorState
+	HypervisorState hv.HypervisorState
 
 	// AgentState saves state data of agent
 	AgentState AgentState
@@ -55,4 +53,13 @@ type SandboxState struct {
 
 	// Config saves config information of sandbox
 	Config SandboxConfig
+
+	// PersistVersion of persist data format, can be used for keeping compatibility later
+	PersistVersion uint
+
+	// GuestMemoryBlockSizeMB is the size of memory block of guestos
+	GuestMemoryBlockSizeMB uint32
+
+	// GuestMemoryHotplugProbe determines whether guest kernel supports memory hotplug probe interface
+	GuestMemoryHotplugProbe bool
 }

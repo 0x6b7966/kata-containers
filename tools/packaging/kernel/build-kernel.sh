@@ -1,12 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright (c) 2018 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
-
-description="
-Description: This script is the *ONLY* to build a kernel for development.
-"
 
 set -o errexit
 set -o nounset
@@ -14,7 +10,6 @@ set -o pipefail
 
 readonly script_name="$(basename "${BASH_SOURCE[0]}")"
 readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-kata_version="${kata_version:-}"
 
 #project_name
 readonly project_name="kata-containers"
@@ -29,14 +24,14 @@ download_kernel=false
 # The repository where kernel configuration lives
 readonly kernel_config_repo="github.com/${project_name}/kata-containers/tools/packaging"
 readonly patches_repo="github.com/${project_name}/kata-containers/tools/packaging"
-readonly patches_repo_dir="${GOPATH}/src/${patches_repo}"
 # Default path to search patches to apply to kernel
-readonly default_patches_dir="${script_dir}/patches/"
+readonly default_patches_dir="${script_dir}/patches"
 # Default path to search config for kata
 readonly default_kernel_config_dir="${script_dir}/configs"
 # Default path to search for kernel config fragments
 readonly default_config_frags_dir="${script_dir}/configs/fragments"
 readonly default_config_whitelist="${script_dir}/configs/fragments/whitelist.conf"
+readonly default_initramfs="${script_dir}/initramfs.cpio.gz"
 # GPU vendor
 readonly GV_INTEL="intel"
 readonly GV_NVIDIA="nvidia"
@@ -44,11 +39,13 @@ readonly GV_NVIDIA="nvidia"
 #Path to kernel directory
 kernel_path=""
 #Experimental kernel support. Pull from virtio-fs GitLab instead of kernel.org
-experimental_kernel="false"
+build_type=""
 #Force generate config when setup
 force_setup_generate_config="false"
 #GPU kernel support
 gpu_vendor=""
+#Confidential guest type
+conf_guest=""
 #
 patches_path=""
 #
@@ -57,21 +54,30 @@ hypervisor_target=""
 arch_target=""
 #
 kernel_config_path=""
+#
+skip_config_checks="false"
 # destdir
 DESTDIR="${DESTDIR:-/}"
 #PREFIX=
 PREFIX="${PREFIX:-/usr}"
+#Kernel URL
+kernel_url=""
+#Linux headers for GPU guest fs module building
+linux_headers=""
+
+CROSS_BUILD_ARG=""
+
+MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
 
 packaging_scripts_dir="${script_dir}/../scripts"
 source "${packaging_scripts_dir}/lib.sh"
 
 usage() {
 	exit_code="$1"
-	cat <<EOT
+	cat <<EOF
 Overview:
 
 	Build a kernel for Kata Containers
-	${description}
 
 Usage:
 
@@ -88,17 +94,23 @@ Commands:
 Options:
 
 	-a <arch>   	: Arch target to build the kernel, such as aarch64/ppc64le/s390x/x86_64.
+	-b <type>    	: Enable optional config type.
 	-c <path>   	: Path to config file to build the kernel.
 	-d          	: Enable bash debug.
 	-e          	: Enable experimental kernel.
+	-E          	: Enable arch-specific experimental kernel, arch info offered by "-a".
 	-f          	: Enable force generate config when setup.
 	-g <vendor> 	: GPU vendor, intel or nvidia.
 	-h          	: Display this help.
+	-H <deb|rpm>	: Linux headers for guest fs module building.
 	-k <path>   	: Path to kernel to build.
 	-p <path>   	: Path to a directory with patches to apply to kernel.
+	-s          	: Skip .config checks
 	-t <hypervisor>	: Hypervisor_target.
+	-u <url>	: Kernel URL to be used to download the kernel tarball.
 	-v <version>	: Kernel version to use if kernel path not provided.
-EOT
+	-x <type>	: Confidential guest protection type, such as sev, snp and tdx
+EOF
 	exit "$exit_code"
 }
 
@@ -115,6 +127,32 @@ arch_to_kernel() {
 	esac
 }
 
+get_tee_kernel() {
+	local version="${1}"
+	local kernel_path="${2}"
+	local tee="${3}"
+
+	mkdir -p ${kernel_path}
+
+	if [ -z "${kernel_url}" ]; then
+		if [[ "${conf_guest}" == "tdx" ]]; then
+			kernel_url=$(get_from_kata_deps "assets.kernel-tdx-experimental.url")
+		else
+			kernel_url=$(get_from_kata_deps "assets.kernel.${tee}.url")
+		fi
+	fi
+
+	local kernel_tarball="${version}.tar.gz"
+
+	# Depending on where we're getting the terball from it may have a
+	# different name, such as linux-${version}.tar.gz or simply
+	# ${version}.tar.gz.  Let's try both before failing.
+	curl --fail -L "${kernel_url}/linux-${kernel_tarball}" -o ${kernel_tarball} || curl --fail -OL "${kernel_url}/${kernel_tarball}"
+
+	mkdir -p ${kernel_path}
+	tar --strip-components=1 -xf ${kernel_tarball} -C ${kernel_path}
+}
+
 get_kernel() {
 	local version="${1:-}"
 
@@ -122,44 +160,41 @@ get_kernel() {
 	[ -n "${kernel_path}" ] || die "kernel_path not provided"
 	[ ! -d "${kernel_path}" ] || die "kernel_path already exist"
 
-
-	if [[ ${experimental_kernel} == "true" ]]; then
-		kernel_tarball="linux-${version}.tar.gz"
-		curl --fail -OL "https://gitlab.com/virtio-fs/linux/-/archive/${version}/${kernel_tarball}"
-		tar xf "${kernel_tarball}"
-		mv "linux-${version}" "${kernel_path}"
-	else
-
-		#Remove extra 'v'
-		version=${version#v}
-
-		major_version=$(echo "${version}" | cut -d. -f1)
-		kernel_tarball="linux-${version}.tar.xz"
-
-                if [ ! -f sha256sums.asc ] || ! grep -q "${kernel_tarball}" sha256sums.asc; then
-                        info "Download kernel checksum file: sha256sums.asc"
-                        curl --fail -OL "https://cdn.kernel.org/pub/linux/kernel/v${major_version}.x/sha256sums.asc"
-                fi
-                grep "${kernel_tarball}" sha256sums.asc >"${kernel_tarball}.sha256"
-
-		if [ -f "${kernel_tarball}" ] && ! sha256sum -c "${kernel_tarball}.sha256"; then
-			info "invalid kernel tarball ${kernel_tarball} removing "
-			rm -f "${kernel_tarball}"
-		fi
-		if [ ! -f "${kernel_tarball}" ]; then
-			info "Download kernel version ${version}"
-			info "Download kernel"
-			curl --fail -OL "https://www.kernel.org/pub/linux/kernel/v${major_version}.x/${kernel_tarball}"
-		else
-			info "kernel tarball already downloaded"
-		fi
-
-		sha256sum -c "${kernel_tarball}.sha256"
-
-		tar xf "${kernel_tarball}"
-
-		mv "linux-${version}" "${kernel_path}"
+	if [ "${conf_guest}" != "" ]; then
+		get_tee_kernel ${version} ${kernel_path} ${conf_guest}
+		return
 	fi
+
+	#Remove extra 'v'
+	version=${version#v}
+
+	major_version=$(echo "${version}" | cut -d. -f1)
+	kernel_tarball="linux-${version}.tar.xz"
+
+	if [ ! -f sha256sums.asc ] || ! grep -q "${kernel_tarball}" sha256sums.asc; then
+		shasum_url="https://cdn.kernel.org/pub/linux/kernel/v${major_version}.x/sha256sums.asc"
+		info "Download kernel checksum file: sha256sums.asc from ${shasum_url}"
+		curl --fail -OL "${shasum_url}"
+	fi
+	grep "${kernel_tarball}" sha256sums.asc >"${kernel_tarball}.sha256"
+
+	if [ -f "${kernel_tarball}" ] && ! sha256sum -c "${kernel_tarball}.sha256"; then
+		info "invalid kernel tarball ${kernel_tarball} removing "
+		rm -f "${kernel_tarball}"
+	fi
+	if [ ! -f "${kernel_tarball}" ]; then
+		info "Download kernel version ${version}"
+		info "Download kernel"
+		curl --fail -OL "https://www.kernel.org/pub/linux/kernel/v${major_version}.x/${kernel_tarball}"
+	else
+		info "kernel tarball already downloaded"
+	fi
+
+	sha256sum -c "${kernel_tarball}.sha256"
+
+	tar xf "${kernel_tarball}"
+
+	mv "linux-${version}" "${kernel_path}"
 }
 
 get_major_kernel_version() {
@@ -189,31 +224,68 @@ get_kernel_frag_path() {
 	# Exclude configs if they have !$arch tag in the header
 	local common_configs="$(grep "\!${arch}" ${common_path}/*.conf -L)"
 
-	local experimental_configs=""
-	local experimental_dir="${common_path}/experimental"
-	if [ -d "$experimental_dir" ]; then
-		experimental_configs=$(find "$experimental_dir" -name '*.conf')
+	local extra_configs=""
+	if [ "${build_type}" != "" ];then
+		local build_type_dir=$(readlink -m "${arch_path}/../build-type/${build_type}")
+		if [ ! -d "$build_type_dir" ]; then
+			die "No config fragments dir for ${build_type}: ${build_type_dir}"
+		fi
+		extra_configs=$(find "$build_type_dir" -name '*.conf')
+		if [ "${extra_configs}" == "" ];then
+			die "No extra configs found in ${build_type_dir}"
+		fi
 	fi
 
 	# These are the strings that the kernel merge_config.sh script kicks out
 	# when it reports an error or warning condition. We search for them in the
 	# output to try and fail when we think something has been misconfigured.
 	local not_in_string="not in final"
-	local redefined_string="not in final"
-	local redundant_string="not in final"
+	local redefined_string="redefined"
+	local redundant_string="redundant"
 
 	# Later, if we need to add kernel version specific subdirs in order to
 	# handle specific cases, then add the path definition and search/list/cat
 	# here.
 	local all_configs="${common_configs} ${arch_configs}"
-	if [[ ${experimental_kernel} == "true" ]]; then
-		all_configs="${all_configs} ${experimental_configs}"
+	if [[ ${build_type} != "" ]]; then
+		all_configs="${all_configs} ${extra_configs}"
 	fi
 
 	if [[ "${gpu_vendor}" != "" ]];then
 		info "Add kernel config for GPU due to '-g ${gpu_vendor}'"
-		local gpu_configs="$(ls ${gpu_path}/${gpu_vendor}.conf)"
+		# If conf_guest is set we need to update the CONFIG_LOCALVERSION
+		# to match the suffix created in install_kata
+		# -nvidia-gpu-{snp|tdx}, the linux headers will be named the very
+		# same if build with make deb-pkg for TDX or SNP.
+		local gpu_configs=$(mktemp).conf
+		local gpu_subst_configs="${gpu_path}/${gpu_vendor}.${arch_target}.conf.in"
+		if [[ "${conf_guest}" != "" ]];then
+			export CONF_GUEST_SUFFIX="-${conf_guest}"
+		else
+			export CONF_GUEST_SUFFIX=""
+		fi
+		envsubst <${gpu_subst_configs} >${gpu_configs}
+		unset CONF_GUEST_SUFFIX
+
 		all_configs="${all_configs} ${gpu_configs}"
+	fi
+
+	if [ "${MEASURED_ROOTFS}" == "yes" ]; then
+		info "Enabling config for confidential guest trust storage protection"
+		local cryptsetup_configs="$(ls ${common_path}/confidential_containers/cryptsetup.conf)"
+		all_configs="${all_configs} ${cryptsetup_configs}"
+
+		if [ -f "${default_initramfs}" ]; then
+			info "Enabling config for confidential guest measured boot"
+			local initramfs_configs="$(ls ${common_path}/confidential_containers/initramfs.conf)"
+			all_configs="${all_configs} ${initramfs_configs}"
+		fi
+	fi
+
+	if [[ "${conf_guest}" != "" ]];then
+		info "Enabling config for '${conf_guest}' confidential guest protection"
+		local conf_configs="$(ls ${arch_path}/${conf_guest}/*.conf)"
+		all_configs="${all_configs} ${conf_configs}"
 	fi
 
 	info "Constructing config from fragments: ${config_path}"
@@ -229,6 +301,8 @@ get_kernel_frag_path() {
 	results=$(grep "${not_in_string}" <<< "$results")
 	# Do not care about options that are in whitelist
 	results=$(grep -v -f ${default_config_whitelist} <<< "$results")
+
+	[[ "${skip_config_checks}" == "true" ]] && echo "${config_path}" && return
 
 	# Did we request any entries that did not make it?
 	local missing=$(echo $results | grep -v -q "${not_in_string}"; echo $?)
@@ -252,7 +326,7 @@ get_kernel_frag_path() {
 	# might be convenient to allow it, but for now, let's pick up on them.
 	local redundant=$(echo ${results} | grep -v -q "${redundant_string}"; echo $?)
 	if [ ${redundant} -ne 0 ]; then
-		info "Some CONFIG elements failed to make the final .config"
+		info "Some CONFIG elements are redundant in fragments:"
 		info "${results}"
 		info "Generated config file can be found in ${config_path}"
 		die "Failed to construct requested .config file"
@@ -329,15 +403,16 @@ setup_kernel() {
 		fi
 
 		[ -n "$kernel_path" ] || die "failed to find kernel source path"
-
-		get_config_and_patches
-
-		[ -d "${patches_path}" ] || die " patches path '${patches_path}' does not exist"
 	fi
+
+	get_config_and_patches
+
+	[ -d "${patches_path}" ] || die " patches path '${patches_path}' does not exist"
 
 	local major_kernel
 	major_kernel=$(get_major_kernel_version "${kernel_version}")
 	local patches_dir_for_version="${patches_path}/${major_kernel}.x"
+	local build_type_patches_dir="${patches_path}/${major_kernel}.x/${build_type}"
 
 	[ -n "${arch_target}" ] || arch_target="$(uname -m)"
 	arch_target=$(arch_to_kernel "${arch_target}")
@@ -347,12 +422,23 @@ setup_kernel() {
 	# Apply version specific patches
 	${packaging_scripts_dir}/apply_patches.sh "${patches_dir_for_version}"
 
+	# Apply version specific patches for build_type build
+	if [ "${build_type}" != "" ] ;then
+		info "Apply build_type patches from ${build_type_patches_dir}"
+		${packaging_scripts_dir}/apply_patches.sh "${build_type_patches_dir}"
+	fi
+
 	[ -n "${hypervisor_target}" ] || hypervisor_target="kvm"
 	[ -n "${kernel_config_path}" ] || kernel_config_path=$(get_default_kernel_config "${kernel_version}" "${hypervisor_target}" "${arch_target}" "${kernel_path}")
 
+	if [ "${MEASURED_ROOTFS}" == "yes" ] && [ -f "${default_initramfs}" ]; then
+		info "Copying initramfs from: ${default_initramfs}"
+		cp "${default_initramfs}" ./
+	fi
+
 	info "Copying config file from: ${kernel_config_path}"
 	cp "${kernel_config_path}" ./.config
-	make oldconfig
+	ARCH=${arch_target}  make oldconfig ${CROSS_BUILD_ARG}
 	)
 }
 
@@ -363,10 +449,31 @@ build_kernel() {
 	[ -n "${arch_target}" ] || arch_target="$(uname -m)"
 	arch_target=$(arch_to_kernel "${arch_target}")
 	pushd "${kernel_path}" >>/dev/null
-	make -j $(nproc) ARCH="${arch_target}"
+	make -j $(nproc ${CI:+--ignore 1}) ARCH="${arch_target}" ${CROSS_BUILD_ARG}
+	if [ "${conf_guest}" == "sev" ]; then
+		make -j $(nproc ${CI:+--ignore 1}) INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH=${kernel_path} modules_install
+	fi
 	[ "$arch_target" != "powerpc" ] && ([ -e "arch/${arch_target}/boot/bzImage" ] || [ -e "arch/${arch_target}/boot/Image.gz" ])
 	[ -e "vmlinux" ]
 	([ "${hypervisor_target}" == "firecracker" ] || [ "${hypervisor_target}" == "cloud-hypervisor" ]) && [ "${arch_target}" == "arm64" ] && [ -e "arch/${arch_target}/boot/Image" ]
+	popd >>/dev/null
+}
+
+build_kernel_headers() {
+	local kernel_path=${1:-}
+	[ -n "${kernel_path}" ] || die "kernel_path not provided"
+	[ -d "${kernel_path}" ] || die "path to kernel does not exist, use ${script_name} setup"
+	[ -n "${arch_target}" ] || arch_target="$(uname -m)"
+	arch_target=$(arch_to_kernel "${arch_target}")
+	pushd "${kernel_path}" >>/dev/null
+
+	if [ "$linux_headers" == "deb" ]; then
+		make -j $(nproc ${CI:+--ignore 1}) deb-pkg ARCH="${arch_target}"
+	fi
+	if [ "$linux_headers" == "rpm" ]; then
+		make -j $(nproc ${CI:+--ignore 1}) rpm-pkg ARCH="${arch_target}"
+	fi
+
 	popd >>/dev/null
 }
 
@@ -374,15 +481,22 @@ install_kata() {
 	local kernel_path=${1:-}
 	[ -n "${kernel_path}" ] || die "kernel_path not provided"
 	[ -d "${kernel_path}" ] || die "path to kernel does not exist, use ${script_name} setup"
+	[ -n "${arch_target}" ] || arch_target="$(uname -m)"
+	arch_target=$(arch_to_kernel "${arch_target}")
 	pushd "${kernel_path}" >>/dev/null
 	config_version=$(get_config_version)
 	[ -n "${config_version}" ] || die "failed to get config version"
 	install_path=$(readlink -m "${DESTDIR}/${PREFIX}/share/${project_name}")
 
 	suffix=""
-	if [[ ${experimental_kernel} == "true" ]]; then
-		suffix="-virtiofs"
+	if [[ ${build_type} != "" ]]; then
+		suffix="-${build_type}"
 	fi
+
+	if [[ ${conf_guest} != "" ]];then
+		suffix="-${conf_guest}${suffix}"
+	fi
+
 	if [[ ${gpu_vendor} != "" ]];then
 		suffix="-${gpu_vendor}-gpu${suffix}"
 	fi
@@ -409,12 +523,12 @@ install_kata() {
 	if [ "${arch_target}" = "arm64" ]; then
 		install --mode 0644 -D "arch/${arch_target}/boot/Image" "${install_path}/${vmlinux}"
 	elif [ "${arch_target}" = "s390" ]; then
-		install --mode 0644 -D "arch/${arch_target}/boot/compressed/vmlinux" "${install_path}/${vmlinux}"
+		install --mode 0644 -D "arch/${arch_target}/boot/vmlinux" "${install_path}/${vmlinux}"
 	else
 		install --mode 0644 -D "vmlinux" "${install_path}/${vmlinux}"
 	fi
 
-	install --mode 0644 -D ./.config "${install_path}/config-${kernel_version}"
+	install --mode 0644 -D ./.config "${install_path}/config-${kernel_version}-${config_version}${suffix}"
 
 	ln -sf "${vmlinuz}" "${install_path}/vmlinuz${suffix}.container"
 	ln -sf "${vmlinux}" "${install_path}/vmlinux${suffix}.container"
@@ -424,10 +538,13 @@ install_kata() {
 }
 
 main() {
-	while getopts "a:c:defg:hk:p:t:v:" opt; do
+	while getopts "a:b:c:deEfg:hH:k:p:t:u:v:x:" opt; do
 		case "$opt" in
 			a)
 				arch_target="${OPTARG}"
+				;;
+			b)
+				build_type="${OPTARG}"
 				;;
 			c)
 				kernel_config_path="${OPTARG}"
@@ -437,7 +554,10 @@ main() {
 				set -x
 				;;
 			e)
-				experimental_kernel="true"
+				build_type="experimental"
+				;;
+			E)
+				build_type="arch-experimental"
 				;;
 			f)
 				force_setup_generate_config="true"
@@ -449,17 +569,33 @@ main() {
 			h)
 				usage 0
 				;;
+			H)
+				linux_headers="${OPTARG}"
+				;;
 			k)
-				kernel_path="${OPTARG}"
+				kernel_path="$(realpath ${OPTARG})"
 				;;
 			p)
 				patches_path="${OPTARG}"
 				;;
+			s)
+				skip_config_checks="true"
+				;;
 			t)
 				hypervisor_target="${OPTARG}"
 				;;
+			u)
+				kernel_url="${OPTARG}"
+				;;
 			v)
 				kernel_version="${OPTARG}"
+				;;
+			x)
+				conf_guest="${OPTARG}"
+				case "$conf_guest" in
+					sev|snp|tdx) ;;
+					*) die "Confidential guest type '$conf_guest' not supported" ;;
+				esac
 				;;
 		esac
 	done
@@ -470,21 +606,52 @@ main() {
 
 	[ -z "${subcmd}" ] && usage 1
 
-	# If not kernel version take it from versions.yaml
-	if [ -z "$kernel_version" ]; then
-		if [[ ${experimental_kernel} == "true" ]]; then
-			kernel_version=$(get_from_kata_deps "assets.kernel-experimental.tag" "${kata_version}")
-		else
-			kernel_version=$(get_from_kata_deps "assets.kernel.version" "${kata_version}")
-			#Remove extra 'v'
-			kernel_version="${kernel_version#v}"
+	if [[ ${build_type} == "experimental" ]] && [[ ${hypervisor_target} == "dragonball" ]]; then
+		build_type="dragonball-experimental"
+		if [ -n "$kernel_version" ];  then
+			kernel_major_version=$(get_major_kernel_version "${kernel_version}")
+			if [[ ${kernel_major_version} != "5.10" ]]; then
+				info "dragonball-experimental kernel patches are only tested on 5.10.x kernel now, other kernel version may cause confliction"	
+			fi
 		fi
 	fi
 
+	# If not kernel version take it from versions.yaml
+	if [ -z "$kernel_version" ]; then
+		if [[ ${build_type} == "experimental" ]]; then
+			kernel_version=$(get_from_kata_deps "assets.kernel-experimental.tag")
+		elif [[ ${build_type} == "arch-experimental" ]]; then
+			case "${arch_target}" in
+			"aarch64")
+				build_type="arm-experimental"
+				kernel_version=$(get_from_kata_deps "assets.kernel-arm-experimental.version")
+			;;
+			*)
+				info "No arch-specific experimental kernel supported, using experimental one instead"
+				kernel_version=$(get_from_kata_deps "assets.kernel-experimental.tag")
+			;;
+			esac
+		elif [[ ${build_type} == "dragonball-experimental" ]]; then
+			kernel_version=$(get_from_kata_deps "assets.kernel-dragonball-experimental.version")
+		elif [[ "${conf_guest}" != "" ]]; then
+			#If specifying a tag for kernel_version, must be formatted version-like to avoid unintended parsing issues
+			if [[ "${conf_guest}" == "tdx" ]]; then
+				kernel_version=$(get_from_kata_deps "assets.kernel-tdx-experimental.version" 2>/dev/null || true)
+			else
+				kernel_version=$(get_from_kata_deps "assets.kernel.${conf_guest}.version" 2>/dev/null || true)
+				[ -n "${kernel_version}" ] || kernel_version=$(get_from_kata_deps "assets.kernel.${conf_guest}.tag")
+			fi
+		else
+			kernel_version=$(get_from_kata_deps "assets.kernel.version")
+		fi
+	fi
+	#Remove extra 'v'
+	kernel_version="${kernel_version#v}"
+
 	if [ -z "${kernel_path}" ]; then
 		config_version=$(get_config_version)
-		if [[ ${experimental_kernel} == "true" ]]; then
-			kernel_path="${PWD}/kata-linux-experimental-${kernel_version}-${config_version}"
+		if [[ ${build_type} != "" ]]; then
+			kernel_path="${PWD}/kata-linux-${build_type}-${kernel_version}-${config_version}"
 		else
 			kernel_path="${PWD}/kata-linux-${kernel_version}-${config_version}"
 		fi
@@ -493,12 +660,16 @@ main() {
 
 	info "Kernel version: ${kernel_version}"
 
+	[ "${arch_target}" != "" -a "${arch_target}" != $(uname -m) ] && CROSS_BUILD_ARG="CROSS_COMPILE=${arch_target}-linux-gnu-"
+
 	case "${subcmd}" in
 		build)
 			build_kernel "${kernel_path}"
 			;;
+		build-headers)
+			build_kernel_headers "${kernel_path}"
+			;;
 		install)
-			build_kernel "${kernel_path}"
 			install_kata "${kernel_path}"
 			;;
 		setup)

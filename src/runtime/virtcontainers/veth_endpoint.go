@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -6,19 +8,22 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
+
+var vethTrace = getNetworkTrace(VethEndpointType)
 
 // VethEndpoint gathers a network pair and its properties.
 type VethEndpoint struct {
-	NetPair            NetworkInterfacePair
-	EndpointProperties NetworkInfo
 	EndpointType       EndpointType
 	PCIPath            vcTypes.PciPath
+	EndpointProperties NetworkInfo
+	NetPair            NetworkInterfacePair
 	RxRateLimiter      bool
 	TxRateLimiter      bool
 }
@@ -90,38 +95,47 @@ func (endpoint *VethEndpoint) SetProperties(properties NetworkInfo) {
 
 // Attach for veth endpoint bridges the network pair and adds the
 // tap interface of the network pair to the hypervisor.
-func (endpoint *VethEndpoint) Attach(s *Sandbox) error {
+func (endpoint *VethEndpoint) Attach(ctx context.Context, s *Sandbox) error {
+	span, ctx := vethTrace(ctx, "Attach", endpoint)
+	defer span.End()
+
 	h := s.hypervisor
-	if err := xConnectVMNetwork(endpoint, h); err != nil {
+	if err := xConnectVMNetwork(ctx, endpoint, h); err != nil {
 		networkLogger().WithError(err).Error("Error bridging virtual endpoint")
 		return err
 	}
 
-	return h.addDevice(endpoint, netDev)
+	return h.AddDevice(ctx, endpoint, NetDev)
 }
 
 // Detach for the veth endpoint tears down the tap and bridge
 // created for the veth interface.
-func (endpoint *VethEndpoint) Detach(netNsCreated bool, netNsPath string) error {
+func (endpoint *VethEndpoint) Detach(ctx context.Context, netNsCreated bool, netNsPath string) error {
 	// The network namespace would have been deleted at this point
 	// if it has not been created by virtcontainers.
 	if !netNsCreated {
 		return nil
 	}
 
+	span, ctx := vethTrace(ctx, "Detach", endpoint)
+	defer span.End()
+
 	return doNetNS(netNsPath, func(_ ns.NetNS) error {
-		return xDisconnectVMNetwork(endpoint)
+		return xDisconnectVMNetwork(ctx, endpoint)
 	})
 }
 
 // HotAttach for the veth endpoint uses hot plug device
-func (endpoint *VethEndpoint) HotAttach(h hypervisor) error {
-	if err := xConnectVMNetwork(endpoint, h); err != nil {
+func (endpoint *VethEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
+	span, ctx := vethTrace(ctx, "HotAttach", endpoint)
+	defer span.End()
+
+	if err := xConnectVMNetwork(ctx, endpoint, h); err != nil {
 		networkLogger().WithError(err).Error("Error bridging virtual ep")
 		return err
 	}
 
-	if _, err := h.hotplugAddDevice(endpoint, netDev); err != nil {
+	if _, err := h.HotplugAddDevice(ctx, endpoint, NetDev); err != nil {
 		networkLogger().WithError(err).Error("Error attach virtual ep")
 		return err
 	}
@@ -129,18 +143,21 @@ func (endpoint *VethEndpoint) HotAttach(h hypervisor) error {
 }
 
 // HotDetach for the veth endpoint uses hot pull device
-func (endpoint *VethEndpoint) HotDetach(h hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *VethEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
 	if !netNsCreated {
 		return nil
 	}
 
+	span, ctx := vethTrace(ctx, "HotDetach", endpoint)
+	defer span.End()
+
 	if err := doNetNS(netNsPath, func(_ ns.NetNS) error {
-		return xDisconnectVMNetwork(endpoint)
+		return xDisconnectVMNetwork(ctx, endpoint)
 	}); err != nil {
 		networkLogger().WithError(err).Warn("Error un-bridging virtual ep")
 	}
 
-	if _, err := h.hotplugRemoveDevice(endpoint, netDev); err != nil {
+	if _, err := h.HotplugRemoveDevice(ctx, endpoint, NetDev); err != nil {
 		networkLogger().WithError(err).Error("Error detach virtual ep")
 		return err
 	}

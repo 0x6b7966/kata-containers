@@ -6,60 +6,79 @@
 package virtcontainers
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
+)
+
+// virtiofsdTracingTags defines tags for the trace span
+var virtiofsdTracingTags = map[string]string{
+	"source":    "runtime",
+	"package":   "virtcontainers",
+	"subsystem": "virtiofsd",
+}
+
+var (
+	errVirtiofsdDaemonPathEmpty          = errors.New("virtiofsd daemon path is empty")
+	errVirtiofsdSocketPathEmpty          = errors.New("virtiofsd socket path is empty")
+	errVirtiofsdSourcePathEmpty          = errors.New("virtiofsd source path is empty")
+	errVirtiofsdInvalidVirtiofsCacheMode = func(mode string) error { return errors.Errorf("Invalid virtio-fs cache mode: %s", mode) }
+	errVirtiofsdSourceNotAvailable       = errors.New("virtiofsd source path not available")
+	errUnimplemented                     = errors.New("unimplemented")
 )
 
 const (
-	//Timeout to wait in secounds
-	virtiofsdStartTimeout = 5
+	typeVirtioFSCacheModeNever  = "never"
+	typeVirtioFSCacheModeNone   = "none"
+	typeVirtioFSCacheModeAlways = "always"
+	typeVirtioFSCacheModeAuto   = "auto"
 )
 
-type Virtiofsd interface {
-	// Start virtiofsd, return pid of virtiofsd process
-	Start(context.Context) (pid int, err error)
-	// Stop virtiofsd process
-	Stop() error
+type VirtiofsDaemon interface {
+	// Start virtiofs daemon, return pid of virtiofs daemon process
+	Start(context.Context, onQuitFunc) (pid int, err error)
+	// Stop virtiofs daemon process
+	Stop(context.Context) error
+	// Add a submount rafs to the virtiofs mountpoint
+	Mount(opt MountOption) error
+	// Umount a submount rafs from the virtiofs mountpoint
+	Umount(mountpoint string) error
 }
 
-// Helper function to check virtiofsd is serving
-type virtiofsdWaitFunc func(runningCmd *exec.Cmd, stderr io.ReadCloser, debug bool) error
+type MountOption struct {
+	source     string
+	mountpoint string
+	config     string
+}
+
+// Helper function to execute when virtiofsd quit
+type onQuitFunc func()
 
 type virtiofsd struct {
+	// Neded by tracing
+	ctx context.Context
 	// path to virtiofsd daemon
 	path string
 	// socketPath where daemon will serve
 	socketPath string
-	// cache size for virtiofsd
+	// cache mode for virtiofsd
 	cache string
-	// extraArgs list of extra args to append to virtiofsd command
-	extraArgs []string
 	// sourcePath path that daemon will help to share
 	sourcePath string
-	// debug flag
-	debug bool
+	// extraArgs list of extra args to append to virtiofsd command
+	extraArgs []string
 	// PID process ID of virtiosd process
 	PID int
-	// Neded by tracing
-	ctx context.Context
-	// wait helper function to check if virtiofsd is serving
-	wait virtiofsdWaitFunc
 }
 
 // Open socket on behalf of virtiofsd
@@ -75,6 +94,14 @@ func (v *virtiofsd) getSocketFD() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Need to change the filesystem ownership of the socket because virtiofsd runs as root while qemu can run as non-root.
+	// This can be removed once virtiofsd can also run as non-root (https://github.com/kata-containers/kata-containers/issues/2542)
+	if err := utils.ChownToParent(v.socketPath); err != nil {
+		return nil, err
+	}
+
+	// no longer needed since fd is a dup
 	defer listener.Close()
 
 	listener.SetUnlinkOnClose(false)
@@ -83,8 +110,8 @@ func (v *virtiofsd) getSocketFD() (*os.File, error) {
 }
 
 // Start the virtiofsd daemon
-func (v *virtiofsd) Start(ctx context.Context) (int, error) {
-	span, _ := v.trace("Start")
+func (v *virtiofsd) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
+	span, _ := katatrace.Trace(ctx, v.Logger(), "Start", virtiofsdTracingTags)
 	defer span.End()
 	pid := 0
 
@@ -98,6 +125,7 @@ func (v *virtiofsd) Start(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	defer socketFD.Close()
 
 	cmd.ExtraFiles = append(cmd.ExtraFiles, socketFD)
 
@@ -118,26 +146,23 @@ func (v *virtiofsd) Start(ctx context.Context) (int, error) {
 		return pid, err
 	}
 
-	defer func() {
-		if err != nil {
-			cmd.Process.Kill()
+	go func() {
+		cmd.Process.Wait()
+		v.Logger().Info("virtiofsd quits")
+		if onQuit != nil {
+			onQuit()
 		}
 	}()
 
-	if v.wait == nil {
-		v.wait = waitVirtiofsReady
-	}
+	v.PID = cmd.Process.Pid
 
-	return pid, socketFD.Close()
+	return cmd.Process.Pid, nil
 }
 
-func (v *virtiofsd) Stop() error {
-	if err := v.kill(); err != nil {
+func (v *virtiofsd) Stop(ctx context.Context) error {
+	if err := v.kill(ctx); err != nil {
+		v.Logger().WithError(err).WithField("pid", v.PID).Warn("kill virtiofsd failed")
 		return nil
-	}
-
-	if v.socketPath == "" {
-		return errors.New("vitiofsd socket path is empty")
 	}
 
 	err := os.Remove(v.socketPath)
@@ -147,33 +172,25 @@ func (v *virtiofsd) Stop() error {
 	return nil
 }
 
-func (v *virtiofsd) args(FdSocketNumber uint) ([]string, error) {
-	if v.sourcePath == "" {
-		return []string{}, errors.New("vitiofsd source path is empty")
-	}
+func (v *virtiofsd) Mount(opt MountOption) error {
+	return errUnimplemented
+}
 
-	if _, err := os.Stat(v.sourcePath); os.IsNotExist(err) {
-		return nil, err
-	}
+func (v *virtiofsd) Umount(mountpoint string) error {
+	return errUnimplemented
+}
+
+func (v *virtiofsd) args(FdSocketNumber uint) ([]string, error) {
 
 	args := []string{
 		// Send logs to syslog
 		"--syslog",
-		// foreground operation
-		"-f",
 		// cache mode for virtiofsd
-		"-o", "cache=" + v.cache,
-		// disable posix locking in daemon: bunch of basic posix locks properties are broken
-		// apt-get update is broken if enabled
-		"-o", "no_posix_lock",
+		"--cache=" + v.cache,
 		// shared directory tree
-		"-o", "source=" + v.sourcePath,
+		"--shared-dir=" + v.sourcePath,
 		// fd number of vhost-user socket
 		fmt.Sprintf("--fd=%v", FdSocketNumber),
-	}
-
-	if v.debug {
-		args = append(args, "-o", "debug")
 	}
 
 	if len(v.extraArgs) != 0 {
@@ -185,93 +202,50 @@ func (v *virtiofsd) args(FdSocketNumber uint) ([]string, error) {
 
 func (v *virtiofsd) valid() error {
 	if v.path == "" {
-		errors.New("virtiofsd path is empty")
+		return errVirtiofsdDaemonPathEmpty
 	}
 
 	if v.socketPath == "" {
-		errors.New("Virtiofsd socket path is empty")
+		return errVirtiofsdSocketPathEmpty
 	}
 
 	if v.sourcePath == "" {
-		errors.New("virtiofsd source path is empty")
+		return errVirtiofsdSourcePathEmpty
+	}
 
+	if _, err := os.Stat(v.sourcePath); err != nil {
+		return errVirtiofsdSourceNotAvailable
+	}
+
+	if v.cache == "" {
+		v.cache = typeVirtioFSCacheModeAuto
+	} else if v.cache == typeVirtioFSCacheModeNone {
+		v.Logger().Warn("virtio-fs cache mode `none` is deprecated since Kata Containers 2.5.0 and will be removed in the future release, please use `never` instead. For more details please refer to https://github.com/kata-containers/kata-containers/issues/4234.")
+		v.cache = typeVirtioFSCacheModeNever
+	} else if v.cache != typeVirtioFSCacheModeAuto && v.cache != typeVirtioFSCacheModeAlways && v.cache != typeVirtioFSCacheModeNever {
+		return errVirtiofsdInvalidVirtiofsCacheMode(v.cache)
 	}
 
 	return nil
 }
 
 func (v *virtiofsd) Logger() *log.Entry {
-	return virtLog.WithField("subsystem", "virtiofsd")
+	return hvLogger.WithField("subsystem", "virtiofsd")
 }
 
-func (v *virtiofsd) trace(name string) (otelTrace.Span, context.Context) {
-	if v.ctx == nil {
-		v.ctx = context.Background()
-	}
-
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(v.ctx, name)
-	span.SetAttributes(label.Key("subsystem").String("virtiofds"))
-
-	return span, ctx
-}
-
-func waitVirtiofsReady(cmd *exec.Cmd, stderr io.ReadCloser, debug bool) error {
-	if cmd == nil {
-		return errors.New("cmd is nil")
-	}
-
-	sockReady := make(chan error, 1)
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		var sent bool
-		for scanner.Scan() {
-			if debug {
-				virtLog.WithField("source", "virtiofsd").Debug(scanner.Text())
-			}
-			if !sent && strings.Contains(scanner.Text(), "Waiting for vhost-user socket connection...") {
-				sockReady <- nil
-				sent = true
-			}
-
-		}
-		if !sent {
-			if err := scanner.Err(); err != nil {
-				sockReady <- err
-
-			} else {
-				sockReady <- fmt.Errorf("virtiofsd did not announce socket connection")
-
-			}
-
-		}
-		// Wait to release resources of virtiofsd process
-		cmd.Process.Wait()
-	}()
-
-	var err error
-	select {
-	case err = <-sockReady:
-	case <-time.After(virtiofsdStartTimeout * time.Second):
-		err = fmt.Errorf("timed out waiting for vitiofsd ready mesage pid=%d", cmd.Process.Pid)
-	}
-
-	return err
-}
-
-func (v *virtiofsd) kill() (err error) {
-	span, _ := v.trace("kill")
+func (v *virtiofsd) kill(ctx context.Context) (err error) {
+	span, _ := katatrace.Trace(ctx, v.Logger(), "kill", virtiofsdTracingTags)
 	defer span.End()
 
 	if v.PID == 0 {
-		return errors.New("invalid virtiofsd PID(0)")
+		v.Logger().WithField("invalid-virtiofsd-pid", v.PID).Warn("cannot kill virtiofsd")
+		return nil
 	}
 
 	err = syscall.Kill(v.PID, syscall.SIGKILL)
 	if err != nil {
 		v.PID = 0
 	}
-
 	return err
 }
 
@@ -280,10 +254,18 @@ type virtiofsdMock struct {
 }
 
 // Start the virtiofsd daemon
-func (v *virtiofsdMock) Start(ctx context.Context) (int, error) {
+func (v *virtiofsdMock) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 	return 9999999, nil
 }
 
-func (v *virtiofsdMock) Stop() error {
+func (v *virtiofsdMock) Mount(opt MountOption) error {
+	return errUnimplemented
+}
+
+func (v *virtiofsdMock) Umount(mountpoint string) error {
+	return errUnimplemented
+}
+
+func (v *virtiofsdMock) Stop(ctx context.Context) error {
 	return nil
 }

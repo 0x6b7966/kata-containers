@@ -6,20 +6,29 @@
 package katamonitor
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
+	"time"
 
-	"github.com/containerd/containerd/defaults"
-	srvconfig "github.com/containerd/containerd/services/server/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/utils/shimclient"
+
+	"github.com/fsnotify/fsnotify"
 	"github.com/sirupsen/logrus"
-
-	// register grpc event types
-	_ "github.com/containerd/containerd/api/events"
 )
 
 var monitorLog = logrus.WithField("source", "kata-monitor")
+
+const (
+	RuntimeContainerd           = "containerd"
+	RuntimeCRIO                 = "cri-o"
+	fsMonitorRetryDelaySeconds  = 60
+	podCacheRefreshDelaySeconds = 5
+	contentTypeHtml             = "text/html"
+)
 
 // SetLogger sets the logger for katamonitor package.
 func SetLogger(logger *logrus.Entry) {
@@ -29,71 +38,152 @@ func SetLogger(logger *logrus.Entry) {
 
 // KataMonitor is monitor agent
 type KataMonitor struct {
-	containerdAddr       string
-	containerdConfigFile string
-	containerdStatePath  string
-	sandboxCache         *sandboxCache
+	sandboxCache    *sandboxCache
+	runtimeEndpoint string
 }
 
 // NewKataMonitor create and return a new KataMonitor instance
-func NewKataMonitor(containerdAddr, containerdConfigFile string) (*KataMonitor, error) {
-	if containerdAddr == "" {
-		return nil, fmt.Errorf("Containerd serve address missing.")
+func NewKataMonitor(runtimeEndpoint string) (*KataMonitor, error) {
+	if runtimeEndpoint == "" {
+		return nil, errors.New("runtime endpoint missing")
 	}
 
-	containerdConf := &srvconfig.Config{
-		State: defaults.DefaultStateDir,
-	}
-
-	if err := srvconfig.LoadConfig(containerdConfigFile, containerdConf); err != nil && !os.IsNotExist(err) {
-		return nil, err
+	if !strings.HasPrefix(runtimeEndpoint, "unix") {
+		runtimeEndpoint = "unix://" + runtimeEndpoint
 	}
 
 	km := &KataMonitor{
-		containerdAddr:       containerdAddr,
-		containerdConfigFile: containerdConfigFile,
-		containerdStatePath:  containerdConf.State,
+		runtimeEndpoint: runtimeEndpoint,
 		sandboxCache: &sandboxCache{
 			Mutex:     &sync.Mutex{},
-			sandboxes: make(map[string]string),
+			sandboxes: make(map[string]sandboxCRIMetadata),
 		},
-	}
-
-	if err := km.initSandboxCache(); err != nil {
-		return nil, err
 	}
 
 	// register metrics
 	registerMetrics()
 
-	go km.sandboxCache.startEventsListener(km.containerdAddr)
+	go km.startPodCacheUpdater()
 
 	return km, nil
 }
 
-func (km *KataMonitor) initSandboxCache() error {
-	sandboxes, err := km.getSandboxes()
-	if err != nil {
-		return err
+func removeFromSandboxList(sandboxList []string, sandboxToRemove string) []string {
+	for i, sandbox := range sandboxList {
+		if sandbox == sandboxToRemove {
+			return append(sandboxList[:i], sandboxList[i+1:]...)
+		}
 	}
-	km.sandboxCache.init(sandboxes)
-	return nil
+	return sandboxList
+}
+
+// startPodCacheUpdater will boot a thread to manage sandbox cache
+func (km *KataMonitor) startPodCacheUpdater() {
+	sbsWatcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		monitorLog.WithError(err).Fatal("failed to setup sandbox events watcher")
+		os.Exit(1)
+	}
+	defer sbsWatcher.Close()
+	for {
+		err = sbsWatcher.Add(getSandboxFS())
+		if err != nil {
+			// if there are no kata pods (yet), the kata /run/vc directory may not be there: retry later
+			monitorLog.WithError(err).Warnf("cannot monitor %s, retry in %d sec.", getSandboxFS(), fsMonitorRetryDelaySeconds)
+			time.Sleep(fsMonitorRetryDelaySeconds * time.Second)
+			continue
+		}
+		monitorLog.Debugf("started fs monitoring @%s", getSandboxFS())
+		break
+	}
+	// Initial sync with the kata sandboxes already running
+	sbsFile, err := os.Open(getSandboxFS())
+	if err != nil {
+		monitorLog.WithError(err).Fatal("cannot open sandboxes fs")
+		os.Exit(1)
+	}
+	sandboxList, err := sbsFile.Readdirnames(0)
+	if err != nil {
+		monitorLog.WithError(err).Fatal("cannot read sandboxes fs")
+		os.Exit(1)
+	}
+	for _, sandbox := range sandboxList {
+		km.sandboxCache.putIfNotExists(sandbox, sandboxCRIMetadata{})
+	}
+
+	monitorLog.Debug("initial sync of sbs directory completed")
+	monitorLog.Tracef("pod list from sbs: %v", sandboxList)
+
+	// We try to get CRI (kubernetes) metadata from the container manager for each new kata sandbox we detect.
+	// It may take a while for data to be available, so we always wait podCacheRefreshDelaySeconds before checking.
+	cacheUpdateTimer := time.NewTimer(podCacheRefreshDelaySeconds * time.Second)
+	cacheUpdateTimerIsSet := true
+	for {
+		select {
+		case event, ok := <-sbsWatcher.Events:
+			if !ok {
+				monitorLog.WithError(err).Fatal("cannot watch sandboxes fs")
+				os.Exit(1)
+			}
+			monitorLog.WithField("event", event).Debug("got sandbox event")
+			switch event.Op {
+			case fsnotify.Create:
+				splitPath := strings.Split(event.Name, string(os.PathSeparator))
+				id := splitPath[len(splitPath)-1]
+				if !km.sandboxCache.putIfNotExists(id, sandboxCRIMetadata{}) {
+					monitorLog.WithField("pod", id).Warn(
+						"CREATE event but pod already present in the sandbox cache")
+				}
+				sandboxList = append(sandboxList, id)
+				monitorLog.WithField("pod", id).Info("sandbox cache: added pod")
+				if !cacheUpdateTimerIsSet {
+					cacheUpdateTimer.Reset(podCacheRefreshDelaySeconds * time.Second)
+					cacheUpdateTimerIsSet = true
+					monitorLog.Debugf(
+						"cache update timer fires in %d secs", podCacheRefreshDelaySeconds)
+				}
+
+			case fsnotify.Remove:
+				splitPath := strings.Split(event.Name, string(os.PathSeparator))
+				id := splitPath[len(splitPath)-1]
+				if !km.sandboxCache.deleteIfExists(id) {
+					monitorLog.WithField("pod", id).Warn(
+						"REMOVE event but pod was missing from the sandbox cache")
+				}
+				sandboxList = removeFromSandboxList(sandboxList, id)
+				monitorLog.WithField("pod", id).Info("sandbox cache: removed pod")
+			}
+
+		case <-cacheUpdateTimer.C:
+			cacheUpdateTimerIsSet = false
+			monitorLog.WithField("pod list", sandboxList).Debugf(
+				"retrieve pods metadata from the container manager")
+			sandboxList, err = km.syncSandboxes(sandboxList)
+			if err != nil {
+				monitorLog.WithError(err).Error("failed to get sandboxes metadata")
+				continue
+			}
+			if len(sandboxList) > 0 {
+				monitorLog.WithField("sandboxes", sandboxList).Debugf(
+					"%d sandboxes still miss metadata", len(sandboxList))
+				cacheUpdateTimer.Reset(podCacheRefreshDelaySeconds * time.Second)
+				cacheUpdateTimerIsSet = true
+			}
+
+			monitorLog.WithField("sandboxes", km.sandboxCache.getSandboxList()).Trace("dump sandbox cache")
+		}
+	}
 }
 
 // GetAgentURL returns agent URL
 func (km *KataMonitor) GetAgentURL(w http.ResponseWriter, r *http.Request) {
-	sandboxID, err := getSandboxIdFromReq(r)
-	if err != nil {
-		commonServeError(w, http.StatusBadRequest, err)
-		return
-	}
-	namespace, err := km.getSandboxNamespace(sandboxID)
+	sandboxID, err := getSandboxIDFromReq(r)
 	if err != nil {
 		commonServeError(w, http.StatusBadRequest, err)
 		return
 	}
 
-	data, err := km.doGet(sandboxID, namespace, defaultTimeout, "agent-url")
+	data, err := shimclient.DoGet(sandboxID, defaultTimeout, "agent-url")
 	if err != nil {
 		commonServeError(w, http.StatusBadRequest, err)
 		return
@@ -104,24 +194,42 @@ func (km *KataMonitor) GetAgentURL(w http.ResponseWriter, r *http.Request) {
 
 // ListSandboxes list all sandboxes running in Kata
 func (km *KataMonitor) ListSandboxes(w http.ResponseWriter, r *http.Request) {
-	sandboxes := km.getSandboxList()
+	sandboxes := km.sandboxCache.getSandboxList()
+	htmlResponse := IfReturnHTMLResponse(w, r)
+	if htmlResponse {
+		listSandboxesHtml(sandboxes, w)
+	} else {
+		listSandboxesText(sandboxes, w)
+	}
+}
+
+func listSandboxesText(sandboxes []string, w http.ResponseWriter) {
 	for _, s := range sandboxes {
 		w.Write([]byte(fmt.Sprintf("%s\n", s)))
 	}
 }
-
-func (km *KataMonitor) getSandboxList() []string {
-	sn := km.sandboxCache.getAllSandboxes()
-	result := make([]string, len(sn))
-
-	i := 0
-	for k := range sn {
-		result[i] = k
-		i++
+func listSandboxesHtml(sandboxes []string, w http.ResponseWriter) {
+	w.Write([]byte("<h1>Sandbox list</h1>\n"))
+	w.Write([]byte("<ul>\n"))
+	for _, s := range sandboxes {
+		w.Write([]byte(fmt.Sprintf("<li>%s: <a href='/debug/pprof/?sandbox=%s'>pprof</a>, <a href='/metrics?sandbox=%s'>metrics</a>, <a href='/agent-url?sandbox=%s'>agent-url</a></li>\n", s, s, s, s)))
 	}
-	return result
+	w.Write([]byte("</ul>\n"))
 }
 
-func (km *KataMonitor) getSandboxNamespace(sandbox string) (string, error) {
-	return km.sandboxCache.getSandboxNamespace(sandbox)
+// IfReturnHTMLResponse returns true if request accepts html response
+// NOTE: IfReturnHTMLResponse will also set response header to `text/html`
+func IfReturnHTMLResponse(w http.ResponseWriter, r *http.Request) bool {
+	accepts := r.Header["Accept"]
+	for _, accept := range accepts {
+		fields := strings.Split(accept, ",")
+		for _, field := range fields {
+			if field == contentTypeHtml {
+				w.Header().Set("Content-Type", contentTypeHtml)
+				return true
+			}
+		}
+	}
+
+	return false
 }

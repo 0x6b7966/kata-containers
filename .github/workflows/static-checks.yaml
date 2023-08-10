@@ -1,71 +1,85 @@
-on: ["pull_request"]
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 name: Static checks
 jobs:
-  test:
+  static-checks:
+    runs-on: ubuntu-20.04
     strategy:
       matrix:
-        go-version: [1.13.x, 1.14.x, 1.15.x]
-        os: [ubuntu-20.04]
-    runs-on: ${{ matrix.os }}
+        cmd:
+          - "make vendor"
+          - "make static-checks"
+          - "make check"
+          - "make test"
+          - "sudo -E PATH=\"$PATH\" make test"
     env:
-      GO111MODULE: off
-      TRAVIS: "true"
-      TRAVIS_BRANCH: ${{ github.base_ref }}
-      TRAVIS_PULL_REQUEST_BRANCH: ${{ github.head_ref }}
-      TRAVIS_PULL_REQUEST_SHA : ${{ github.event.pull_request.head.sha }}
       RUST_BACKTRACE: "1"
-      RUST_AGENT: "yes"
-      target_branch: ${TRAVIS_BRANCH}
+      target_branch: ${{ github.base_ref }}
+      GOPATH: ${{ github.workspace }}
     steps:
-    - name: Install Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: ${{ matrix.go-version }}
-      env:
-        GOPATH: ${{ runner.workspace }}/kata-containers
-    - name: Setup GOPATH
+    - name: Free disk space
       run: |
-        gopath_org=$(go env GOPATH)/src/github.com/kata-containers/
-        mkdir -p ${gopath_org}
-        ln -s ${PWD} ${gopath_org}
-        echo "TRAVIS_BRANCH: ${TRAVIS_BRANCH}"
-        echo "TRAVIS_PULL_REQUEST_BRANCH: ${TRAVIS_PULL_REQUEST_BRANCH}"
-        echo "TRAVIS_PULL_REQUEST_SHA: ${TRAVIS_PULL_REQUEST_SHA}"
-        echo "TRAVIS: ${TRAVIS}"
-    - name: Set env
-      run: |
-        echo "GOPATH=${{ github.workspace }}" >> $GITHUB_ENV
-        echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
     - name: Checkout code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       with:
         fetch-depth: 0
         path: ./src/github.com/${{ github.repository }}
-    - name: Setup travis references
+    - name: Install Go
+      uses: actions/setup-go@v3
+      with:
+        go-version: 1.19.3
+    - name: Check kernel config version
       run: |
-        echo "TRAVIS_BRANCH=${TRAVIS_BRANCH:-$(echo $GITHUB_REF | awk 'BEGIN { FS = \"/\" } ; { print $3 }')}" 
-        target_branch=${TRAVIS_BRANCH}
+        cd "${{ github.workspace }}/src/github.com/${{ github.repository }}"
+        kernel_dir="tools/packaging/kernel/"
+        kernel_version_file="${kernel_dir}kata_config_version"
+        modified_files=$(git diff --name-only origin/main..HEAD)
+        if git diff --name-only origin/main..HEAD "${kernel_dir}" | grep "${kernel_dir}"; then
+          echo "Kernel directory has changed, checking if $kernel_version_file has been updated"
+          if echo "$modified_files" | grep -v "README.md" | grep "${kernel_dir}" >>"/dev/null"; then
+            echo "$modified_files" | grep "$kernel_version_file" >>/dev/null || ( echo "Please bump version in $kernel_version_file" && exit 1)
+          else
+            echo "Readme file changed, no need for kernel config version update."
+          fi
+          echo "Check passed"
+        fi
+    - name: Set PATH
+      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
+      run: |
+        echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
     - name: Setup
+      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
       run: |
-        cd ${GOPATH}/src/github.com/kata-containers/kata-containers && ./ci/setup.sh
-      env:
-        GOPATH: ${{ runner.workspace }}/kata-containers
-    - name: Building rust
+        cd ${GOPATH}/src/github.com/${{ github.repository }} && ./ci/setup.sh
+    - name: Installing rust
+      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
       run: |
-        cd ${GOPATH}/src/github.com/kata-containers/kata-containers && ./ci/install_rust.sh
+        cd ${GOPATH}/src/github.com/${{ github.repository }} && ./ci/install_rust.sh
         PATH=$PATH:"$HOME/.cargo/bin"
-    - name: Make clippy
+        rustup target add x86_64-unknown-linux-musl
+        rustup component add rustfmt clippy
+    - name: Setup seccomp
+      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
       run: |
-        cd ${GOPATH}/src/github.com/kata-containers/kata-containers/src/agent && rustup target add x86_64-unknown-linux-musl && rustup component add rustfmt && rustup component add clippy && make clippy
-    - name: Static checks
+        libseccomp_install_dir=$(mktemp -d -t libseccomp.XXXXXXXXXX)
+        gperf_install_dir=$(mktemp -d -t gperf.XXXXXXXXXX)
+        cd ${GOPATH}/src/github.com/${{ github.repository }} && ./ci/install_libseccomp.sh "${libseccomp_install_dir}" "${gperf_install_dir}"
+        echo "Set environment variables for the libseccomp crate to link the libseccomp library statically"
+        echo "LIBSECCOMP_LINK_TYPE=static" >> $GITHUB_ENV
+        echo "LIBSECCOMP_LIB_PATH=${libseccomp_install_dir}/lib" >> $GITHUB_ENV
+    - name: Run check
+      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
       run: |
-        cd ${GOPATH}/src/github.com/kata-containers/kata-containers && ./ci/static-checks.sh
-    - name: Build agent
-      run: |
-        cd ${GOPATH}/src/github.com/kata-containers/kata-containers/src/agent && make
-    - name: Run agent unit tests
-      run: |
-        cd ${GOPATH}/src/github.com/kata-containers/kata-containers/src/agent && make check
-    - name: Build agent-ctl tool (must be buildable against current agent)
-      run: |
-        cd ${GOPATH}/src/github.com/kata-containers/kata-containers/tools/agent-ctl && make
+        cd ${GOPATH}/src/github.com/${{ github.repository }} && ${{ matrix.cmd }}

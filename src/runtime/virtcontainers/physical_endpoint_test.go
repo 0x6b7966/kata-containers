@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -6,6 +8,7 @@
 package virtcontainers
 
 import (
+	"context"
 	"net"
 	"testing"
 
@@ -26,7 +29,7 @@ func TestPhysicalEndpoint_HotAttach(t *testing.T) {
 
 	h := &mockHypervisor{}
 
-	err := v.HotAttach(h)
+	err := v.HotAttach(context.Background(), h)
 	assert.Error(err)
 }
 
@@ -39,7 +42,7 @@ func TestPhysicalEndpoint_HotDetach(t *testing.T) {
 
 	h := &mockHypervisor{}
 
-	err := v.HotDetach(h, true, "")
+	err := v.HotDetach(context.Background(), h, true, "")
 	assert.Error(err)
 }
 
@@ -76,7 +79,7 @@ func TestIsPhysicalIface(t *testing.T) {
 
 	netlinkHandle, err := netlink.NewHandleAt(netnsHandle)
 	assert.NoError(err)
-	defer netlinkHandle.Delete()
+	defer netlinkHandle.Close()
 
 	err = netlinkHandle.LinkAdd(link)
 	assert.NoError(err)

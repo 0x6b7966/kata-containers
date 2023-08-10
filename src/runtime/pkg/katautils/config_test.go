@@ -9,7 +9,6 @@ package katautils
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,10 +18,13 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/govmm"
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/oci"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/oci"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
+	"github.com/pbnjay/memory"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -30,7 +32,6 @@ var (
 	hypervisorDebug = false
 	runtimeDebug    = false
 	runtimeTrace    = false
-	netmonDebug     = false
 	agentDebug      = false
 	agentTrace      = false
 	enablePprof     = true
@@ -39,6 +40,7 @@ var (
 	jaegerPassword  = "jaeger_password1"
 )
 
+// nolint: govet
 type testRuntimeConfig struct {
 	RuntimeConfig     oci.RuntimeConfig
 	RuntimeConfigFile string
@@ -50,7 +52,7 @@ type testRuntimeConfig struct {
 
 func createConfig(configPath string, fileData string) error {
 
-	err := ioutil.WriteFile(configPath, []byte(fileData), testFileMode)
+	err := os.WriteFile(configPath, []byte(fileData), testFileMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to create config file %s %v\n", configPath, err)
 		return err
@@ -61,57 +63,61 @@ func createConfig(configPath string, fileData string) error {
 
 // createAllRuntimeConfigFiles creates all files necessary to call
 // loadConfiguration().
-func createAllRuntimeConfigFiles(dir, hypervisor string) (config testRuntimeConfig, err error) {
+func createAllRuntimeConfigFiles(dir, hypervisor string) (testConfig testRuntimeConfig, err error) {
 	if dir == "" {
-		return config, fmt.Errorf("BUG: need directory")
+		return testConfig, fmt.Errorf("BUG: need directory")
 	}
 
 	if hypervisor == "" {
-		return config, fmt.Errorf("BUG: need hypervisor")
+		return testConfig, fmt.Errorf("BUG: need hypervisor")
 	}
-
+	var hotPlugVFIO config.PCIePort
+	var coldPlugVFIO config.PCIePort
 	hypervisorPath := path.Join(dir, "hypervisor")
 	kernelPath := path.Join(dir, "kernel")
 	kernelParams := "foo=bar xyz"
 	imagePath := path.Join(dir, "image")
-	netmonPath := path.Join(dir, "netmon")
+	rootfsType := "ext4"
 	logDir := path.Join(dir, "logs")
 	logPath := path.Join(logDir, "runtime.log")
 	machineType := "machineType"
 	disableBlockDevice := true
 	blockDeviceDriver := "virtio-scsi"
+	blockDeviceAIO := "io_uring"
 	enableIOThreads := true
-	hotplugVFIOOnRootBus := true
-	pcieRootPort := uint32(2)
+	hotPlugVFIO = config.NoPort
+	coldPlugVFIO = config.BridgePort
 	disableNewNetNs := false
 	sharedFS := "virtio-9p"
 	virtioFSdaemon := path.Join(dir, "virtiofsd")
 	epcSize := int64(0)
+	maxMemory := uint64(memory.TotalMemory() / 1024 / 1024)
 
 	configFileOptions := ktu.RuntimeConfigOptions{
 		Hypervisor:           "qemu",
 		HypervisorPath:       hypervisorPath,
 		KernelPath:           kernelPath,
 		ImagePath:            imagePath,
+		RootfsType:           rootfsType,
 		KernelParams:         kernelParams,
 		MachineType:          machineType,
-		NetmonPath:           netmonPath,
 		LogPath:              logPath,
 		DefaultGuestHookPath: defaultGuestHookPath,
 		DisableBlock:         disableBlockDevice,
 		BlockDeviceDriver:    blockDeviceDriver,
+		BlockDeviceAIO:       blockDeviceAIO,
 		EnableIOThreads:      enableIOThreads,
-		HotplugVFIOOnRootBus: hotplugVFIOOnRootBus,
-		PCIeRootPort:         pcieRootPort,
+		HotPlugVFIO:          hotPlugVFIO,
+		ColdPlugVFIO:         coldPlugVFIO,
 		DisableNewNetNs:      disableNewNetNs,
 		DefaultVCPUCount:     defaultVCPUCount,
 		DefaultMaxVCPUCount:  defaultMaxVCPUCount,
 		DefaultMemSize:       defaultMemSize,
+		DefaultMaxMemorySize: maxMemory,
 		DefaultMsize9p:       defaultMsize9p,
 		HypervisorDebug:      hypervisorDebug,
 		RuntimeDebug:         runtimeDebug,
 		RuntimeTrace:         runtimeTrace,
-		NetmonDebug:          netmonDebug,
 		AgentDebug:           agentDebug,
 		AgentTrace:           agentTrace,
 		SharedFS:             sharedFS,
@@ -127,7 +133,7 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (config testRuntimeConf
 	configPath := path.Join(dir, "runtime.toml")
 	err = createConfig(configPath, runtimeConfigFileData)
 	if err != nil {
-		return config, err
+		return testConfig, err
 	}
 
 	configPathLink := path.Join(filepath.Dir(configPath), "link-to-configuration.toml")
@@ -135,7 +141,7 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (config testRuntimeConf
 	// create a link to the config file
 	err = syscall.Symlink(configPath, configPathLink)
 	if err != nil {
-		return config, err
+		return testConfig, err
 	}
 
 	files := []string{hypervisorPath, kernelPath, imagePath}
@@ -144,7 +150,7 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (config testRuntimeConf
 		// create the resource (which must be >0 bytes)
 		err := WriteFile(file, "foo", testFileMode)
 		if err != nil {
-			return config, err
+			return testConfig, err
 		}
 	}
 
@@ -152,18 +158,20 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (config testRuntimeConf
 		HypervisorPath:        hypervisorPath,
 		KernelPath:            kernelPath,
 		ImagePath:             imagePath,
+		RootfsType:            rootfsType,
 		KernelParams:          vc.DeserializeParams(strings.Fields(kernelParams)),
 		HypervisorMachineType: machineType,
 		NumVCPUs:              defaultVCPUCount,
-		DefaultMaxVCPUs:       uint32(goruntime.NumCPU()),
+		DefaultMaxVCPUs:       getCurrentCpuNum(),
 		MemorySize:            defaultMemSize,
+		DefaultMaxMemorySize:  maxMemory,
 		DisableBlockDeviceUse: disableBlockDevice,
 		BlockDeviceDriver:     defaultBlockDeviceDriver,
+		BlockDeviceAIO:        defaultBlockDeviceAIO,
 		DefaultBridges:        defaultBridgesCount,
-		Mlock:                 !defaultEnableSwap,
 		EnableIOThreads:       enableIOThreads,
-		HotplugVFIOOnRootBus:  hotplugVFIOOnRootBus,
-		PCIeRootPort:          pcieRootPort,
+		HotPlugVFIO:           hotPlugVFIO,
+		ColdPlugVFIO:          coldPlugVFIO,
 		Msize9p:               defaultMsize9p,
 		MemSlots:              defaultMemSlots,
 		EntropySource:         defaultEntropySource,
@@ -172,17 +180,16 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (config testRuntimeConf
 		SharedFS:              sharedFS,
 		VirtioFSDaemon:        virtioFSdaemon,
 		VirtioFSCache:         defaultVirtioFSCacheMode,
+		PFlash:                []string{},
 		SGXEPCSize:            epcSize,
+	}
+
+	if goruntime.GOARCH == "arm64" && len(hypervisorConfig.PFlash) == 0 && hypervisorConfig.FirmwarePath == "" {
+		hypervisorConfig.DisableImageNvdimm = true
 	}
 
 	agentConfig := vc.KataAgentConfig{
 		LongLiveConn: true,
-	}
-
-	netmonConfig := vc.NetmonConfig{
-		Path:   netmonPath,
-		Debug:  false,
-		Enable: false,
 	}
 
 	factoryConfig := oci.FactoryConfig{
@@ -196,7 +203,6 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (config testRuntimeConf
 
 		AgentConfig: agentConfig,
 
-		NetmonConfig:    netmonConfig,
 		DisableNewNetNs: disableNewNetNs,
 		EnablePprof:     enablePprof,
 		JaegerEndpoint:  jaegerEndpoint,
@@ -208,10 +214,10 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (config testRuntimeConf
 
 	err = SetKernelParams(&runtimeConfig)
 	if err != nil {
-		return config, err
+		return testConfig, err
 	}
 
-	config = testRuntimeConfig{
+	rtimeConfig := testRuntimeConfig{
 		RuntimeConfig:     runtimeConfig,
 		RuntimeConfigFile: configPath,
 		ConfigPath:        configPath,
@@ -220,7 +226,7 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (config testRuntimeConf
 		LogPath:           logPath,
 	}
 
-	return config, nil
+	return rtimeConfig, nil
 }
 
 // testLoadConfiguration accepts an optional function that can be used
@@ -248,7 +254,7 @@ func testLoadConfiguration(t *testing.T, dir string,
 
 			// override
 			defaultRuntimeConfiguration = testConfig.ConfigPath
-			defaultSysConfRuntimeConfiguration = ""
+			DEFAULTSYSCONFRUNTIMECONFIGURATION = ""
 
 			for _, file := range configFiles {
 				var err error
@@ -259,7 +265,7 @@ func testLoadConfiguration(t *testing.T, dir string,
 					assert.NoError(t, err)
 				}
 
-				resolvedConfigPath, config, err := LoadConfiguration(file, ignoreLogging, false)
+				resolvedConfigPath, config, err := LoadConfiguration(file, ignoreLogging)
 				if expectFail {
 					assert.Error(t, err)
 
@@ -290,17 +296,13 @@ func testLoadConfiguration(t *testing.T, dir string,
 }
 
 func TestConfigLoadConfiguration(t *testing.T) {
-	tmpdir, err := ioutil.TempDir(testDir, "load-config-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testLoadConfiguration(t, tmpdir, nil)
 }
 
 func TestConfigLoadConfigurationFailBrokenSymLink(t *testing.T) {
-	tmpdir, err := ioutil.TempDir(testDir, "runtime-config-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testLoadConfiguration(t, tmpdir,
 		func(config testRuntimeConfig, configFile string, ignoreLogging bool) (bool, error) {
@@ -308,7 +310,7 @@ func TestConfigLoadConfigurationFailBrokenSymLink(t *testing.T) {
 
 			if configFile == config.ConfigPathLink {
 				// break the symbolic link
-				err = os.Remove(config.ConfigPathLink)
+				err := os.Remove(config.ConfigPathLink)
 				if err != nil {
 					return expectFail, err
 				}
@@ -321,9 +323,7 @@ func TestConfigLoadConfigurationFailBrokenSymLink(t *testing.T) {
 }
 
 func TestConfigLoadConfigurationFailSymLinkLoop(t *testing.T) {
-	tmpdir, err := ioutil.TempDir(testDir, "runtime-config-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testLoadConfiguration(t, tmpdir,
 		func(config testRuntimeConfig, configFile string, ignoreLogging bool) (bool, error) {
@@ -331,13 +331,13 @@ func TestConfigLoadConfigurationFailSymLinkLoop(t *testing.T) {
 
 			if configFile == config.ConfigPathLink {
 				// remove the config file
-				err = os.Remove(config.ConfigPath)
+				err := os.Remove(config.ConfigPath)
 				if err != nil {
 					return expectFail, err
 				}
 
 				// now, create a sym-link loop
-				err := os.Symlink(config.ConfigPathLink, config.ConfigPath)
+				err = os.Symlink(config.ConfigPathLink, config.ConfigPath)
 				if err != nil {
 					return expectFail, err
 				}
@@ -350,15 +350,13 @@ func TestConfigLoadConfigurationFailSymLinkLoop(t *testing.T) {
 }
 
 func TestConfigLoadConfigurationFailMissingHypervisor(t *testing.T) {
-	tmpdir, err := ioutil.TempDir(testDir, "runtime-config-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testLoadConfiguration(t, tmpdir,
 		func(config testRuntimeConfig, configFile string, ignoreLogging bool) (bool, error) {
 			expectFail := true
 
-			err = os.Remove(config.RuntimeConfig.HypervisorConfig.HypervisorPath)
+			err := os.Remove(config.RuntimeConfig.HypervisorConfig.HypervisorPath)
 			if err != nil {
 				return expectFail, err
 			}
@@ -368,15 +366,13 @@ func TestConfigLoadConfigurationFailMissingHypervisor(t *testing.T) {
 }
 
 func TestConfigLoadConfigurationFailMissingImage(t *testing.T) {
-	tmpdir, err := ioutil.TempDir(testDir, "runtime-config-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testLoadConfiguration(t, tmpdir,
 		func(config testRuntimeConfig, configFile string, ignoreLogging bool) (bool, error) {
 			expectFail := true
 
-			err = os.Remove(config.RuntimeConfig.HypervisorConfig.ImagePath)
+			err := os.Remove(config.RuntimeConfig.HypervisorConfig.ImagePath)
 			if err != nil {
 				return expectFail, err
 			}
@@ -386,15 +382,13 @@ func TestConfigLoadConfigurationFailMissingImage(t *testing.T) {
 }
 
 func TestConfigLoadConfigurationFailMissingKernel(t *testing.T) {
-	tmpdir, err := ioutil.TempDir(testDir, "runtime-config-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testLoadConfiguration(t, tmpdir,
 		func(config testRuntimeConfig, configFile string, ignoreLogging bool) (bool, error) {
 			expectFail := true
 
-			err = os.Remove(config.RuntimeConfig.HypervisorConfig.KernelPath)
+			err := os.Remove(config.RuntimeConfig.HypervisorConfig.KernelPath)
 			if err != nil {
 				return expectFail, err
 			}
@@ -408,16 +402,14 @@ func TestConfigLoadConfigurationFailUnreadableConfig(t *testing.T) {
 		t.Skip(ktu.TestDisabledNeedNonRoot)
 	}
 
-	tmpdir, err := ioutil.TempDir(testDir, "runtime-config-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testLoadConfiguration(t, tmpdir,
 		func(config testRuntimeConfig, configFile string, ignoreLogging bool) (bool, error) {
 			expectFail := true
 
 			// make file unreadable by non-root user
-			err = os.Chmod(config.ConfigPath, 0000)
+			err := os.Chmod(config.ConfigPath, 0000)
 			if err != nil {
 				return expectFail, err
 			}
@@ -431,9 +423,7 @@ func TestConfigLoadConfigurationFailTOMLConfigFileInvalidContents(t *testing.T) 
 		t.Skip(ktu.TestDisabledNeedNonRoot)
 	}
 
-	tmpdir, err := ioutil.TempDir(testDir, "runtime-config-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testLoadConfiguration(t, tmpdir,
 		func(config testRuntimeConfig, configFile string, ignoreLogging bool) (bool, error) {
@@ -457,9 +447,7 @@ func TestConfigLoadConfigurationFailTOMLConfigFileDuplicatedData(t *testing.T) {
 		t.Skip(ktu.TestDisabledNeedNonRoot)
 	}
 
-	tmpdir, err := ioutil.TempDir(testDir, "runtime-config-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testLoadConfiguration(t, tmpdir,
 		func(config testRuntimeConfig, configFile string, ignoreLogging bool) (bool, error) {
@@ -482,17 +470,12 @@ func TestConfigLoadConfigurationFailTOMLConfigFileDuplicatedData(t *testing.T) {
 }
 
 func TestMinimalRuntimeConfig(t *testing.T) {
-	dir, err := ioutil.TempDir(testDir, "minimal-runtime-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	hypervisorPath := path.Join(dir, "hypervisor")
 	defaultHypervisorPath = hypervisorPath
 	jailerPath := path.Join(dir, "jailer")
 	defaultJailerPath = jailerPath
-	netmonPath := path.Join(dir, "netmon")
 
 	imagePath := path.Join(dir, "image.img")
 	initrdPath := path.Join(dir, "initrd.img")
@@ -522,7 +505,7 @@ func TestMinimalRuntimeConfig(t *testing.T) {
 	defaultKernelPath = kernelPath
 
 	for _, file := range []string{defaultImagePath, defaultInitrdPath, defaultHypervisorPath, defaultJailerPath, defaultKernelPath} {
-		err = WriteFile(file, "foo", testFileMode)
+		err := WriteFile(file, "foo", testFileMode)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -534,8 +517,6 @@ func TestMinimalRuntimeConfig(t *testing.T) {
 	[agent.kata]
 	debug_console_enabled=true
 	kernel_modules=["a", "b", "c"]
-	[netmon]
-	path = "` + netmonPath + `"
 `
 
 	orgVHostVSockDevicePath := utils.VHostVSockDevicePath
@@ -545,7 +526,7 @@ func TestMinimalRuntimeConfig(t *testing.T) {
 	utils.VHostVSockDevicePath = "/dev/null"
 
 	configPath := path.Join(dir, "runtime.toml")
-	err = createConfig(configPath, runtimeMinimalConfig)
+	err := createConfig(configPath, runtimeMinimalConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,12 +541,7 @@ func TestMinimalRuntimeConfig(t *testing.T) {
 		t.Error(err)
 	}
 
-	err = createEmptyFile(netmonPath)
-	if err != nil {
-		t.Error(err)
-	}
-
-	_, config, err := LoadConfiguration(configPath, false, false)
+	_, config, err := LoadConfiguration(configPath, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -576,30 +552,28 @@ func TestMinimalRuntimeConfig(t *testing.T) {
 		KernelPath:            defaultKernelPath,
 		ImagePath:             defaultImagePath,
 		InitrdPath:            defaultInitrdPath,
+		RootfsType:            defaultRootfsType,
 		HypervisorMachineType: defaultMachineType,
 		NumVCPUs:              defaultVCPUCount,
 		DefaultMaxVCPUs:       defaultMaxVCPUCount,
 		MemorySize:            defaultMemSize,
 		DisableBlockDeviceUse: defaultDisableBlockDeviceUse,
 		DefaultBridges:        defaultBridgesCount,
-		Mlock:                 !defaultEnableSwap,
 		BlockDeviceDriver:     defaultBlockDeviceDriver,
 		Msize9p:               defaultMsize9p,
 		GuestHookPath:         defaultGuestHookPath,
 		VhostUserStorePath:    defaultVhostUserStorePath,
 		VirtioFSCache:         defaultVirtioFSCacheMode,
+		BlockDeviceAIO:        defaultBlockDeviceAIO,
+		DisableGuestSeLinux:   defaultDisableGuestSeLinux,
+		HotPlugVFIO:           defaultHotPlugVFIO,
+		ColdPlugVFIO:          defaultColdPlugVFIO,
 	}
 
 	expectedAgentConfig := vc.KataAgentConfig{
 		LongLiveConn:       true,
 		EnableDebugConsole: true,
 		KernelModules:      []string{"a", "b", "c"},
-	}
-
-	expectedNetmonConfig := vc.NetmonConfig{
-		Path:   netmonPath,
-		Debug:  false,
-		Enable: false,
 	}
 
 	expectedFactoryConfig := oci.FactoryConfig{
@@ -612,8 +586,6 @@ func TestMinimalRuntimeConfig(t *testing.T) {
 		HypervisorConfig: expectedHypervisorConfig,
 
 		AgentConfig: expectedAgentConfig,
-
-		NetmonConfig: expectedNetmonConfig,
 
 		FactoryConfig: expectedFactoryConfig,
 	}
@@ -628,21 +600,17 @@ func TestMinimalRuntimeConfig(t *testing.T) {
 }
 
 func TestNewQemuHypervisorConfig(t *testing.T) {
-	dir, err := ioutil.TempDir(testDir, "hypervisor-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
+	dir := t.TempDir()
+	var coldPlugVFIO config.PCIePort
 	hypervisorPath := path.Join(dir, "hypervisor")
 	kernelPath := path.Join(dir, "kernel")
 	imagePath := path.Join(dir, "image")
 	machineType := "machineType"
 	disableBlock := true
 	enableIOThreads := true
-	hotplugVFIOOnRootBus := true
-	pcieRootPort := uint32(2)
+	coldPlugVFIO = config.BridgePort
 	orgVHostVSockDevicePath := utils.VHostVSockDevicePath
+	blockDeviceAIO := "io_uring"
 	defer func() {
 		utils.VHostVSockDevicePath = orgVHostVSockDevicePath
 	}()
@@ -658,10 +626,12 @@ func TestNewQemuHypervisorConfig(t *testing.T) {
 		MachineType:           machineType,
 		DisableBlockDeviceUse: disableBlock,
 		EnableIOThreads:       enableIOThreads,
-		HotplugVFIOOnRootBus:  hotplugVFIOOnRootBus,
-		PCIeRootPort:          pcieRootPort,
+		ColdPlugVFIO:          coldPlugVFIO,
 		RxRateLimiterMaxRate:  rxRateLimiterMaxRate,
 		TxRateLimiterMaxRate:  txRateLimiterMaxRate,
+		SharedFS:              "virtio-fs",
+		VirtioFSDaemon:        filepath.Join(dir, "virtiofsd"),
+		BlockDeviceAIO:        blockDeviceAIO,
 	}
 
 	files := []string{hypervisorPath, kernelPath, imagePath}
@@ -707,14 +677,6 @@ func TestNewQemuHypervisorConfig(t *testing.T) {
 		t.Errorf("Expected value for enable IOThreads  %v, got %v", enableIOThreads, config.EnableIOThreads)
 	}
 
-	if config.HotplugVFIOOnRootBus != hotplugVFIOOnRootBus {
-		t.Errorf("Expected value for HotplugVFIOOnRootBus %v, got %v", hotplugVFIOOnRootBus, config.HotplugVFIOOnRootBus)
-	}
-
-	if config.PCIeRootPort != pcieRootPort {
-		t.Errorf("Expected value for PCIeRootPort %v, got %v", pcieRootPort, config.PCIeRootPort)
-	}
-
 	if config.RxRateLimiterMaxRate != rxRateLimiterMaxRate {
 		t.Errorf("Expected value for rx rate limiter %v, got %v", rxRateLimiterMaxRate, config.RxRateLimiterMaxRate)
 	}
@@ -722,14 +684,15 @@ func TestNewQemuHypervisorConfig(t *testing.T) {
 	if config.TxRateLimiterMaxRate != txRateLimiterMaxRate {
 		t.Errorf("Expected value for tx rate limiter %v, got %v", txRateLimiterMaxRate, config.TxRateLimiterMaxRate)
 	}
+
+	if config.BlockDeviceAIO != blockDeviceAIO {
+		t.Errorf("Expected value for BlockDeviceAIO  %v, got %v", blockDeviceAIO, config.BlockDeviceAIO)
+	}
+
 }
 
 func TestNewFirecrackerHypervisorConfig(t *testing.T) {
-	dir, err := ioutil.TempDir(testDir, "hypervisor-config-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	hypervisorPath := path.Join(dir, "hypervisor")
 	kernelPath := path.Join(dir, "kernel")
@@ -820,9 +783,7 @@ func TestNewFirecrackerHypervisorConfig(t *testing.T) {
 func TestNewQemuHypervisorConfigImageAndInitrd(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpdir, err := ioutil.TempDir(testDir, "")
-	assert.NoError(err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	imagePath := filepath.Join(tmpdir, "image")
 	initrdPath := filepath.Join(tmpdir, "initrd")
@@ -830,15 +791,13 @@ func TestNewQemuHypervisorConfigImageAndInitrd(t *testing.T) {
 	kernelPath := path.Join(tmpdir, "kernel")
 
 	for _, file := range []string{imagePath, initrdPath, hypervisorPath, kernelPath} {
-		err = createEmptyFile(file)
+		err := createEmptyFile(file)
 		assert.NoError(err)
 	}
 
 	machineType := "machineType"
 	disableBlock := true
 	enableIOThreads := true
-	hotplugVFIOOnRootBus := true
-	pcieRootPort := uint32(2)
 
 	hypervisor := hypervisor{
 		Path:                  hypervisorPath,
@@ -848,11 +807,9 @@ func TestNewQemuHypervisorConfigImageAndInitrd(t *testing.T) {
 		MachineType:           machineType,
 		DisableBlockDeviceUse: disableBlock,
 		EnableIOThreads:       enableIOThreads,
-		HotplugVFIOOnRootBus:  hotplugVFIOOnRootBus,
-		PCIeRootPort:          pcieRootPort,
 	}
 
-	_, err = newQemuHypervisorConfig(hypervisor)
+	_, err := newQemuHypervisorConfig(hypervisor)
 
 	// specifying both an image+initrd is invalid
 	assert.Error(err)
@@ -862,26 +819,40 @@ func TestNewClhHypervisorConfig(t *testing.T) {
 
 	assert := assert.New(t)
 
-	tmpdir, err := ioutil.TempDir(testDir, "")
-	assert.NoError(err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	hypervisorPath := path.Join(tmpdir, "hypervisor")
 	kernelPath := path.Join(tmpdir, "kernel")
 	imagePath := path.Join(tmpdir, "image")
 	virtioFsDaemon := path.Join(tmpdir, "virtiofsd")
+	netRateLimiterBwMaxRate := int64(1000)
+	netRateLimiterBwOneTimeBurst := int64(1000)
+	netRateLimiterOpsMaxRate := int64(0)
+	netRateLimiterOpsOneTimeBurst := int64(1000)
+	diskRateLimiterBwMaxRate := int64(1000)
+	diskRateLimiterBwOneTimeBurst := int64(1000)
+	diskRateLimiterOpsMaxRate := int64(0)
+	diskRateLimiterOpsOneTimeBurst := int64(1000)
 
 	for _, file := range []string{imagePath, hypervisorPath, kernelPath, virtioFsDaemon} {
-		err = createEmptyFile(file)
+		err := createEmptyFile(file)
 		assert.NoError(err)
 	}
 
 	hypervisor := hypervisor{
-		Path:           hypervisorPath,
-		Kernel:         kernelPath,
-		Image:          imagePath,
-		VirtioFSDaemon: virtioFsDaemon,
-		VirtioFSCache:  "always",
+		Path:                           hypervisorPath,
+		Kernel:                         kernelPath,
+		Image:                          imagePath,
+		VirtioFSDaemon:                 virtioFsDaemon,
+		VirtioFSCache:                  "always",
+		NetRateLimiterBwMaxRate:        netRateLimiterBwMaxRate,
+		NetRateLimiterBwOneTimeBurst:   netRateLimiterBwOneTimeBurst,
+		NetRateLimiterOpsMaxRate:       netRateLimiterOpsMaxRate,
+		NetRateLimiterOpsOneTimeBurst:  netRateLimiterOpsOneTimeBurst,
+		DiskRateLimiterBwMaxRate:       diskRateLimiterBwMaxRate,
+		DiskRateLimiterBwOneTimeBurst:  diskRateLimiterBwOneTimeBurst,
+		DiskRateLimiterOpsMaxRate:      diskRateLimiterOpsMaxRate,
+		DiskRateLimiterOpsOneTimeBurst: diskRateLimiterOpsOneTimeBurst,
 	}
 	config, err := newClhHypervisorConfig(hypervisor)
 	if err != nil {
@@ -912,18 +883,51 @@ func TestNewClhHypervisorConfig(t *testing.T) {
 		t.Errorf("Expected VirtioFSCache %v, got %v", true, config.VirtioFSCache)
 	}
 
+	if config.NetRateLimiterBwMaxRate != netRateLimiterBwMaxRate {
+		t.Errorf("Expected value for network bandwidth rate limiter %v, got %v", netRateLimiterBwMaxRate, config.NetRateLimiterBwMaxRate)
+	}
+
+	if config.NetRateLimiterBwOneTimeBurst != netRateLimiterBwOneTimeBurst {
+		t.Errorf("Expected value for network bandwidth one time burst %v, got %v", netRateLimiterBwOneTimeBurst, config.NetRateLimiterBwOneTimeBurst)
+	}
+
+	if config.NetRateLimiterOpsMaxRate != netRateLimiterOpsMaxRate {
+		t.Errorf("Expected value for network operations rate limiter %v, got %v", netRateLimiterOpsMaxRate, config.NetRateLimiterOpsMaxRate)
+	}
+
+	// We expect 0 (zero) here as netRateLimiterOpsMaxRate is not set (set to zero).
+	if config.NetRateLimiterOpsOneTimeBurst != 0 {
+		t.Errorf("Expected value for network operations one time burst %v, got %v", netRateLimiterOpsOneTimeBurst, config.NetRateLimiterOpsOneTimeBurst)
+	}
+
+	if config.DiskRateLimiterBwMaxRate != diskRateLimiterBwMaxRate {
+		t.Errorf("Expected value for disk bandwidth rate limiter %v, got %v", diskRateLimiterBwMaxRate, config.DiskRateLimiterBwMaxRate)
+	}
+
+	if config.DiskRateLimiterBwOneTimeBurst != diskRateLimiterBwOneTimeBurst {
+		t.Errorf("Expected value for disk bandwidth one time burst %v, got %v", diskRateLimiterBwOneTimeBurst, config.DiskRateLimiterBwOneTimeBurst)
+	}
+
+	if config.DiskRateLimiterOpsMaxRate != diskRateLimiterOpsMaxRate {
+		t.Errorf("Expected value for disk operations rate limiter %v, got %v", diskRateLimiterOpsMaxRate, config.DiskRateLimiterOpsMaxRate)
+	}
+
+	// We expect 0 (zero) here as diskRateLimiterOpsMaxRate is not set (set to zero).
+	if config.DiskRateLimiterOpsOneTimeBurst != 0 {
+		t.Errorf("Expected value for disk operations one time burst %v, got %v", diskRateLimiterOpsOneTimeBurst, config.DiskRateLimiterOpsOneTimeBurst)
+	}
 }
 
 func TestHypervisorDefaults(t *testing.T) {
 	assert := assert.New(t)
 
-	numCPUs := goruntime.NumCPU()
+	numCPUs := getCurrentCpuNum()
 
 	h := hypervisor{}
 
 	assert.Equal(h.machineType(), defaultMachineType, "default hypervisor machine type wrong")
 	assert.Equal(h.defaultVCPUs(), defaultVCPUCount, "default vCPU number is wrong")
-	assert.Equal(h.defaultMaxVCPUs(), uint32(numCPUs), "default max vCPU number is wrong")
+	assert.Equal(h.defaultMaxVCPUs(), numCPUs, "default max vCPU number is wrong")
 	assert.Equal(h.defaultMemSz(), defaultMemSize, "default memory size is wrong")
 
 	machineType := "foo"
@@ -932,23 +936,23 @@ func TestHypervisorDefaults(t *testing.T) {
 
 	// auto inferring
 	h.NumVCPUs = -1
-	assert.Equal(h.defaultVCPUs(), uint32(numCPUs), "default vCPU number is wrong")
+	assert.Equal(h.defaultVCPUs(), numCPUs, "default vCPU number is wrong")
 
 	h.NumVCPUs = 2
 	assert.Equal(h.defaultVCPUs(), uint32(2), "default vCPU number is wrong")
 
 	h.NumVCPUs = int32(numCPUs) + 1
-	assert.Equal(h.defaultVCPUs(), uint32(numCPUs), "default vCPU number is wrong")
+	assert.Equal(h.defaultVCPUs(), numCPUs, "default vCPU number is wrong")
 
 	h.DefaultMaxVCPUs = 2
 	assert.Equal(h.defaultMaxVCPUs(), uint32(2), "default max vCPU number is wrong")
 
-	h.DefaultMaxVCPUs = uint32(numCPUs) + 1
-	assert.Equal(h.defaultMaxVCPUs(), uint32(numCPUs), "default max vCPU number is wrong")
+	h.DefaultMaxVCPUs = numCPUs + 1
+	assert.Equal(h.defaultMaxVCPUs(), numCPUs, "default max vCPU number is wrong")
 
-	maxvcpus := vc.MaxQemuVCPUs()
+	maxvcpus := govmm.MaxVCPUs()
 	h.DefaultMaxVCPUs = maxvcpus + 1
-	assert.Equal(h.defaultMaxVCPUs(), uint32(numCPUs), "default max vCPU number is wrong")
+	assert.Equal(h.defaultMaxVCPUs(), numCPUs, "default max vCPU number is wrong")
 
 	h.MemorySize = 1024
 	assert.Equal(h.defaultMemSz(), uint32(1024), "default memory size is wrong")
@@ -957,14 +961,12 @@ func TestHypervisorDefaults(t *testing.T) {
 func TestHypervisorDefaultsHypervisor(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpdir, err := ioutil.TempDir(testDir, "")
-	assert.NoError(err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testHypervisorPath := filepath.Join(tmpdir, "hypervisor")
 	testHypervisorLinkPath := filepath.Join(tmpdir, "hypervisor-link")
 
-	err = createEmptyFile(testHypervisorPath)
+	err := createEmptyFile(testHypervisorPath)
 	assert.NoError(err)
 
 	err = syscall.Symlink(testHypervisorPath, testHypervisorLinkPath)
@@ -993,14 +995,12 @@ func TestHypervisorDefaultsHypervisor(t *testing.T) {
 func TestHypervisorDefaultsKernel(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpdir, err := ioutil.TempDir(testDir, "")
-	assert.NoError(err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testKernelPath := filepath.Join(tmpdir, "kernel")
 	testKernelLinkPath := filepath.Join(tmpdir, "kernel-link")
 
-	err = createEmptyFile(testKernelPath)
+	err := createEmptyFile(testKernelPath)
 	assert.NoError(err)
 
 	err = syscall.Symlink(testKernelPath, testKernelLinkPath)
@@ -1032,18 +1032,16 @@ func TestHypervisorDefaultsKernel(t *testing.T) {
 	assert.Equal(h.kernelParams(), kernelParams, "custom hypervisor kernel parameterms wrong")
 }
 
-// The default initrd path is not returned by h.initrd()
+// The default initrd path is not returned by h.initrd(), it isn't an error if path isn't provided
 func TestHypervisorDefaultsInitrd(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpdir, err := ioutil.TempDir(testDir, "")
-	assert.NoError(err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testInitrdPath := filepath.Join(tmpdir, "initrd")
 	testInitrdLinkPath := filepath.Join(tmpdir, "initrd-link")
 
-	err = createEmptyFile(testInitrdPath)
+	err := createEmptyFile(testInitrdPath)
 	assert.NoError(err)
 
 	err = syscall.Symlink(testInitrdPath, testInitrdLinkPath)
@@ -1058,29 +1056,27 @@ func TestHypervisorDefaultsInitrd(t *testing.T) {
 	defaultInitrdPath = testInitrdPath
 	h := hypervisor{}
 	p, err := h.initrd()
-	assert.Error(err)
+	assert.NoError(err)
 	assert.Equal(p, "", "default Image path wrong")
 
 	// test path resolution
 	defaultInitrdPath = testInitrdLinkPath
 	h = hypervisor{}
 	p, err = h.initrd()
-	assert.Error(err)
+	assert.NoError(err)
 	assert.Equal(p, "")
 }
 
-// The default image path is not returned by h.image()
+// The default image path is not returned by h.image(), it isn't an error if path isn't provided
 func TestHypervisorDefaultsImage(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpdir, err := ioutil.TempDir(testDir, "")
-	assert.NoError(err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testImagePath := filepath.Join(tmpdir, "image")
 	testImageLinkPath := filepath.Join(tmpdir, "image-link")
 
-	err = createEmptyFile(testImagePath)
+	err := createEmptyFile(testImagePath)
 	assert.NoError(err)
 
 	err = syscall.Symlink(testImagePath, testImageLinkPath)
@@ -1095,14 +1091,14 @@ func TestHypervisorDefaultsImage(t *testing.T) {
 	defaultImagePath = testImagePath
 	h := hypervisor{}
 	p, err := h.image()
-	assert.Error(err)
+	assert.NoError(err)
 	assert.Equal(p, "", "default Image path wrong")
 
 	// test path resolution
 	defaultImagePath = testImageLinkPath
 	h = hypervisor{}
 	p, err = h.image()
-	assert.Error(err)
+	assert.NoError(err)
 	assert.Equal(p, "")
 }
 
@@ -1150,9 +1146,6 @@ func TestAgentDefaults(t *testing.T) {
 
 	a.Tracing = true
 	assert.Equal(a.trace(), a.Tracing)
-
-	assert.Equal(a.traceMode(), a.TraceMode)
-	assert.Equal(a.traceType(), a.TraceType)
 }
 
 func TestGetDefaultConfigFilePaths(t *testing.T) {
@@ -1171,16 +1164,14 @@ func TestGetDefaultConfigFilePaths(t *testing.T) {
 func TestGetDefaultConfigFile(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpdir, err := ioutil.TempDir(testDir, "")
-	assert.NoError(err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	hypervisor := "qemu"
 	confDir := filepath.Join(tmpdir, "conf")
 	sysConfDir := filepath.Join(tmpdir, "sysconf")
 
 	for _, dir := range []string{confDir, sysConfDir} {
-		err = os.MkdirAll(dir, testDirMode)
+		err := os.MkdirAll(dir, testDirMode)
 		assert.NoError(err)
 	}
 
@@ -1191,24 +1182,24 @@ func TestGetDefaultConfigFile(t *testing.T) {
 	assert.NoError(err)
 
 	savedConf := defaultRuntimeConfiguration
-	savedSysConf := defaultSysConfRuntimeConfiguration
+	savedSysConf := DEFAULTSYSCONFRUNTIMECONFIGURATION
 
 	defaultRuntimeConfiguration = confDirConfig.ConfigPath
-	defaultSysConfRuntimeConfiguration = sysConfDirConfig.ConfigPath
+	DEFAULTSYSCONFRUNTIMECONFIGURATION = sysConfDirConfig.ConfigPath
 
 	defer func() {
 		defaultRuntimeConfiguration = savedConf
-		defaultSysConfRuntimeConfiguration = savedSysConf
+		DEFAULTSYSCONFRUNTIMECONFIGURATION = savedSysConf
 
 	}()
 
 	got, err := getDefaultConfigFile()
 	assert.NoError(err)
-	// defaultSysConfRuntimeConfiguration has priority over defaultRuntimeConfiguration
-	assert.Equal(got, defaultSysConfRuntimeConfiguration)
+	// DEFAULTSYSCONFRUNTIMECONFIGURATION has priority over defaultRuntimeConfiguration
+	assert.Equal(got, DEFAULTSYSCONFRUNTIMECONFIGURATION)
 
 	// force defaultRuntimeConfiguration to be returned
-	os.Remove(defaultSysConfRuntimeConfiguration)
+	os.Remove(DEFAULTSYSCONFRUNTIMECONFIGURATION)
 
 	got, err = getDefaultConfigFile()
 	assert.NoError(err)
@@ -1250,9 +1241,9 @@ func TestDefaultVirtioFSCache(t *testing.T) {
 	cache = h.defaultVirtioFSCache()
 	assert.Equal("always", cache)
 
-	h.VirtioFSCache = "none"
+	h.VirtioFSCache = "never"
 	cache = h.defaultVirtioFSCache()
-	assert.Equal("none", cache)
+	assert.Equal("never", cache)
 }
 
 func TestDefaultFirmware(t *testing.T) {
@@ -1261,7 +1252,7 @@ func TestDefaultFirmware(t *testing.T) {
 	// save default firmware path
 	oldDefaultFirmwarePath := defaultFirmwarePath
 
-	f, err := ioutil.TempFile(os.TempDir(), "qboot.bin")
+	f, err := os.CreateTemp(os.TempDir(), "qboot.bin")
 	assert.NoError(err)
 	assert.NoError(f.Close())
 	defer os.RemoveAll(f.Name())
@@ -1279,6 +1270,32 @@ func TestDefaultFirmware(t *testing.T) {
 
 	// restore default firmware path
 	defaultFirmwarePath = oldDefaultFirmwarePath
+}
+
+func TestDefaultFirmwareVolume(t *testing.T) {
+	assert := assert.New(t)
+
+	// save default firmware path
+	oldDefaultFirmwareVolumePath := defaultFirmwareVolumePath
+
+	f, err := os.CreateTemp(os.TempDir(), "vol")
+	assert.NoError(err)
+	assert.NoError(f.Close())
+	defer os.RemoveAll(f.Name())
+
+	h := hypervisor{}
+	defaultFirmwareVolumePath = ""
+	p, err := h.firmwareVolume()
+	assert.NoError(err)
+	assert.Empty(p)
+
+	defaultFirmwareVolumePath = f.Name()
+	p, err = h.firmwareVolume()
+	assert.NoError(err)
+	assert.NotEmpty(p)
+
+	// restore default firmware volume path
+	defaultFirmwarePath = oldDefaultFirmwareVolumePath
 }
 
 func TestDefaultMachineAccelerators(t *testing.T) {
@@ -1387,17 +1404,20 @@ func TestUpdateRuntimeConfigurationVMConfig(t *testing.T) {
 	tomlConf := tomlConfig{
 		Hypervisor: map[string]hypervisor{
 			qemuHypervisorTableType: {
-				NumVCPUs:   int32(vcpus),
-				MemorySize: mem,
-				Path:       "/",
-				Kernel:     "/",
-				Image:      "/",
-				Firmware:   "/",
+				NumVCPUs:       int32(vcpus),
+				MemorySize:     mem,
+				Path:           "/",
+				Kernel:         "/",
+				Image:          "/",
+				Firmware:       "/",
+				FirmwareVolume: "/",
+				SharedFS:       "virtio-fs",
+				VirtioFSDaemon: "/usr/libexec/kata-qemu/virtiofsd",
 			},
 		},
 	}
 
-	err := updateRuntimeConfig("", tomlConf, &config, false)
+	err := updateRuntimeConfig("", tomlConf, &config)
 	assert.NoError(err)
 
 	assert.Equal(expectedVMConfig, config.HypervisorConfig.MemorySize)
@@ -1415,7 +1435,7 @@ func TestUpdateRuntimeConfigurationFactoryConfig(t *testing.T) {
 
 	tomlConf := tomlConfig{Factory: factory{Template: true}}
 
-	err := updateRuntimeConfig("", tomlConf, &config, false)
+	err := updateRuntimeConfig("", tomlConf, &config)
 	assert.NoError(err)
 
 	assert.Equal(expectedFactoryConfig, config.FactoryConfig)
@@ -1442,18 +1462,14 @@ func TestUpdateRuntimeConfigurationInvalidKernelParams(t *testing.T) {
 		}
 	}
 
-	err := updateRuntimeConfig("", tomlConf, &config, false)
+	err := updateRuntimeConfig("", tomlConf, &config)
 	assert.EqualError(err, "Empty kernel parameter")
 }
 
 func TestCheckHypervisorConfig(t *testing.T) {
 	assert := assert.New(t)
 
-	dir, err := ioutil.TempDir(testDir, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// Not created on purpose
 	imageENOENT := filepath.Join(dir, "image-ENOENT.img")
@@ -1463,7 +1479,7 @@ func TestCheckHypervisorConfig(t *testing.T) {
 	initrdEmpty := filepath.Join(dir, "initrd-empty.img")
 
 	for _, file := range []string{imageEmpty, initrdEmpty} {
-		err = createEmptyFile(file)
+		err := createEmptyFile(file)
 		assert.NoError(err)
 	}
 
@@ -1478,7 +1494,7 @@ func TestCheckHypervisorConfig(t *testing.T) {
 	fileData := strings.Repeat("X", int(fileSizeBytes))
 
 	for _, file := range []string{image, initrd} {
-		err = WriteFile(file, fileData, testFileMode)
+		err := WriteFile(file, fileData, testFileMode)
 		assert.NoError(err)
 	}
 
@@ -1555,9 +1571,6 @@ func TestCheckNetNsConfig(t *testing.T) {
 
 	config := oci.RuntimeConfig{
 		DisableNewNetNs: true,
-		NetmonConfig: vc.NetmonConfig{
-			Enable: true,
-		},
 	}
 	err := checkNetNsConfig(config)
 	assert.Error(err)
@@ -1573,6 +1586,7 @@ func TestCheckNetNsConfig(t *testing.T) {
 func TestCheckFactoryConfig(t *testing.T) {
 	assert := assert.New(t)
 
+	// nolint: govet
 	type testData struct {
 		factoryEnabled bool
 		expectError    bool
@@ -1609,4 +1623,115 @@ func TestCheckFactoryConfig(t *testing.T) {
 			assert.NoError(err, "test %d (%+v)", i, d)
 		}
 	}
+}
+
+func TestValidateBindMounts(t *testing.T) {
+	assert := assert.New(t)
+
+	tmpdir1 := t.TempDir()
+
+	tmpdir2 := t.TempDir()
+
+	duplicate1 := filepath.Join(tmpdir1, "cat.txt")
+	duplicate2 := filepath.Join(tmpdir2, "cat.txt")
+	unique := filepath.Join(tmpdir1, "foobar.txt")
+
+	err := os.WriteFile(duplicate1, []byte("kibble-monster"), 0644)
+	assert.NoError(err)
+
+	err = os.WriteFile(duplicate2, []byte("furbag"), 0644)
+	assert.NoError(err)
+
+	err = os.WriteFile(unique, []byte("fuzzball"), 0644)
+	assert.NoError(err)
+
+	type testData struct {
+		name        string
+		mounts      []string
+		expectError bool
+	}
+
+	data := []testData{
+		{"two unique directories", []string{tmpdir1, tmpdir2}, false},
+		{"unique directory and two unique files", []string{tmpdir1, duplicate1, unique}, false},
+		{"two files with same base name", []string{duplicate1, duplicate2}, true},
+		{"non existent path", []string{"/this/does/not/exist"}, true},
+		{"non existent path with existing path", []string{unique, "/this/does/not/exist"}, true},
+		{"non existent path with duplicates", []string{duplicate1, duplicate2, "/this/does/not/exist"}, true},
+		{"no paths", []string{}, false},
+	}
+	for i, d := range data {
+		err := validateBindMounts(d.mounts)
+		if d.expectError {
+			assert.Error(err, "test %d (%+v)", i, d.name)
+		} else {
+			assert.NoError(err, "test %d (%+v)", i, d.name)
+		}
+	}
+}
+
+func TestLoadDropInConfiguration(t *testing.T) {
+	tmpdir := t.TempDir()
+
+	// Test Runtime and Hypervisor to represent structures stored directly and
+	// in maps, respectively.  For each of them, test
+	// - a key that's only set in the base config file
+	// - a key that's only set in a drop-in
+	// - a key that's set in the base config file and then changed by a drop-in
+	// - a key that's set in a drop-in and then overridden by another drop-in
+	// Avoid default values to reduce the risk of mistaking a result of
+	// something having gone wrong with the expected value.
+
+	runtimeConfigFileData := `
+[hypervisor.qemu]
+path = "/usr/bin/qemu-kvm"
+default_bridges = 3
+[runtime]
+enable_debug = true
+internetworking_model="tcfilter"
+`
+	dropInData := `
+[hypervisor.qemu]
+default_vcpus = 2
+default_bridges = 4
+shared_fs = "virtio-fs"
+[runtime]
+sandbox_cgroup_only=true
+internetworking_model="macvtap"
+vfio_mode="guest-kernel"
+`
+	dropInOverrideData := `
+[hypervisor.qemu]
+shared_fs = "virtio-9p"
+[runtime]
+vfio_mode="vfio"
+`
+
+	configPath := path.Join(tmpdir, "runtime.toml")
+	err := createConfig(configPath, runtimeConfigFileData)
+	assert.NoError(t, err)
+
+	dropInDir := path.Join(tmpdir, "config.d")
+	err = os.Mkdir(dropInDir, os.FileMode(0777))
+	assert.NoError(t, err)
+
+	dropInPath := path.Join(dropInDir, "10-base")
+	err = createConfig(dropInPath, dropInData)
+	assert.NoError(t, err)
+
+	dropInOverridePath := path.Join(dropInDir, "10-override")
+	err = createConfig(dropInOverridePath, dropInOverrideData)
+	assert.NoError(t, err)
+
+	config, _, err := decodeConfig(configPath)
+	assert.NoError(t, err)
+
+	assert.Equal(t, config.Hypervisor["qemu"].Path, "/usr/bin/qemu-kvm")
+	assert.Equal(t, config.Hypervisor["qemu"].NumVCPUs, int32(2))
+	assert.Equal(t, config.Hypervisor["qemu"].DefaultBridges, uint32(4))
+	assert.Equal(t, config.Hypervisor["qemu"].SharedFS, "virtio-9p")
+	assert.Equal(t, config.Runtime.Debug, true)
+	assert.Equal(t, config.Runtime.SandboxCgroupOnly, true)
+	assert.Equal(t, config.Runtime.InterNetworkModel, "macvtap")
+	assert.Equal(t, config.Runtime.VfioMode, "vfio")
 }

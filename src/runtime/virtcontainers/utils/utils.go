@@ -12,8 +12,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
+	"time"
 
-	"github.com/vishvananda/netlink"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 )
@@ -21,6 +24,13 @@ import (
 const cpBinaryName = "cp"
 
 const fileMode0755 = os.FileMode(0755)
+
+const maxWaitDelay = 50 * time.Millisecond
+
+// The DefaultRateLimiterRefillTime is used for calculating the rate at
+// which a TokenBucket is replinished, in cases where a RateLimiter is
+// applied to either network or disk I/O.
+const DefaultRateLimiterRefillTimeMilliSecs = 1000
 
 // MibToBytesShift the number to shift needed to convert MiB to Bytes
 const MibToBytesShift = 20
@@ -68,8 +78,8 @@ func GenerateRandomBytes(n int) ([]byte, error) {
 	return b, nil
 }
 
-// ReverseString reverses whole string
-func ReverseString(s string) string {
+// reverseString reverses whole string
+func reverseString(s string) string {
 	r := []rune(s)
 
 	length := len(r)
@@ -109,7 +119,7 @@ func WriteToFile(path string, data []byte) error {
 	return nil
 }
 
-//CalculateMilliCPUs converts CPU quota and period to milli-CPUs
+// CalculateMilliCPUs converts CPU quota and period to milli-CPUs
 func CalculateMilliCPUs(quota int64, period uint64) uint32 {
 
 	// If quota is -1, it means the CPU resource request is
@@ -122,25 +132,10 @@ func CalculateMilliCPUs(quota int64, period uint64) uint32 {
 	return 0
 }
 
-//CalculateVCpusFromMilliCpus converts from mCPU to CPU, taking the ceiling
+// CalculateVCpusFromMilliCpus converts from mCPU to CPU, taking the ceiling
 // value when necessary
 func CalculateVCpusFromMilliCpus(mCPU uint32) uint32 {
 	return (mCPU + 999) / 1000
-}
-
-// ConstraintsToVCPUs converts CPU quota and period to vCPUs
-func ConstraintsToVCPUs(quota int64, period uint64) uint {
-	if quota != 0 && period != 0 {
-		// Use some math magic to round up to the nearest whole vCPU
-		// (that is, a partial part of a quota request ends up assigning
-		// a whole vCPU, for instance, a request of 1.5 'cpu quotas'
-		// will give 2 vCPUs).
-		// This also has the side effect that we will always allocate
-		// at least 1 vCPU.
-		return uint((uint64(quota) + (period - 1)) / period)
-	}
-
-	return 0
 }
 
 // GetVirtDriveName returns the disk name format for virtio-blk
@@ -172,7 +167,7 @@ func GetVirtDriveName(index int) (string, error) {
 		return "", fmt.Errorf("Index not supported")
 	}
 
-	diskName := prefix + ReverseString(string(diskLetters[:i]))
+	diskName := prefix + reverseString(string(diskLetters[:i]))
 	return diskName, nil
 }
 
@@ -302,13 +297,200 @@ const (
 	GiB          = MiB << 10
 )
 
-func ConvertNetlinkFamily(netlinkFamily int32) pbTypes.IPFamily {
-	switch netlinkFamily {
-	case netlink.FAMILY_V6:
+func ConvertAddressFamily(family int32) pbTypes.IPFamily {
+	switch family {
+	case unix.AF_INET6:
 		return pbTypes.IPFamily_v6
-	case netlink.FAMILY_V4:
+	case unix.AF_INET:
 		fallthrough
 	default:
 		return pbTypes.IPFamily_v4
 	}
+}
+
+func waitProcessUsingWaitLoop(pid int, timeoutSecs uint, logger *logrus.Entry) bool {
+	secs := time.Duration(timeoutSecs) * time.Second
+	timeout := time.After(secs)
+	delay := 1 * time.Millisecond
+
+	for {
+		// Wait4 is used to reap and check that a child terminated.
+		// Without the Wait4 call, Kill(0) for a child will always exit without
+		// error because the process isn't reaped.
+		// Wait4 return ECHLD error for non-child processes. Kill(0) is meant
+		// to address this case, once the process is reaped by init process,
+		// the call will return ESRCH error.
+
+		// "A watched pot never boils" and an unwaited-for process never appears to die!
+		waitedPid, err := syscall.Wait4(pid, nil, syscall.WNOHANG, nil)
+
+		if waitedPid == pid && err == nil {
+			return false
+		}
+
+		if err := syscall.Kill(pid, syscall.Signal(0)); err != nil {
+			return false
+		}
+
+		select {
+		case <-time.After(delay):
+			delay = delay * 5
+
+			if delay > maxWaitDelay {
+				delay = maxWaitDelay
+			}
+		case <-timeout:
+			logger.Warnf("process %v still running after waiting %ds", pid, timeoutSecs)
+			return true
+		}
+	}
+}
+
+// WaitLocalProcess waits for the specified process for up to timeoutSecs seconds.
+//
+// Notes:
+//
+//   - If the initial signal is zero, the specified process is assumed to be
+//     attempting to stop itself.
+//   - If the initial signal is not zero, it will be sent to the process before
+//     checking if it is running.
+//   - If the process has not ended after the timeout value, it will be forcibly killed.
+func WaitLocalProcess(pid int, timeoutSecs uint, initialSignal syscall.Signal, logger *logrus.Entry) error {
+	var err error
+
+	// Don't support process groups
+	if pid <= 0 {
+		return errors.New("can only wait for a single process")
+	}
+
+	if initialSignal != syscall.Signal(0) {
+		if err = syscall.Kill(pid, initialSignal); err != nil {
+			if err == syscall.ESRCH {
+				logger.WithField("pid", pid).Warnf("kill encounters ESRCH, process already finished")
+				return nil
+			}
+
+			return fmt.Errorf("Failed to send initial signal %v to process %v: %v", initialSignal, pid, err)
+		}
+	}
+
+	pidRunning := waitForProcessCompletion(pid, timeoutSecs, logger)
+
+	if pidRunning {
+		// Force process to die
+		if err = syscall.Kill(pid, syscall.SIGKILL); err != nil {
+			if err == syscall.ESRCH {
+				logger.WithField("pid", pid).Warnf("process already finished")
+				return nil
+			}
+			return fmt.Errorf("Failed to stop process %v: %s", pid, err)
+		}
+
+		for {
+			_, err := syscall.Wait4(pid, nil, 0, nil)
+			if err != syscall.EINTR {
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
+// MkdirAllWithInheritedOwner creates a directory named path, along with any necessary parents.
+// It creates the missing directories with the ownership of the last existing parent.
+// The path needs to be absolute and the method doesn't handle symlink.
+func MkdirAllWithInheritedOwner(path string, perm os.FileMode) error {
+	if len(path) == 0 {
+		return fmt.Errorf("the path is empty")
+	}
+
+	// By default, use the uid and gid of the calling process.
+	var uid = os.Getuid()
+	var gid = os.Getgid()
+
+	paths := getAllParentPaths(path)
+	for _, curPath := range paths {
+		info, err := os.Stat(curPath)
+
+		if err != nil {
+			if err = os.MkdirAll(curPath, perm); err != nil {
+				return fmt.Errorf("mkdir call failed: %v", err.Error())
+			}
+			if err = syscall.Chown(curPath, uid, gid); err != nil {
+				return fmt.Errorf("chown syscall failed: %v", err.Error())
+			}
+			continue
+		}
+
+		if !info.IsDir() {
+			return &os.PathError{Op: "mkdir", Path: curPath, Err: syscall.ENOTDIR}
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			uid = int(stat.Uid)
+			gid = int(stat.Gid)
+		} else {
+			return fmt.Errorf("fail to retrieve the uid and gid of path %s", curPath)
+		}
+	}
+	return nil
+}
+
+// ChownToParent changes the owners of the path to the same of parent directory.
+// The path needs to be absolute and the method doesn't handle symlink.
+func ChownToParent(path string) error {
+	if len(path) == 0 {
+		return fmt.Errorf("the path is empty")
+	}
+
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("the path is not absolute")
+	}
+
+	info, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("os.Stat() error on %s: %s", filepath.Dir(path), err.Error())
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		if err = syscall.Chown(path, int(stat.Uid), int(stat.Gid)); err != nil {
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("fail to retrieve the uid and gid of path %s", path)
+}
+
+// getAllParentPaths returns all the parent directories of a path, including itself but excluding root directory "/".
+// For example, "/foo/bar/biz" returns {"/foo", "/foo/bar", "/foo/bar/biz"}
+func getAllParentPaths(path string) []string {
+	if path == "/" || path == "." {
+		return []string{}
+	}
+
+	paths := []string{filepath.Clean(path)}
+	cur := path
+	var parent string
+	for cur != "/" && cur != "." {
+		parent = filepath.Dir(cur)
+		paths = append([]string{parent}, paths...)
+		cur = parent
+	}
+	// remove the "/" or "." from the return result
+	return paths[1:]
+}
+
+// In Cloud Hypervisor, as well as in Firecracker, the crate used by the VMMs
+// accepts the size of rate limiter in scaling factors of 2^10(1024).
+// But in kata-defined rate limiter, for better Human-readability, we prefer
+// scaling factors of 10^3(1000).
+//
+// func revertBytes reverts num from scaling factors of 1000 to 1024, e.g.
+// 10000000(10MB) to 10485760.
+func RevertBytes(num uint64) uint64 {
+	a := num / 1000
+	b := num % 1000
+	if a == 0 {
+		return num
+	}
+	return 1024*RevertBytes(a) + b
 }

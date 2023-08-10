@@ -5,99 +5,145 @@
 
 extern crate procfs;
 
-use prometheus::{Encoder, Gauge, GaugeVec, IntCounter, TextEncoder};
+use prometheus::{Encoder, Gauge, GaugeVec, IntCounter, Opts, Registry, TextEncoder};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use slog::warn;
+use std::sync::Mutex;
+use tracing::instrument;
 
 const NAMESPACE_KATA_AGENT: &str = "kata_agent";
 const NAMESPACE_KATA_GUEST: &str = "kata_guest";
 
-// Convenience macro to obtain the scope logger
-macro_rules! sl {
-    () => {
-        slog_scope::logger().new(o!("subsystem" => "metrics"))
-    };
+// Convenience function to obtain the scope logger.
+fn sl() -> slog::Logger {
+    slog_scope::logger().new(o!("subsystem" => "metrics"))
 }
 
 lazy_static! {
 
-    static ref     AGENT_SCRAPE_COUNT: IntCounter =
-    prometheus::register_int_counter!(format!("{}_{}",NAMESPACE_KATA_AGENT,"scrape_count").as_ref(), "Metrics scrape count").unwrap();
+    static ref REGISTERED: Mutex<bool> = Mutex::new(false);
 
-    static ref     AGENT_THREADS: Gauge =
-    prometheus::register_gauge!(format!("{}_{}",NAMESPACE_KATA_AGENT,"threads").as_ref(), "Agent process threads").unwrap();
+    // custom registry
+    static ref REGISTRY: Registry = Registry::new();
 
-    static ref     AGENT_TOTAL_TIME: Gauge =
-    prometheus::register_gauge!(format!("{}_{}",NAMESPACE_KATA_AGENT,"total_time").as_ref(), "Agent process total time").unwrap();
+    static ref AGENT_SCRAPE_COUNT: IntCounter =
+    IntCounter::new(format!("{}_{}",NAMESPACE_KATA_AGENT,"scrape_count"), "Metrics scrape count").unwrap();
 
-    static ref     AGENT_TOTAL_VM: Gauge =
-    prometheus::register_gauge!(format!("{}_{}",NAMESPACE_KATA_AGENT,"total_vm").as_ref(), "Agent process total VM size").unwrap();
+    // agent metrics
+    static ref AGENT_THREADS: Gauge =
+    Gauge::new(format!("{}_{}",NAMESPACE_KATA_AGENT,"threads"), "Agent process threads").unwrap();
 
-    static ref     AGENT_TOTAL_RSS: Gauge =
-    prometheus::register_gauge!(format!("{}_{}",NAMESPACE_KATA_AGENT,"total_rss").as_ref(), "Agent process total RSS size").unwrap();
+    static ref AGENT_TOTAL_TIME: Gauge =
+    Gauge::new(format!("{}_{}",NAMESPACE_KATA_AGENT,"total_time"), "Agent process total time").unwrap();
 
-    static ref     AGENT_PROC_STATUS: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_AGENT,"proc_status").as_ref(), "Agent process status.", &["item"]).unwrap();
+    static ref AGENT_TOTAL_VM: Gauge =
+    Gauge::new(format!("{}_{}",NAMESPACE_KATA_AGENT,"total_vm"), "Agent process total VM size").unwrap() ;
 
-    static ref     AGENT_IO_STAT: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_AGENT,"io_stat").as_ref(), "Agent process IO statistics.", &["item"]).unwrap();
+    static ref AGENT_TOTAL_RSS: Gauge =
+    Gauge::new(format!("{}_{}",NAMESPACE_KATA_AGENT,"total_rss"), "Agent process total RSS size").unwrap();
 
-    static ref     AGENT_PROC_STAT: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_AGENT,"proc_stat").as_ref(), "Agent process statistics.", &["item"]).unwrap();
+    static ref AGENT_PROC_STATUS: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_AGENT,"proc_status"), "Agent process status."), &["item"]).unwrap();
+
+    static ref AGENT_IO_STAT: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_AGENT,"io_stat"), "Agent process IO statistics."), &["item"]).unwrap();
+
+    static ref AGENT_PROC_STAT: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_AGENT,"proc_stat"), "Agent process statistics."), &["item"]).unwrap();
 
     // guest os metrics
-    static ref     GUEST_LOAD: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_GUEST,"load").as_ref() , "Guest system load.", &["item"]).unwrap();
+    static ref GUEST_LOAD: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"load"), "Guest system load."), &["item"]).unwrap();
 
-    static ref     GUEST_TASKS: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_GUEST,"tasks").as_ref() , "Guest system load.", &["item"]).unwrap();
+    static ref GUEST_TASKS: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"tasks"), "Guest system load."), &["item"]).unwrap();
 
-    static ref     GUEST_CPU_TIME: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_GUEST,"cpu_time").as_ref() , "Guest CPU statistics.", &["cpu","item"]).unwrap();
+    static ref GUEST_CPU_TIME: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"cpu_time"), "Guest CPU statistics."), &["cpu","item"]).unwrap();
 
-    static ref     GUEST_VM_STAT: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_GUEST,"vm_stat").as_ref() , "Guest virtual memory statistics.", &["item"]).unwrap();
+    static ref GUEST_VM_STAT: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"vm_stat"), "Guest virtual memory statistics."), &["item"]).unwrap();
 
-    static ref     GUEST_NETDEV_STAT: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_GUEST,"netdev_stat").as_ref() , "Guest net devices statistics.", &["interface","item"]).unwrap();
+    static ref GUEST_NETDEV_STAT: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"netdev_stat"), "Guest net devices statistics."), &["interface","item"]).unwrap();
 
-    static ref     GUEST_DISKSTAT: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_GUEST,"diskstat").as_ref() , "Disks statistics in system.", &["disk","item"]).unwrap();
+    static ref GUEST_DISKSTAT: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"diskstat"), "Disks statistics in system."), &["disk","item"]).unwrap();
 
-    static ref     GUEST_MEMINFO: GaugeVec =
-    prometheus::register_gauge_vec!(format!("{}_{}",NAMESPACE_KATA_GUEST,"meminfo").as_ref() , "Statistics about memory usage in the system.", &["item"]).unwrap();
+    static ref GUEST_MEMINFO: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"meminfo"), "Statistics about memory usage in the system."), &["item"]).unwrap();
 }
 
+#[instrument]
 pub fn get_metrics(_: &protocols::agent::GetMetricsRequest) -> Result<String> {
+    let mut registered = REGISTERED
+        .lock()
+        .map_err(|e| anyhow!("failed to check agent metrics register status {:?}", e))?;
+
+    if !(*registered) {
+        register_metrics()?;
+        *registered = true;
+    }
+
     AGENT_SCRAPE_COUNT.inc();
 
     // update agent process metrics
-    update_agent_metrics();
+    update_agent_metrics()?;
 
     // update guest os metrics
     update_guest_metrics();
 
     // gather all metrics and return as a String
-    let metric_families = prometheus::gather();
+    let metric_families = REGISTRY.gather();
 
     let mut buffer = Vec::new();
     let encoder = TextEncoder::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
+    encoder.encode(&metric_families, &mut buffer)?;
 
-    Ok(String::from_utf8(buffer).unwrap())
+    Ok(String::from_utf8(buffer)?)
 }
 
-fn update_agent_metrics() {
+#[instrument]
+fn register_metrics() -> Result<()> {
+    REGISTRY.register(Box::new(AGENT_SCRAPE_COUNT.clone()))?;
+
+    // agent metrics
+    REGISTRY.register(Box::new(AGENT_THREADS.clone()))?;
+    REGISTRY.register(Box::new(AGENT_TOTAL_TIME.clone()))?;
+    REGISTRY.register(Box::new(AGENT_TOTAL_VM.clone()))?;
+    REGISTRY.register(Box::new(AGENT_TOTAL_RSS.clone()))?;
+    REGISTRY.register(Box::new(AGENT_PROC_STATUS.clone()))?;
+    REGISTRY.register(Box::new(AGENT_IO_STAT.clone()))?;
+    REGISTRY.register(Box::new(AGENT_PROC_STAT.clone()))?;
+
+    // guest metrics
+    REGISTRY.register(Box::new(GUEST_LOAD.clone()))?;
+    REGISTRY.register(Box::new(GUEST_TASKS.clone()))?;
+    REGISTRY.register(Box::new(GUEST_CPU_TIME.clone()))?;
+    REGISTRY.register(Box::new(GUEST_VM_STAT.clone()))?;
+    REGISTRY.register(Box::new(GUEST_NETDEV_STAT.clone()))?;
+    REGISTRY.register(Box::new(GUEST_DISKSTAT.clone()))?;
+    REGISTRY.register(Box::new(GUEST_MEMINFO.clone()))?;
+
+    Ok(())
+}
+
+#[instrument]
+fn update_agent_metrics() -> Result<()> {
     let me = procfs::process::Process::myself();
 
-    if let Err(err) = me {
-        error!(sl!(), "failed to create process instance: {:?}", err);
-        return;
-    }
+    let me = match me {
+        Ok(p) => p,
+        Err(e) => {
+            // FIXME: return Ok for all errors?
+            warn!(sl(), "failed to create process instance: {:?}", e);
 
-    let me = me.unwrap();
+            return Ok(());
+        }
+    };
 
-    let tps = procfs::ticks_per_second().unwrap();
+    let tps = procfs::ticks_per_second()?;
 
     // process total time
     AGENT_TOTAL_TIME.set((me.stat.utime + me.stat.stime) as f64 / (tps as f64));
@@ -106,13 +152,13 @@ fn update_agent_metrics() {
     AGENT_TOTAL_VM.set(me.stat.vsize as f64);
 
     // Total resident set
-    let page_size = procfs::page_size().unwrap() as f64;
+    let page_size = procfs::page_size()? as f64;
     AGENT_TOTAL_RSS.set(me.stat.rss as f64 * page_size);
 
     // io
     match me.io() {
         Err(err) => {
-            info!(sl!(), "failed to get process io stat: {:?}", err);
+            info!(sl(), "failed to get process io stat: {:?}", err);
         }
         Ok(io) => {
             set_gauge_vec_proc_io(&AGENT_IO_STAT, &io);
@@ -121,7 +167,7 @@ fn update_agent_metrics() {
 
     match me.stat() {
         Err(err) => {
-            info!(sl!(), "failed to get process stat: {:?}", err);
+            info!(sl(), "failed to get process stat: {:?}", err);
         }
         Ok(stat) => {
             set_gauge_vec_proc_stat(&AGENT_PROC_STAT, &stat);
@@ -129,18 +175,19 @@ fn update_agent_metrics() {
     }
 
     match me.status() {
-        Err(err) => {
-            info!(sl!(), "failed to get process status: {:?}", err);
-        }
+        Err(err) => error!(sl(), "failed to get process status: {:?}", err),
         Ok(status) => set_gauge_vec_proc_status(&AGENT_PROC_STATUS, &status),
     }
+
+    Ok(())
 }
 
+#[instrument]
 fn update_guest_metrics() {
     // try get load and task info
     match procfs::LoadAverage::new() {
         Err(err) => {
-            info!(sl!(), "failed to get guest LoadAverage: {:?}", err);
+            info!(sl(), "failed to get guest LoadAverage: {:?}", err);
         }
         Ok(load) => {
             GUEST_LOAD
@@ -160,7 +207,7 @@ fn update_guest_metrics() {
     // try to get disk stats
     match procfs::diskstats() {
         Err(err) => {
-            info!(sl!(), "failed to get guest diskstats: {:?}", err);
+            info!(sl(), "failed to get guest diskstats: {:?}", err);
         }
         Ok(diskstats) => {
             for diskstat in diskstats {
@@ -172,7 +219,7 @@ fn update_guest_metrics() {
     // try to get vm stats
     match procfs::vmstat() {
         Err(err) => {
-            info!(sl!(), "failed to get guest vmstat: {:?}", err);
+            info!(sl(), "failed to get guest vmstat: {:?}", err);
         }
         Ok(vmstat) => {
             for (k, v) in vmstat {
@@ -184,12 +231,12 @@ fn update_guest_metrics() {
     // cpu stat
     match procfs::KernelStats::new() {
         Err(err) => {
-            info!(sl!(), "failed to get guest KernelStats: {:?}", err);
+            info!(sl(), "failed to get guest KernelStats: {:?}", err);
         }
         Ok(kernel_stats) => {
             set_gauge_vec_cpu_time(&GUEST_CPU_TIME, "total", &kernel_stats.total);
             for (i, cpu_time) in kernel_stats.cpu_time.iter().enumerate() {
-                set_gauge_vec_cpu_time(&GUEST_CPU_TIME, format!("{}", i).as_str(), &cpu_time);
+                set_gauge_vec_cpu_time(&GUEST_CPU_TIME, format!("{}", i).as_str(), cpu_time);
             }
         }
     }
@@ -197,7 +244,7 @@ fn update_guest_metrics() {
     // try to get net device stats
     match procfs::net::dev_status() {
         Err(err) => {
-            info!(sl!(), "failed to get guest net::dev_status: {:?}", err);
+            info!(sl(), "failed to get guest net::dev_status: {:?}", err);
         }
         Ok(devs) => {
             // netdev: map[string]procfs::net::DeviceStatus
@@ -210,7 +257,7 @@ fn update_guest_metrics() {
     // get statistics about memory from /proc/meminfo
     match procfs::Meminfo::new() {
         Err(err) => {
-            info!(sl!(), "failed to get guest Meminfo: {:?}", err);
+            info!(sl(), "failed to get guest Meminfo: {:?}", err);
         }
         Ok(meminfo) => {
             set_gauge_vec_meminfo(&GUEST_MEMINFO, &meminfo);
@@ -218,6 +265,7 @@ fn update_guest_metrics() {
     }
 }
 
+#[instrument]
 fn set_gauge_vec_meminfo(gv: &prometheus::GaugeVec, meminfo: &procfs::Meminfo) {
     gv.with_label_values(&["mem_total"])
         .set(meminfo.mem_total as f64);
@@ -332,29 +380,31 @@ fn set_gauge_vec_meminfo(gv: &prometheus::GaugeVec, meminfo: &procfs::Meminfo) {
         .set(meminfo.k_reclaimable.unwrap_or(0) as f64);
 }
 
+#[instrument]
 fn set_gauge_vec_cpu_time(gv: &prometheus::GaugeVec, cpu: &str, cpu_time: &procfs::CpuTime) {
     gv.with_label_values(&[cpu, "user"])
-        .set(cpu_time.user as f64);
+        .set(cpu_time.user_ms() as f64);
     gv.with_label_values(&[cpu, "nice"])
-        .set(cpu_time.nice as f64);
+        .set(cpu_time.nice_ms() as f64);
     gv.with_label_values(&[cpu, "system"])
-        .set(cpu_time.system as f64);
+        .set(cpu_time.system_ms() as f64);
     gv.with_label_values(&[cpu, "idle"])
-        .set(cpu_time.idle as f64);
+        .set(cpu_time.idle_ms() as f64);
     gv.with_label_values(&[cpu, "iowait"])
-        .set(cpu_time.iowait.unwrap_or(0.0) as f64);
+        .set(cpu_time.iowait_ms().unwrap_or(0) as f64);
     gv.with_label_values(&[cpu, "irq"])
-        .set(cpu_time.irq.unwrap_or(0.0) as f64);
+        .set(cpu_time.irq_ms().unwrap_or(0) as f64);
     gv.with_label_values(&[cpu, "softirq"])
-        .set(cpu_time.softirq.unwrap_or(0.0) as f64);
+        .set(cpu_time.softirq_ms().unwrap_or(0) as f64);
     gv.with_label_values(&[cpu, "steal"])
-        .set(cpu_time.steal.unwrap_or(0.0) as f64);
+        .set(cpu_time.steal_ms().unwrap_or(0) as f64);
     gv.with_label_values(&[cpu, "guest"])
-        .set(cpu_time.guest.unwrap_or(0.0) as f64);
+        .set(cpu_time.guest_ms().unwrap_or(0) as f64);
     gv.with_label_values(&[cpu, "guest_nice"])
-        .set(cpu_time.guest_nice.unwrap_or(0.0) as f64);
+        .set(cpu_time.guest_nice_ms().unwrap_or(0) as f64);
 }
 
+#[instrument]
 fn set_gauge_vec_diskstat(gv: &prometheus::GaugeVec, diskstat: &procfs::DiskStat) {
     gv.with_label_values(&[diskstat.name.as_str(), "reads"])
         .set(diskstat.reads as f64);
@@ -393,6 +443,7 @@ fn set_gauge_vec_diskstat(gv: &prometheus::GaugeVec, diskstat: &procfs::DiskStat
 }
 
 // set_gauge_vec_netdev set gauge for NetDevLine
+#[instrument]
 fn set_gauge_vec_netdev(gv: &prometheus::GaugeVec, status: &procfs::net::DeviceStatus) {
     gv.with_label_values(&[status.name.as_str(), "recv_bytes"])
         .set(status.recv_bytes as f64);
@@ -429,6 +480,7 @@ fn set_gauge_vec_netdev(gv: &prometheus::GaugeVec, status: &procfs::net::DeviceS
 }
 
 // set_gauge_vec_proc_status set gauge for ProcStatus
+#[instrument]
 fn set_gauge_vec_proc_status(gv: &prometheus::GaugeVec, status: &procfs::process::Status) {
     gv.with_label_values(&["vmpeak"])
         .set(status.vmpeak.unwrap_or(0) as f64);
@@ -461,7 +513,7 @@ fn set_gauge_vec_proc_status(gv: &prometheus::GaugeVec, status: &procfs::process
     gv.with_label_values(&["vmswap"])
         .set(status.vmswap.unwrap_or(0) as f64);
     gv.with_label_values(&["hugetlbpages"])
-        .set(status.hugetblpages.unwrap_or(0) as f64);
+        .set(status.hugetlbpages.unwrap_or(0) as f64);
     gv.with_label_values(&["voluntary_ctxt_switches"])
         .set(status.voluntary_ctxt_switches.unwrap_or(0) as f64);
     gv.with_label_values(&["nonvoluntary_ctxt_switches"])
@@ -469,6 +521,7 @@ fn set_gauge_vec_proc_status(gv: &prometheus::GaugeVec, status: &procfs::process
 }
 
 // set_gauge_vec_proc_io set gauge for ProcIO
+#[instrument]
 fn set_gauge_vec_proc_io(gv: &prometheus::GaugeVec, io_stat: &procfs::process::Io) {
     gv.with_label_values(&["rchar"]).set(io_stat.rchar as f64);
     gv.with_label_values(&["wchar"]).set(io_stat.wchar as f64);
@@ -483,6 +536,7 @@ fn set_gauge_vec_proc_io(gv: &prometheus::GaugeVec, io_stat: &procfs::process::I
 }
 
 // set_gauge_vec_proc_stat set gauge for ProcStat
+#[instrument]
 fn set_gauge_vec_proc_stat(gv: &prometheus::GaugeVec, stat: &procfs::process::Stat) {
     gv.with_label_values(&["utime"]).set(stat.utime as f64);
     gv.with_label_values(&["stime"]).set(stat.stime as f64);

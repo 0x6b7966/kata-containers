@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright (c) 2018 Intel Corporation
 #
@@ -15,7 +15,7 @@ script_name="$(basename "${BASH_SOURCE[0]}")"
 OWNER=${OWNER:-"kata-containers"}
 PROJECT="Kata Containers"
 PUSH="${PUSH:-"false"}"
-branch="master"
+branch="main"
 readonly URL_RAW_FILE="https://raw.githubusercontent.com/${OWNER}"
 #The runtime version is used as reference of latest release
 # This is set to the right value later.
@@ -27,16 +27,16 @@ source "${script_dir}/../scripts/lib.sh"
 
 function usage() {
 
-	cat <<EOT
+	cat <<EOF
 Usage: ${script_name} [options] <args>
 This script creates a new release for ${PROJECT}.
 It tags and create release for:
-EOT
+EOF
 	for r in "${repos[@]}"; do
 		echo "  - ${r}"
 	done
 
-	cat <<EOT
+	cat <<EOF
 
 Args:
 status : Get Current ${PROJECT} tags status
@@ -48,7 +48,7 @@ Options:
 -h         : Show this help
 -p         : push tags
 
-EOT
+EOF
 
 }
 
@@ -134,9 +134,9 @@ tag_repos() {
 
 		do_tag "${tag}"
 
-		if [ "${branch}" == "master" ]; then
+		if [ "${branch}" == "main" ]; then
 			if echo "${tag}" | grep -oP '.*-rc0$'; then
-				info "This is a rc0 for master - creating stable branch"
+				info "This is a rc0 for main - creating stable branch"
 				stable_branch=$(echo ${tag} | awk 'BEGIN{FS=OFS="."}{print $1 "." $2}')
 				stable_branch="stable-${stable_branch}"
 				info "creating branch ${stable_branch} for ${repo}"

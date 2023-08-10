@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -6,19 +8,21 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/drivers"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
+	resCtrl "github.com/kata-containers/kata-containers/src/runtime/pkg/resourcecontrol"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/safchain/ethtool"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 )
+
+var physicalTrace = getNetworkTrace(PhysicalEndpointType)
 
 // PhysicalEndpoint gathers a physical network interface and its properties
 type PhysicalEndpoint struct {
@@ -74,7 +78,10 @@ func (endpoint *PhysicalEndpoint) NetworkPair() *NetworkInterfacePair {
 
 // Attach for physical endpoint binds the physical network interface to
 // vfio-pci and adds device to the hypervisor with vfio-passthrough.
-func (endpoint *PhysicalEndpoint) Attach(s *Sandbox) error {
+func (endpoint *PhysicalEndpoint) Attach(ctx context.Context, s *Sandbox) error {
+	span, ctx := physicalTrace(ctx, "Attach", endpoint)
+	defer span.End()
+
 	// Unbind physical interface from host driver and bind to vfio
 	// so that it can be passed to qemu.
 	vfioPath, err := bindNICToVFIO(endpoint)
@@ -82,26 +89,29 @@ func (endpoint *PhysicalEndpoint) Attach(s *Sandbox) error {
 		return err
 	}
 
-	c, err := cgroups.DeviceToCgroupDevice(vfioPath)
+	c, err := resCtrl.DeviceToCgroupDeviceRule(vfioPath)
 	if err != nil {
 		return err
 	}
 
 	d := config.DeviceInfo{
-		ContainerPath: c.Path,
+		ContainerPath: vfioPath,
 		DevType:       string(c.Type),
 		Major:         c.Major,
 		Minor:         c.Minor,
 		ColdPlug:      true,
 	}
 
-	_, err = s.AddDevice(d)
+	_, err = s.AddDevice(ctx, d)
 	return err
 }
 
 // Detach for physical endpoint unbinds the physical network interface from vfio-pci
 // and binds it back to the saved host driver.
-func (endpoint *PhysicalEndpoint) Detach(netNsCreated bool, netNsPath string) error {
+func (endpoint *PhysicalEndpoint) Detach(ctx context.Context, netNsCreated bool, netNsPath string) error {
+	span, _ := physicalTrace(ctx, "Detach", endpoint)
+	defer span.End()
+
 	// Bind back the physical network interface to host.
 	// We need to do this even if a new network namespace has not
 	// been created by virtcontainers.
@@ -112,12 +122,12 @@ func (endpoint *PhysicalEndpoint) Detach(netNsCreated bool, netNsPath string) er
 }
 
 // HotAttach for physical endpoint not supported yet
-func (endpoint *PhysicalEndpoint) HotAttach(h hypervisor) error {
+func (endpoint *PhysicalEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
 	return fmt.Errorf("PhysicalEndpoint does not support Hot attach")
 }
 
 // HotDetach for physical endpoint not supported yet
-func (endpoint *PhysicalEndpoint) HotDetach(h hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *PhysicalEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
 	return fmt.Errorf("PhysicalEndpoint does not support Hot detach")
 }
 
@@ -176,7 +186,7 @@ func createPhysicalEndpoint(netInfo NetworkInfo) (*PhysicalEndpoint, error) {
 	// Get vendor and device id from pci space (sys/bus/pci/devices/$bdf)
 
 	ifaceDevicePath := filepath.Join(sysPCIDevicesPath, bdf, "device")
-	contents, err := ioutil.ReadFile(ifaceDevicePath)
+	contents, err := os.ReadFile(ifaceDevicePath)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +195,7 @@ func createPhysicalEndpoint(netInfo NetworkInfo) (*PhysicalEndpoint, error) {
 
 	// Vendor id
 	ifaceVendorPath := filepath.Join(sysPCIDevicesPath, bdf, "vendor")
-	contents, err = ioutil.ReadFile(ifaceVendorPath)
+	contents, err = os.ReadFile(ifaceVendorPath)
 	if err != nil {
 		return nil, err
 	}

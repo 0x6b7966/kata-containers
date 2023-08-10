@@ -3,12 +3,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-OS_VERSION=${OS_VERSION:-9.5}
+OS_VERSION=${OS_VERSION:-10.11}
 
 # Set OS_NAME to the desired debian "codename"
 OS_NAME=${OS_NAME:-"stretch"}
 
-PACKAGES="systemd iptables init chrony kmod"
+PACKAGES="systemd coreutils init iptables chrony kmod"
 
 # NOTE: Re-using ubuntu rootfs configuration, see 'ubuntu' folder for full content.
 source $script_dir/ubuntu/$CONFIG_SH

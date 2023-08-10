@@ -1,6 +1,7 @@
 package netlink
 
 import (
+	"fmt"
 	"net"
 	"syscall"
 	"unsafe"
@@ -20,7 +21,14 @@ const (
 	NDA_PORT
 	NDA_VNI
 	NDA_IFINDEX
-	NDA_MAX = NDA_IFINDEX
+	NDA_MASTER
+	NDA_LINK_NETNSID
+	NDA_SRC_VNI
+	NDA_PROTOCOL
+	NDA_NH_ID
+	NDA_FDB_EXT_ATTRS
+	NDA_FLAGS_EXT
+	NDA_MAX = NDA_FLAGS_EXT
 )
 
 // Neighbor Cache Entry States.
@@ -38,11 +46,19 @@ const (
 
 // Neighbor Flags
 const (
-	NTF_USE    = 0x01
-	NTF_SELF   = 0x02
-	NTF_MASTER = 0x04
-	NTF_PROXY  = 0x08
-	NTF_ROUTER = 0x80
+	NTF_USE         = 0x01
+	NTF_SELF        = 0x02
+	NTF_MASTER      = 0x04
+	NTF_PROXY       = 0x08
+	NTF_EXT_LEARNED = 0x10
+	NTF_OFFLOADED   = 0x20
+	NTF_STICKY      = 0x40
+	NTF_ROUTER      = 0x80
+)
+
+// Extended Neighbor Flags
+const (
+	NTF_EXT_MANAGED = 0x00000001
 )
 
 // Ndmsg is for adding, removing or receiving information about a neighbor table entry
@@ -158,9 +174,14 @@ func neighHandle(neigh *Neigh, req *nl.NetlinkRequest) error {
 	if neigh.LLIPAddr != nil {
 		llIPData := nl.NewRtAttr(NDA_LLADDR, neigh.LLIPAddr.To4())
 		req.AddData(llIPData)
-	} else if neigh.Flags != NTF_PROXY || neigh.HardwareAddr != nil {
+	} else if neigh.HardwareAddr != nil {
 		hwData := nl.NewRtAttr(NDA_LLADDR, []byte(neigh.HardwareAddr))
 		req.AddData(hwData)
+	}
+
+	if neigh.FlagsExt != 0 {
+		flagsExtData := nl.NewRtAttr(NDA_FLAGS_EXT, nl.Uint32Attr(uint32(neigh.FlagsExt)))
+		req.AddData(flagsExtData)
 	}
 
 	if neigh.Vlan != 0 {
@@ -171,6 +192,11 @@ func neighHandle(neigh *Neigh, req *nl.NetlinkRequest) error {
 	if neigh.VNI != 0 {
 		vniData := nl.NewRtAttr(NDA_VNI, nl.Uint32Attr(uint32(neigh.VNI)))
 		req.AddData(vniData)
+	}
+
+	if neigh.MasterIndex != 0 {
+		masterData := nl.NewRtAttr(NDA_MASTER, nl.Uint32Attr(uint32(neigh.MasterIndex)))
+		req.AddData(masterData)
 	}
 
 	_, err := req.Execute(unix.NETLINK_ROUTE, 0)
@@ -234,6 +260,18 @@ func (h *Handle) NeighListExecute(msg Ndmsg) ([]Neigh, error) {
 			// Ignore messages from other interfaces
 			continue
 		}
+		if msg.Family != 0 && ndm.Family != msg.Family {
+			continue
+		}
+		if msg.State != 0 && ndm.State != msg.State {
+			continue
+		}
+		if msg.Type != 0 && ndm.Type != msg.Type {
+			continue
+		}
+		if msg.Flags != 0 && ndm.Flags != msg.Flags {
+			continue
+		}
 
 		neigh, err := NeighDeserialize(m)
 		if err != nil {
@@ -284,10 +322,14 @@ func NeighDeserialize(m []byte) (*Neigh, error) {
 			} else {
 				neigh.HardwareAddr = net.HardwareAddr(attr.Value)
 			}
+		case NDA_FLAGS_EXT:
+			neigh.FlagsExt = int(native.Uint32(attr.Value[0:4]))
 		case NDA_VLAN:
 			neigh.Vlan = int(native.Uint16(attr.Value[0:2]))
 		case NDA_VNI:
 			neigh.VNI = int(native.Uint32(attr.Value[0:4]))
+		case NDA_MASTER:
+			neigh.MasterIndex = int(native.Uint32(attr.Value[0:4]))
 		}
 	}
 
@@ -327,6 +369,16 @@ func NeighSubscribeWithOptions(ch chan<- NeighUpdate, done <-chan struct{}, opti
 
 func neighSubscribeAt(newNs, curNs netns.NsHandle, ch chan<- NeighUpdate, done <-chan struct{}, cberr func(error), listExisting bool) error {
 	s, err := nl.SubscribeAt(newNs, curNs, unix.NETLINK_ROUTE, unix.RTNLGRP_NEIGH)
+	makeRequest := func(family int) error {
+		req := pkgHandle.newNetlinkRequest(unix.RTM_GETNEIGH,
+			unix.NLM_F_DUMP)
+		infmsg := nl.NewIfInfomsg(family)
+		req.AddData(infmsg)
+		if err := s.Send(req); err != nil {
+			return err
+		}
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -337,30 +389,44 @@ func neighSubscribeAt(newNs, curNs netns.NsHandle, ch chan<- NeighUpdate, done <
 		}()
 	}
 	if listExisting {
-		req := pkgHandle.newNetlinkRequest(unix.RTM_GETNEIGH,
-			unix.NLM_F_DUMP)
-		infmsg := nl.NewIfInfomsg(unix.AF_UNSPEC)
-		req.AddData(infmsg)
-		if err := s.Send(req); err != nil {
+		if err := makeRequest(unix.AF_UNSPEC); err != nil {
 			return err
 		}
+		// We have to wait for NLMSG_DONE before making AF_BRIDGE request
 	}
 	go func() {
 		defer close(ch)
 		for {
-			msgs, err := s.Receive()
+			msgs, from, err := s.Receive()
 			if err != nil {
 				if cberr != nil {
 					cberr(err)
 				}
 				return
 			}
+			if from.Pid != nl.PidKernel {
+				if cberr != nil {
+					cberr(fmt.Errorf("Wrong sender portid %d, expected %d", from.Pid, nl.PidKernel))
+				}
+				continue
+			}
 			for _, m := range msgs {
 				if m.Header.Type == unix.NLMSG_DONE {
+					if listExisting {
+						// This will be called after handling AF_UNSPEC
+						// list request, we have to wait for NLMSG_DONE
+						// before making another request
+						if err := makeRequest(unix.AF_BRIDGE); err != nil {
+							if cberr != nil {
+								cberr(err)
+							}
+							return
+						}
+						listExisting = false
+					}
 					continue
 				}
 				if m.Header.Type == unix.NLMSG_ERROR {
-					native := nl.NativeEndian()
 					error := int32(native.Uint32(m.Data[0:4]))
 					if error == 0 {
 						continue

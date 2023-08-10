@@ -10,9 +10,9 @@ import (
 	"io"
 	"syscall"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -20,6 +20,7 @@ import (
 )
 
 // Sandbox is a fake Sandbox type used for testing
+// nolint: govet
 type Sandbox struct {
 	MockID          string
 	MockURL         string
@@ -53,7 +54,6 @@ type Sandbox struct {
 	EnterContainerFunc       func(containerID string, cmd types.Cmd) (vc.VCContainer, *vc.Process, error)
 	MonitorFunc              func() (chan error, error)
 	UpdateContainerFunc      func(containerID string, resources specs.LinuxResources) error
-	ProcessListContainerFunc func(containerID string, options vc.ProcessListOptions) (vc.ProcessList, error)
 	WaitProcessFunc          func(containerID, processID string) (int32, error)
 	SignalProcessFunc        func(containerID, processID string, signal syscall.Signal, all bool) error
 	WinsizeProcessFunc       func(containerID, processID string, height, width uint32) error
@@ -71,6 +71,7 @@ type Sandbox struct {
 }
 
 // Container is a fake Container type used for testing
+// nolint: govet
 type Container struct {
 	MockID          string
 	MockURL         string
@@ -87,6 +88,6 @@ type VCMock struct {
 	SetLoggerFunc  func(ctx context.Context, logger *logrus.Entry)
 	SetFactoryFunc func(ctx context.Context, factory vc.Factory)
 
-	CreateSandboxFunc    func(ctx context.Context, sandboxConfig vc.SandboxConfig) (vc.VCSandbox, error)
+	CreateSandboxFunc    func(ctx context.Context, sandboxConfig vc.SandboxConfig, hookFunc func(context.Context) error) (vc.VCSandbox, error)
 	CleanupContainerFunc func(ctx context.Context, sandboxID, containerID string, force bool) error
 }

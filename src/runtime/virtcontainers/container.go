@@ -1,4 +1,3 @@
-// +build linux
 // Copyright (c) 2016 Intel Corporation
 // Copyright (c) 2014,2015,2016,2017 Docker, Inc.
 // SPDX-License-Identifier: Apache-2.0
@@ -8,31 +7,36 @@ package virtcontainers
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/manager"
-	vccgroups "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/manager"
+	deviceManager "github.com/kata-containers/kata-containers/src/runtime/pkg/device/manager"
+	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
+	vcAnnotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
-	"go.opentelemetry.io/otel"
-	otelLabel "go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 
-	"github.com/containerd/cgroups"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
+
+// tracingTags defines tags for the trace span
+var containerTracingTags = map[string]string{
+	"source":    "runtime",
+	"package":   "virtcontainers",
+	"subsystem": "container",
+}
 
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/major.h
 // This file has definitions for major device numbers.
@@ -59,6 +63,8 @@ const floppyMajor = int64(2)
 
 // Process gathers data related to a container process.
 type Process struct {
+	StartTime time.Time
+
 	// Token is the process execution context ID. It must be
 	// unique per sandbox.
 	// Token is used to manipulate processes for containers
@@ -70,23 +76,23 @@ type Process struct {
 	// stack, e.g. CRI-O, containerd. This is typically the
 	// shim PID.
 	Pid int
-
-	StartTime time.Time
 }
 
 // ContainerStatus describes a container status.
 type ContainerStatus struct {
-	ID        string
-	State     types.ContainerState
-	PID       int
-	StartTime time.Time
-	RootFs    string
-	Spec      *specs.Spec
+	Spec *specs.Spec
 
 	// Annotations allow clients to store arbitrary values,
 	// for example to add additional status values required
 	// to support particular specifications.
 	Annotations map[string]string
+
+	ID        string
+	RootFs    string
+	StartTime time.Time
+	State     types.ContainerState
+
+	PID int
 }
 
 // ThrottlingData gather the date related to container cpu throttling.
@@ -102,12 +108,12 @@ type ThrottlingData struct {
 // CPUUsage denotes the usage of a CPU.
 // All CPU stats are aggregate since container inception.
 type CPUUsage struct {
-	// Total CPU time consumed.
-	// Units: nanoseconds.
-	TotalUsage uint64 `json:"total_usage,omitempty"`
 	// Total CPU time consumed per core.
 	// Units: nanoseconds.
 	PercpuUsage []uint64 `json:"percpu_usage,omitempty"`
+	// Total CPU time consumed.
+	// Units: nanoseconds.
+	TotalUsage uint64 `json:"total_usage,omitempty"`
 	// Time spent by tasks of the cgroup in kernel mode.
 	// Units: nanoseconds.
 	UsageInKernelmode uint64 `json:"usage_in_kernelmode"`
@@ -132,8 +138,7 @@ type MemoryData struct {
 
 // MemoryStats describes the memory stats
 type MemoryStats struct {
-	// memory used for cache
-	Cache uint64 `json:"cache,omitempty"`
+	Stats map[string]uint64 `json:"stats,omitempty"`
 	// usage of memory
 	Usage MemoryData `json:"usage,omitempty"`
 	// usage of memory  swap
@@ -142,10 +147,10 @@ type MemoryStats struct {
 	KernelUsage MemoryData `json:"kernel_usage,omitempty"`
 	// usage of kernel TCP memory
 	KernelTCPUsage MemoryData `json:"kernel_tcp_usage,omitempty"`
+	// memory used for cache
+	Cache uint64 `json:"cache,omitempty"`
 	// if true, memory usage is accounted for throughout a hierarchy of cgroups.
 	UseHierarchy bool `json:"use_hierarchy"`
-
-	Stats map[string]uint64 `json:"stats,omitempty"`
 }
 
 // PidsStats describes the pids stats
@@ -158,9 +163,9 @@ type PidsStats struct {
 
 // BlkioStatEntry gather date related to a block device
 type BlkioStatEntry struct {
+	Op    string `json:"op,omitempty"`
 	Major uint64 `json:"major,omitempty"`
 	Minor uint64 `json:"minor,omitempty"`
-	Op    string `json:"op,omitempty"`
 	Value uint64 `json:"value,omitempty"`
 }
 
@@ -189,12 +194,12 @@ type HugetlbStats struct {
 
 // CgroupStats describes all cgroup subsystem stats
 type CgroupStats struct {
-	CPUStats    CPUStats    `json:"cpu_stats,omitempty"`
-	MemoryStats MemoryStats `json:"memory_stats,omitempty"`
-	PidsStats   PidsStats   `json:"pids_stats,omitempty"`
-	BlkioStats  BlkioStats  `json:"blkio_stats,omitempty"`
 	// the map is in the format "size of hugepage: stats of the hugepage"
 	HugetlbStats map[string]HugetlbStats `json:"hugetlb_stats,omitempty"`
+	BlkioStats   BlkioStats              `json:"blkio_stats,omitempty"`
+	CPUStats     CPUStats                `json:"cpu_stats,omitempty"`
+	MemoryStats  MemoryStats             `json:"memory_stats,omitempty"`
+	PidsStats    PidsStats               `json:"pids_stats,omitempty"`
 }
 
 // NetworkStats describe all network stats.
@@ -229,32 +234,32 @@ type ContainerResources struct {
 
 // ContainerConfig describes one container runtime configuration.
 type ContainerConfig struct {
-	ID string
+	// Device configuration for devices that must be available within the container.
+	DeviceInfos []config.DeviceInfo
 
-	// RootFs is the container workload image on the host.
-	RootFs RootFs
+	Mounts []Mount
 
-	// ReadOnlyRootfs indicates if the rootfs should be mounted readonly
-	ReadonlyRootfs bool
-
-	// Cmd specifies the command to run on a container
-	Cmd types.Cmd
+	// Raw OCI specification, it won't be saved to disk.
+	CustomSpec *specs.Spec `json:"-"`
 
 	// Annotations allow clients to store arbitrary values,
 	// for example to add additional status values required
 	// to support particular specifications.
 	Annotations map[string]string
 
-	Mounts []Mount
-
-	// Device configuration for devices that must be available within the container.
-	DeviceInfos []config.DeviceInfo
+	ID string
 
 	// Resources container resources
 	Resources specs.LinuxResources
 
-	// Raw OCI specification, it won't be saved to disk.
-	CustomSpec *specs.Spec `json:"-"`
+	// Cmd specifies the command to run on a container
+	Cmd types.Cmd
+
+	// RootFs is the container workload image on the host.
+	RootFs RootFs
+
+	// ReadOnlyRootfs indicates if the rootfs should be mounted readonly
+	ReadonlyRootfs bool
 }
 
 // valid checks that the container configuration is valid.
@@ -315,29 +320,27 @@ type RootFs struct {
 // Container is composed of a set of containers and a runtime environment.
 // A Container can be created, deleted, started, stopped, listed, entered, paused and restored.
 type Container struct {
-	id        string
-	sandboxID string
+	ctx context.Context
 
-	rootFs RootFs
-
-	config *ContainerConfig
-
+	config  *ContainerConfig
 	sandbox *Sandbox
 
+	id            string
+	sandboxID     string
 	containerPath string
 	rootfsSuffix  string
-
-	state types.ContainerState
-
-	process Process
 
 	mounts []Mount
 
 	devices []ContainerDevice
 
-	systemMountsInfo SystemMountsInfo
+	state types.ContainerState
 
-	ctx context.Context
+	process Process
+
+	rootFs RootFs
+
+	systemMountsInfo SystemMountsInfo
 }
 
 // ID returns the container identifier string.
@@ -350,20 +353,8 @@ func (c *Container) Logger() *logrus.Entry {
 	return virtLog.WithFields(logrus.Fields{
 		"subsystem": "container",
 		"sandbox":   c.sandboxID,
+		"container": c.id,
 	})
-}
-
-func (c *Container) trace(name string) (otelTrace.Span, context.Context) {
-	if c.ctx == nil {
-		c.Logger().WithField("type", "bug").Error("trace called before context set")
-		c.ctx = context.Background()
-	}
-
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(c.ctx, name)
-	span.SetAttributes(otelLabel.Key("subsystem").String("container"))
-
-	return span, ctx
 }
 
 // Sandbox returns the sandbox handler related to this container.
@@ -401,7 +392,7 @@ func (c *Container) GetAnnotations() map[string]string {
 // This OCI specification was patched when the sandbox was created
 // by containerCapabilities(), SetEphemeralStorageType() and others
 // in order to support:
-// * capabilities
+// * Capabilities
 // * Ephemeral storage
 // * k8s empty dir
 // If you need the original (vanilla) OCI spec,
@@ -410,19 +401,11 @@ func (c *Container) GetPatchedOCISpec() *specs.Spec {
 	return c.config.CustomSpec
 }
 
-// storeContainer stores a container config.
-func (c *Container) storeContainer() error {
-	if err := c.sandbox.Save(); err != nil {
-		return err
-	}
-	return nil
-}
-
 // setContainerState sets both the in-memory and on-disk state of the
 // container.
 func (c *Container) setContainerState(state types.StateString) error {
 	if state == "" {
-		return vcTypes.ErrNeedState
+		return types.ErrNeedState
 	}
 
 	c.Logger().Debugf("Setting container state from %v to %v", c.state.State, state)
@@ -437,74 +420,21 @@ func (c *Container) setContainerState(state types.StateString) error {
 	return nil
 }
 
-func (c *Container) shareFiles(m Mount, idx int, hostSharedDir, hostMountDir, guestSharedDir string) (string, bool, error) {
-	randBytes, err := utils.GenerateRandomBytes(8)
-	if err != nil {
-		return "", false, err
-	}
-
-	filename := fmt.Sprintf("%s-%s-%s", c.id, hex.EncodeToString(randBytes), filepath.Base(m.Destination))
-	guestDest := filepath.Join(guestSharedDir, filename)
-
-	// copy file to contaier's rootfs if filesystem sharing is not supported, otherwise
-	// bind mount it in the shared directory.
-	caps := c.sandbox.hypervisor.capabilities()
-	if !caps.IsFsSharingSupported() {
-		c.Logger().Debug("filesystem sharing is not supported, files will be copied")
-
-		fileInfo, err := os.Stat(m.Source)
-		if err != nil {
-			return "", false, err
-		}
-
-		// Ignore the mount if this is not a regular file (excludes
-		// directory, socket, device, ...) as it cannot be handled by
-		// a simple copy. But this should not be treated as an error,
-		// only as a limitation.
-		if !fileInfo.Mode().IsRegular() {
-			c.Logger().WithField("ignored-file", m.Source).Debug("Ignoring non-regular file as FS sharing not supported")
-			return "", true, nil
-		}
-
-		if err := c.sandbox.agent.copyFile(m.Source, guestDest); err != nil {
-			return "", false, err
-		}
-	} else {
-		// These mounts are created in the shared dir
-		mountDest := filepath.Join(hostMountDir, filename)
-		if err := bindMount(c.ctx, m.Source, mountDest, m.ReadOnly, "private"); err != nil {
-			return "", false, err
-		}
-		// Save HostPath mount value into the mount list of the container.
-		c.mounts[idx].HostPath = mountDest
-		// bindmount remount event is not propagated to mount subtrees, so we have to remount the shared dir mountpoint directly.
-		if m.ReadOnly {
-			mountDest = filepath.Join(hostSharedDir, filename)
-			if err := remountRo(c.ctx, mountDest); err != nil {
-				return "", false, err
-			}
-		}
-	}
-
-	return guestDest, false, nil
-}
-
 // mountSharedDirMounts handles bind-mounts by bindmounting to the host shared
 // directory which is mounted through virtiofs/9pfs in the VM.
 // It also updates the container mount list with the HostPath info, and store
 // container mounts to the storage. This way, we will have the HostPath info
 // available when we will need to unmount those mounts.
-func (c *Container) mountSharedDirMounts(hostSharedDir, hostMountDir, guestSharedDir string) (sharedDirMounts map[string]Mount, ignoredMounts map[string]Mount, err error) {
-	sharedDirMounts = make(map[string]Mount)
-	ignoredMounts = make(map[string]Mount)
+func (c *Container) mountSharedDirMounts(ctx context.Context, sharedDirMounts, ignoredMounts map[string]Mount) (storages []*grpc.Storage, err error) {
 	var devicesToDetach []string
 	defer func() {
 		if err != nil {
 			for _, id := range devicesToDetach {
-				c.sandbox.devManager.DetachDevice(id, c.sandbox)
+				c.sandbox.devManager.DetachDevice(ctx, id, c.sandbox)
 			}
 		}
 	}()
+
 	for idx, m := range c.mounts {
 		// Skip mounting certain system paths from the source on the host side
 		// into the container as it does not make sense to do so.
@@ -517,8 +447,8 @@ func (c *Container) mountSharedDirMounts(hostSharedDir, hostMountDir, guestShare
 		// instead of passing this as a shared mount:
 		if len(m.BlockDeviceID) > 0 {
 			// Attach this block device, all other devices passed in the config have been attached at this point
-			if err = c.sandbox.devManager.AttachDevice(m.BlockDeviceID, c.sandbox); err != nil {
-				return nil, nil, err
+			if err = c.sandbox.devManager.AttachDevice(ctx, m.BlockDeviceID, c.sandbox); err != nil {
+				return storages, err
 			}
 			devicesToDetach = append(devicesToDetach, m.BlockDeviceID)
 			continue
@@ -543,66 +473,95 @@ func (c *Container) mountSharedDirMounts(hostSharedDir, hostMountDir, guestShare
 			continue
 		}
 
-		var ignore bool
-		var guestDest string
-		guestDest, ignore, err = c.shareFiles(m, idx, hostSharedDir, hostMountDir, guestSharedDir)
+		sharedFile, err := c.sandbox.fsShare.ShareFile(ctx, c, &c.mounts[idx])
 		if err != nil {
-			return nil, nil, err
+			return storages, err
 		}
 
 		// Expand the list of mounts to ignore.
-		if ignore {
+		if sharedFile == nil {
 			ignoredMounts[m.Source] = Mount{Source: m.Source}
 			continue
 		}
-
 		sharedDirMount := Mount{
-			Source:      guestDest,
+			Source:      sharedFile.guestPath,
 			Destination: m.Destination,
 			Type:        m.Type,
 			Options:     m.Options,
 			ReadOnly:    m.ReadOnly,
 		}
 
+		// virtiofs does not support inotify. To workaround this limitation, we want to special case
+		// mounts that are commonly 'watched'. "watchable" mounts include:
+		//  - Kubernetes configmap
+		//  - Kubernetes secret
+		// If we identify one of these, we'll need to carry out polling in the guest in order to present the
+		// container with a mount that supports inotify. To do this, we create a Storage object for
+		// the "watchable-bind" driver. This will have the agent create a new mount that is watchable,
+		// who's effective source is the original mount (the agent will poll the original mount for changes and
+		// manually update the path that is mounted into the container).
+		// Based on this, let's make sure we update the sharedDirMount structure with the new watchable-mount as
+		// the source (this is what is utilized to update the OCI spec).
+		caps := c.sandbox.hypervisor.Capabilities(ctx)
+		if isWatchableMount(m.Source) && caps.IsFsSharingSupported() {
+
+			// Create path in shared directory for creating watchable mount:
+			watchableHostPath := filepath.Join(getMountPath(c.sandboxID), "watchable")
+			if err := os.MkdirAll(watchableHostPath, DirMode); err != nil {
+				return storages, fmt.Errorf("unable to create watchable path: %s: %v", watchableHostPath, err)
+			}
+
+			watchableGuestMount := filepath.Join(kataGuestSharedDir(), "watchable", filepath.Base(sharedFile.guestPath))
+
+			storage := &grpc.Storage{
+				Driver:     kataWatchableBindDevType,
+				Source:     sharedFile.guestPath,
+				Fstype:     "bind",
+				MountPoint: watchableGuestMount,
+				Options:    m.Options,
+			}
+			storages = append(storages, storage)
+
+			// Update the sharedDirMount, in order to identify what will
+			// change in the OCI spec.
+			sharedDirMount.Source = watchableGuestMount
+		}
+
 		sharedDirMounts[sharedDirMount.Destination] = sharedDirMount
 	}
 
-	return sharedDirMounts, ignoredMounts, nil
+	return storages, nil
 }
 
-func (c *Container) unmountHostMounts() error {
-	var span otelTrace.Span
-	span, c.ctx = c.trace("unmountHostMounts")
+func (c *Container) unmountHostMounts(ctx context.Context) error {
+	span, ctx := katatrace.Trace(ctx, c.Logger(), "unmountHostMounts", containerTracingTags, map[string]string{"container_id": c.id})
 	defer span.End()
+
+	unmountFunc := func(m Mount) (err error) {
+		span, _ := katatrace.Trace(ctx, c.Logger(), "unmount", containerTracingTags, map[string]string{"container_id": c.id, "host-path": m.HostPath})
+		defer func() {
+			if err != nil {
+				katatrace.AddTags(span, "error", err)
+			}
+			span.End()
+		}()
+
+		if err = c.sandbox.fsShare.UnshareFile(ctx, c, &m); err != nil {
+			c.Logger().WithFields(logrus.Fields{
+				"host-path": m.HostPath,
+				"error":     err,
+			}).Warn("Could not umount")
+			return err
+		}
+
+		return nil
+	}
 
 	for _, m := range c.mounts {
 		if m.HostPath != "" {
-			span, _ := c.trace("unmount")
-			span.SetAttributes(otelLabel.Key("host-path").String(m.HostPath))
-
-			if err := syscall.Unmount(m.HostPath, syscall.MNT_DETACH|UmountNoFollow); err != nil {
-				c.Logger().WithFields(logrus.Fields{
-					"host-path": m.HostPath,
-					"error":     err,
-				}).Warn("Could not umount")
+			if err := unmountFunc(m); err != nil {
 				return err
 			}
-
-			if m.Type == "bind" {
-				s, err := os.Stat(m.HostPath)
-				if err != nil {
-					return errors.Wrapf(err, "Could not stat host-path %v", m.HostPath)
-				}
-				// Remove the empty file or directory
-				if s.Mode().IsRegular() && s.Size() == 0 {
-					os.Remove(m.HostPath)
-				}
-				if s.Mode().IsDir() {
-					syscall.Rmdir(m.HostPath)
-				}
-			}
-
-			span.End()
 		}
 	}
 
@@ -631,32 +590,81 @@ func filterDevices(c *Container, devices []ContainerDevice) (ret []ContainerDevi
 	return
 }
 
-// Add any mount based block devices to the device manager and save the
+// Add any mount based block devices to the device manager and Save the
 // device ID for the particular mount. This'll occur when the mountpoint source
 // is a block device.
-func (c *Container) createBlockDevices() error {
-	if !c.checkBlockDeviceSupport() {
+func (c *Container) createBlockDevices(ctx context.Context) error {
+	if !c.checkBlockDeviceSupport(ctx) {
 		c.Logger().Warn("Block device not supported")
 		return nil
 	}
 
 	// iterate all mounts and create block device if it's block based.
-	for i, m := range c.mounts {
-		if len(m.BlockDeviceID) > 0 {
+	for i := range c.mounts {
+		if len(c.mounts[i].BlockDeviceID) > 0 {
 			// Non-empty m.BlockDeviceID indicates there's already one device
 			// associated with the mount,so no need to create a new device for it
 			// and we only create block device for bind mount
 			continue
 		}
 
-		if m.Type != "bind" {
-			// We only handle for bind-mounts
+		isBlockFile := HasOption(c.mounts[i].Options, vcAnnotations.IsFileBlockDevice)
+		if c.mounts[i].Type != "bind" && !isBlockFile {
+			// We only handle for bind and block device mounts.
 			continue
 		}
 
+		// Handle directly assigned volume. Update the mount info based on the mount info json.
+		mntInfo, e := volume.VolumeMountInfo(c.mounts[i].Source)
+		if e != nil && !os.IsNotExist(e) {
+			c.Logger().WithError(e).WithField("mount-source", c.mounts[i].Source).
+				Error("failed to parse the mount info file for a direct assigned volume")
+			continue
+		}
+
+		if mntInfo != nil {
+			// Write out sandbox info file on the mount source to allow CSI to communicate with the runtime
+			if err := volume.RecordSandboxId(c.sandboxID, c.mounts[i].Source); err != nil {
+				c.Logger().WithError(err).Error("error writing sandbox info")
+			}
+
+			readonly := false
+			for _, flag := range mntInfo.Options {
+				if flag == "ro" {
+					readonly = true
+					break
+				}
+			}
+
+			c.mounts[i].Source = mntInfo.Device
+			c.mounts[i].Type = mntInfo.FsType
+			c.mounts[i].Options = mntInfo.Options
+			c.mounts[i].ReadOnly = readonly
+
+			for key, value := range mntInfo.Metadata {
+				switch key {
+				case volume.FSGroupMetadataKey:
+					gid, err := strconv.Atoi(value)
+					if err != nil {
+						c.Logger().WithError(err).Errorf("invalid group id value %s provided for key %s", value, volume.FSGroupMetadataKey)
+						continue
+					}
+					c.mounts[i].FSGroup = &gid
+				case volume.FSGroupChangePolicyMetadataKey:
+					if _, exists := mntInfo.Metadata[volume.FSGroupMetadataKey]; !exists {
+						c.Logger().Errorf("%s specified without provding the group id with key %s", volume.FSGroupChangePolicyMetadataKey, volume.FSGroupMetadataKey)
+						continue
+					}
+					c.mounts[i].FSGroupChangePolicy = volume.FSGroupChangePolicy(value)
+				default:
+					c.Logger().Warnf("Ignoring unsupported direct-assignd volume metadata key: %s, value: %s", key, value)
+				}
+			}
+		}
+
 		var stat unix.Stat_t
-		if err := unix.Stat(m.Source, &stat); err != nil {
-			return fmt.Errorf("stat %q failed: %v", m.Source, err)
+		if err := unix.Stat(c.mounts[i].Source, &stat); err != nil {
+			return fmt.Errorf("stat %q failed: %v", c.mounts[i].Source, err)
 		}
 
 		var di *config.DeviceInfo
@@ -664,19 +672,28 @@ func (c *Container) createBlockDevices() error {
 
 		// Check if mount is a block device file. If it is, the block device will be attached to the host
 		// instead of passing this as a shared mount.
-		if stat.Mode&unix.S_IFBLK == unix.S_IFBLK {
+		if stat.Mode&unix.S_IFMT == unix.S_IFBLK {
 			di = &config.DeviceInfo{
-				HostPath:      m.Source,
-				ContainerPath: m.Destination,
+				HostPath:      c.mounts[i].Source,
+				ContainerPath: c.mounts[i].Destination,
 				DevType:       "b",
-				Major:         int64(unix.Major(stat.Rdev)),
-				Minor:         int64(unix.Minor(stat.Rdev)),
-				ReadOnly:      m.ReadOnly,
+				Major:         int64(unix.Major(uint64(stat.Rdev))),
+				Minor:         int64(unix.Minor(uint64(stat.Rdev))),
+				ReadOnly:      c.mounts[i].ReadOnly,
 			}
-			// check whether source can be used as a pmem device
-		} else if di, err = config.PmemDeviceInfo(m.Source, m.Destination); err != nil {
+		} else if isBlockFile && stat.Mode&unix.S_IFMT == unix.S_IFREG {
+			di = &config.DeviceInfo{
+				HostPath:      c.mounts[i].Source,
+				ContainerPath: c.mounts[i].Destination,
+				DevType:       "b",
+				Major:         -1,
+				Minor:         0,
+				ReadOnly:      c.mounts[i].ReadOnly,
+			}
+			// Check whether source can be used as a pmem device
+		} else if di, err = config.PmemDeviceInfo(c.mounts[i].Source, c.mounts[i].Destination); err != nil {
 			c.Logger().WithError(err).
-				WithField("mount-source", m.Source).
+				WithField("mount-source", c.mounts[i].Source).
 				Debug("no loop device")
 		}
 
@@ -685,7 +702,7 @@ func (c *Container) createBlockDevices() error {
 			if err != nil {
 				// Do not return an error, try to create
 				// devices for other mounts
-				c.Logger().WithError(err).WithField("mount-source", m.Source).
+				c.Logger().WithError(err).WithField("mount-source", c.mounts[i].Source).
 					Error("device manager failed to create new device")
 				continue
 
@@ -698,9 +715,15 @@ func (c *Container) createBlockDevices() error {
 	return nil
 }
 
+func (c *Container) initConfigResourcesMemory() {
+	ociSpec := c.GetPatchedOCISpec()
+	c.config.Resources.Memory = &specs.LinuxMemory{}
+	ociSpec.Linux.Resources.Memory = c.config.Resources.Memory
+}
+
 // newContainer creates a Container structure from a sandbox and a container configuration.
-func newContainer(sandbox *Sandbox, contConfig *ContainerConfig) (*Container, error) {
-	span, _ := sandbox.trace("newContainer")
+func newContainer(ctx context.Context, sandbox *Sandbox, contConfig *ContainerConfig) (*Container, error) {
+	span, ctx := katatrace.Trace(ctx, nil, "newContainer", containerTracingTags, map[string]string{"container_id": contConfig.ID, "sandbox_id": sandbox.id})
 	defer span.End()
 
 	if !contConfig.valid() {
@@ -721,6 +744,32 @@ func newContainer(sandbox *Sandbox, contConfig *ContainerConfig) (*Container, er
 		ctx:           sandbox.ctx,
 	}
 
+	// Set the Annotations of SWAP to Resources
+	if resourceSwappinessStr, ok := c.config.Annotations[vcAnnotations.ContainerResourcesSwappiness]; ok {
+		resourceSwappiness, err := strconv.ParseUint(resourceSwappinessStr, 0, 64)
+		if err == nil && resourceSwappiness > 200 {
+			err = fmt.Errorf("swapiness should not bigger than 200")
+		}
+		if err != nil {
+			return &Container{}, fmt.Errorf("Invalid container configuration Annotations %s %v", vcAnnotations.ContainerResourcesSwappiness, err)
+		}
+		if c.config.Resources.Memory == nil {
+			c.initConfigResourcesMemory()
+		}
+		c.config.Resources.Memory.Swappiness = &resourceSwappiness
+	}
+	if resourceSwapInBytesStr, ok := c.config.Annotations[vcAnnotations.ContainerResourcesSwapInBytes]; ok {
+		resourceSwapInBytesInUint, err := strconv.ParseUint(resourceSwapInBytesStr, 0, 64)
+		if err != nil {
+			return &Container{}, fmt.Errorf("Invalid container configuration Annotations %s %v", vcAnnotations.ContainerResourcesSwapInBytes, err)
+		}
+		if c.config.Resources.Memory == nil {
+			c.initConfigResourcesMemory()
+		}
+		resourceSwapInBytes := int64(resourceSwapInBytesInUint)
+		c.config.Resources.Memory.Swap = &resourceSwapInBytes
+	}
+
 	// experimental runtime use "persist.json" instead of legacy "state.json" as storage
 	err := c.Restore()
 	if err == nil {
@@ -734,7 +783,7 @@ func newContainer(sandbox *Sandbox, contConfig *ContainerConfig) (*Container, er
 	}
 
 	// If mounts are block devices, add to devmanager
-	if err := c.createMounts(); err != nil {
+	if err := c.createMounts(ctx); err != nil {
 		return nil, err
 	}
 
@@ -746,9 +795,9 @@ func newContainer(sandbox *Sandbox, contConfig *ContainerConfig) (*Container, er
 	return c, nil
 }
 
-func (c *Container) createMounts() error {
+func (c *Container) createMounts(ctx context.Context) error {
 	// Create block devices for newly created container
-	return c.createBlockDevices()
+	return c.createBlockDevices(ctx)
 }
 
 func (c *Container) createDevices(contConfig *ContainerConfig) error {
@@ -777,25 +826,32 @@ func (c *Container) createDevices(contConfig *ContainerConfig) error {
 // been performed before the container creation failed.
 // - Unplug CPU and memory resources from the VM.
 // - Unplug devices from the VM.
-func (c *Container) rollbackFailingContainerCreation() {
-	if err := c.detachDevices(); err != nil {
+func (c *Container) rollbackFailingContainerCreation(ctx context.Context) {
+	if err := c.detachDevices(ctx); err != nil {
 		c.Logger().WithError(err).Error("rollback failed detachDevices()")
 	}
-	if err := c.removeDrive(); err != nil {
+	if err := c.removeDrive(ctx); err != nil {
 		c.Logger().WithError(err).Error("rollback failed removeDrive()")
 	}
-	if err := c.unmountHostMounts(); err != nil {
+	if err := c.unmountHostMounts(ctx); err != nil {
 		c.Logger().WithError(err).Error("rollback failed unmountHostMounts()")
 	}
-	if err := bindUnmountContainerRootfs(c.ctx, getMountPath(c.sandbox.id), c.id); err != nil {
-		c.Logger().WithError(err).Error("rollback failed bindUnmountContainerRootfs()")
+
+	if c.rootFs.Type == NydusRootFSType {
+		if err := nydusContainerCleanup(ctx, getMountPath(c.sandbox.id), c); err != nil {
+			c.Logger().WithError(err).Error("rollback failed nydusContainerCleanup()")
+		}
+	} else {
+		if err := c.sandbox.fsShare.UnshareRootFilesystem(ctx, c); err != nil {
+			c.Logger().WithError(err).Error("rollback failed UnshareRootFilesystem()")
+		}
 	}
 }
 
-func (c *Container) checkBlockDeviceSupport() bool {
+func (c *Container) checkBlockDeviceSupport(ctx context.Context) bool {
 	if !c.sandbox.config.HypervisorConfig.DisableBlockDeviceUse {
 		agentCaps := c.sandbox.agent.capabilities()
-		hypervisorCaps := c.sandbox.hypervisor.capabilities()
+		hypervisorCaps := c.sandbox.hypervisor.Capabilities(ctx)
 
 		if agentCaps.IsBlockDeviceSupported() && hypervisorCaps.IsBlockDeviceHotplugSupported() {
 			return true
@@ -805,85 +861,87 @@ func (c *Container) checkBlockDeviceSupport() bool {
 	return false
 }
 
-// createContainer creates and start a container inside a Sandbox. It has to be
+// Sort the devices starting with device #1 being the VFIO control group
+// device and the next the actuall device(s) e.g. /dev/vfio/<group>
+func sortContainerVFIODevices(devices []ContainerDevice) []ContainerDevice {
+	var vfioDevices []ContainerDevice
+
+	for _, device := range devices {
+		if deviceManager.IsVFIOControlDevice(device.ContainerPath) {
+			vfioDevices = append([]ContainerDevice{device}, vfioDevices...)
+			continue
+		}
+		vfioDevices = append(vfioDevices, device)
+	}
+	return vfioDevices
+}
+
+// create creates and starts a container inside a Sandbox. It has to be
 // called only when a new container, not known by the sandbox, has to be created.
-func (c *Container) create() (err error) {
+func (c *Container) create(ctx context.Context) (err error) {
 	// In case the container creation fails, the following takes care
 	// of rolling back all the actions previously performed.
 	defer func() {
 		if err != nil {
 			c.Logger().WithError(err).Error("container create failed")
-			c.rollbackFailingContainerCreation()
+			c.rollbackFailingContainerCreation(ctx)
 		}
 	}()
 
-	if c.checkBlockDeviceSupport() {
+	if c.checkBlockDeviceSupport(ctx) && c.rootFs.Type != NydusRootFSType {
 		// If the rootfs is backed by a block device, go ahead and hotplug it to the guest
-		if err = c.hotplugDrive(); err != nil {
+		if err = c.hotplugDrive(ctx); err != nil {
 			return
 		}
 	}
 
-	var (
-		machineType        = c.sandbox.config.HypervisorConfig.HypervisorMachineType
-		normalAttachedDevs []ContainerDevice //for q35: normally attached devices
-		delayAttachedDevs  []ContainerDevice //for q35: delay attached devices, for example, large bar space device
-	)
-	// Fix: https://github.com/kata-containers/runtime/issues/2460
-	if machineType == QemuQ35 {
-		// add Large Bar space device to delayAttachedDevs
-		for _, device := range c.devices {
-			var isLargeBarSpace bool
-			isLargeBarSpace, err = manager.IsVFIOLargeBarSpaceDevice(device.ContainerPath)
-			if err != nil {
-				return
+	// If cold-plug we've attached the devices already, do not try to
+	// attach them a second time.
+	coldPlugVFIO := (c.sandbox.config.HypervisorConfig.ColdPlugVFIO != config.NoPort)
+	modeVFIO := (c.sandbox.config.VfioMode == config.VFIOModeVFIO)
+
+	if coldPlugVFIO {
+		var cntDevices []ContainerDevice
+		for _, dev := range c.devices {
+			isVFIOControlDevice := deviceManager.IsVFIOControlDevice(dev.ContainerPath)
+			if isVFIOControlDevice && modeVFIO {
+				cntDevices = append(cntDevices, dev)
 			}
-			if isLargeBarSpace {
-				delayAttachedDevs = append(delayAttachedDevs, device)
-			} else {
-				normalAttachedDevs = append(normalAttachedDevs, device)
+
+			if strings.HasPrefix(dev.ContainerPath, vfioPath) {
+				c.Logger().WithFields(logrus.Fields{
+					"device": dev,
+				}).Info("Remvoing device since we're cold-plugging no Attach needed")
+				continue
 			}
+			cntDevices = append(cntDevices, dev)
 		}
-	} else {
-		normalAttachedDevs = c.devices
+		c.devices = cntDevices
+	}
+	// If modeVFIO is enabled we need 1st to attach the VFIO control group
+	// device /dev/vfio/vfio an 2nd the actuall device(s) afterwards.
+	// Sort the devices starting with device #1 being the VFIO control group
+	// device and the next the actuall device(s) /dev/vfio/<group>
+	if modeVFIO {
+		c.devices = sortContainerVFIODevices(c.devices)
 	}
 
 	c.Logger().WithFields(logrus.Fields{
-		"machine_type": machineType,
-		"devices":      normalAttachedDevs,
-	}).Info("normal attach devices")
-	if len(normalAttachedDevs) > 0 {
-		if err = c.attachDevices(normalAttachedDevs); err != nil {
-			return
-		}
+		"devices": c.devices,
+	}).Info("Attach devices")
+	if err = c.attachDevices(ctx); err != nil {
+		return
 	}
 
 	// Deduce additional system mount info that should be handled by the agent
 	// inside the VM
 	c.getSystemMountInfo()
 
-	process, err := c.sandbox.agent.createContainer(c.sandbox, c)
+	process, err := c.sandbox.agent.createContainer(ctx, c.sandbox, c)
 	if err != nil {
 		return err
 	}
 	c.process = *process
-
-	// lazy attach device after createContainer for q35
-	if machineType == QemuQ35 && len(delayAttachedDevs) > 0 {
-		c.Logger().WithFields(logrus.Fields{
-			"machine_type": machineType,
-			"devices":      delayAttachedDevs,
-		}).Info("lazy attach devices")
-		if err = c.attachDevices(delayAttachedDevs); err != nil {
-			return
-		}
-	}
-
-	if !rootless.IsRootless() && !c.sandbox.config.SandboxCgroupOnly {
-		if err = c.cgroupsCreate(); err != nil {
-			return
-		}
-	}
 
 	if err = c.setContainerState(types.StateReady); err != nil {
 		return
@@ -892,7 +950,7 @@ func (c *Container) create() (err error) {
 	return nil
 }
 
-func (c *Container) delete() error {
+func (c *Container) delete(ctx context.Context) error {
 	if c.state.State != types.StateReady &&
 		c.state.State != types.StateStopped {
 		return fmt.Errorf("Container not ready or stopped, impossible to delete")
@@ -903,14 +961,7 @@ func (c *Container) delete() error {
 		return err
 	}
 
-	// If running rootless, there are no cgroups to remove
-	if !c.sandbox.config.SandboxCgroupOnly || !rootless.IsRootless() {
-		if err := c.cgroupsDelete(); err != nil {
-			return err
-		}
-	}
-
-	return c.sandbox.storeSandbox()
+	return c.sandbox.storeSandbox(ctx)
 }
 
 // checkSandboxRunning validates the container state.
@@ -931,7 +982,7 @@ func (c *Container) checkSandboxRunning(cmd string) error {
 }
 
 func (c *Container) getSystemMountInfo() {
-	// check if /dev needs to be bind mounted from host /dev
+	// Check if /dev needs to be bind mounted from host /dev
 	c.systemMountsInfo.BindMountDev = false
 
 	for _, m := range c.mounts {
@@ -943,7 +994,7 @@ func (c *Container) getSystemMountInfo() {
 	// TODO Deduce /dev/shm size. See https://github.com/clearcontainers/runtime/issues/138
 }
 
-func (c *Container) start() error {
+func (c *Container) start(ctx context.Context) error {
 	if err := c.checkSandboxRunning("start"); err != nil {
 		return err
 	}
@@ -957,10 +1008,10 @@ func (c *Container) start() error {
 		return err
 	}
 
-	if err := c.sandbox.agent.startContainer(c.sandbox, c); err != nil {
+	if err := c.sandbox.agent.startContainer(ctx, c.sandbox, c); err != nil {
 		c.Logger().WithError(err).Error("Failed to start container")
 
-		if err := c.stop(true); err != nil {
+		if err := c.stop(ctx, true); err != nil {
 			c.Logger().WithError(err).Warn("Failed to stop container")
 		}
 		return err
@@ -969,8 +1020,8 @@ func (c *Container) start() error {
 	return c.setContainerState(types.StateRunning)
 }
 
-func (c *Container) stop(force bool) error {
-	span, _ := c.trace("stop")
+func (c *Container) stop(ctx context.Context, force bool) error {
+	span, ctx := katatrace.Trace(ctx, c.Logger(), "stop", containerTracingTags, map[string]string{"container_id": c.id})
 	defer span.End()
 
 	// In case the container status has been updated implicitly because
@@ -992,45 +1043,50 @@ func (c *Container) stop(force bool) error {
 	// Force the container to be killed. For most of the cases, this
 	// should not matter and it should return an error that will be
 	// ignored.
-	c.kill(syscall.SIGKILL, true)
+	c.kill(ctx, syscall.SIGKILL, true)
 
 	// Since the agent has supported the MultiWaitProcess, it's better to
 	// wait the process here to make sure the process has exited before to
 	// issue stopContainer, otherwise the RemoveContainerRequest in it will
 	// get failed if the process hasn't exited.
-	c.sandbox.agent.waitProcess(c, c.id)
+	c.sandbox.agent.waitProcess(ctx, c, c.id)
 
 	defer func() {
 		// Save device and drive data.
 		// TODO: can we merge this saving with setContainerState()?
 		if err := c.sandbox.Save(); err != nil {
-			c.Logger().WithError(err).Info("save container state failed")
+			c.Logger().WithError(err).Info("Save container state failed")
 		}
 	}()
 
-	if err := c.sandbox.agent.stopContainer(c.sandbox, *c); err != nil && !force {
+	if err := c.sandbox.agent.stopContainer(ctx, c.sandbox, *c); err != nil && !force {
 		return err
 	}
 
-	if err := c.unmountHostMounts(); err != nil && !force {
+	if err := c.unmountHostMounts(ctx); err != nil && !force {
 		return err
 	}
 
-	if err := bindUnmountContainerRootfs(c.ctx, getMountPath(c.sandbox.id), c.id); err != nil && !force {
+	if c.rootFs.Type == NydusRootFSType {
+		if err := nydusContainerCleanup(ctx, getMountPath(c.sandbox.id), c); err != nil && !force {
+			return err
+		}
+	} else {
+		if err := c.sandbox.fsShare.UnshareRootFilesystem(ctx, c); err != nil && !force {
+			return err
+		}
+	}
+
+	if err := c.sandbox.agent.removeStaleVirtiofsShareMounts(ctx); err != nil && !force {
 		return err
 	}
 
-	if err := c.detachDevices(); err != nil && !force {
+	if err := c.detachDevices(ctx); err != nil && !force {
 		return err
 	}
 
-	if err := c.removeDrive(); err != nil && !force {
+	if err := c.removeDrive(ctx); err != nil && !force {
 		return err
-	}
-
-	shareDir := filepath.Join(kataHostSharedDir(), c.sandbox.id, c.id)
-	if err := syscall.Rmdir(shareDir); err != nil {
-		c.Logger().WithError(err).WithField("share-dir", shareDir).Warn("Could not remove container share dir")
 	}
 
 	// container was killed by force, container MUST change its state
@@ -1043,7 +1099,7 @@ func (c *Container) stop(force bool) error {
 	return nil
 }
 
-func (c *Container) enter(cmd types.Cmd) (*Process, error) {
+func (c *Container) enter(ctx context.Context, cmd types.Cmd) (*Process, error) {
 	if err := c.checkSandboxRunning("enter"); err != nil {
 		return nil, err
 	}
@@ -1054,7 +1110,7 @@ func (c *Container) enter(cmd types.Cmd) (*Process, error) {
 			"impossible to enter")
 	}
 
-	process, err := c.sandbox.agent.exec(c.sandbox, *c, cmd)
+	process, err := c.sandbox.agent.exec(ctx, c.sandbox, *c, cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -1062,21 +1118,21 @@ func (c *Container) enter(cmd types.Cmd) (*Process, error) {
 	return process, nil
 }
 
-func (c *Container) wait(processID string) (int32, error) {
+func (c *Container) wait(ctx context.Context, processID string) (int32, error) {
 	if c.state.State != types.StateReady &&
 		c.state.State != types.StateRunning {
 		return 0, fmt.Errorf("Container not ready or running, " +
 			"impossible to wait")
 	}
 
-	return c.sandbox.agent.waitProcess(c, processID)
+	return c.sandbox.agent.waitProcess(ctx, c, processID)
 }
 
-func (c *Container) kill(signal syscall.Signal, all bool) error {
-	return c.signalProcess(c.process.Token, signal, all)
+func (c *Container) kill(ctx context.Context, signal syscall.Signal, all bool) error {
+	return c.signalProcess(ctx, c.process.Token, signal, all)
 }
 
-func (c *Container) signalProcess(processID string, signal syscall.Signal, all bool) error {
+func (c *Container) signalProcess(ctx context.Context, processID string, signal syscall.Signal, all bool) error {
 	if c.sandbox.state.State != types.StateReady && c.sandbox.state.State != types.StateRunning {
 		return fmt.Errorf("Sandbox not ready or running, impossible to signal the container")
 	}
@@ -1085,15 +1141,26 @@ func (c *Container) signalProcess(processID string, signal syscall.Signal, all b
 		return fmt.Errorf("Container not ready, running or paused, impossible to signal the container")
 	}
 
-	return c.sandbox.agent.signalProcess(c, processID, signal, all)
+	// kill(2) method can return ESRCH in certain cases, which is not handled by containerd cri server in container_stop.go.
+	// CRIO server also doesn't handle ESRCH. So kata runtime will swallow it here.
+	var err error
+	if err = c.sandbox.agent.signalProcess(ctx, c, processID, signal, all); err != nil &&
+		strings.Contains(err.Error(), "ESRCH: No such process") {
+		c.Logger().WithFields(logrus.Fields{
+			"container":  c.id,
+			"process-id": processID,
+		}).Warn("signal encounters ESRCH, process already finished")
+		return nil
+	}
+	return err
 }
 
-func (c *Container) winsizeProcess(processID string, height, width uint32) error {
+func (c *Container) winsizeProcess(ctx context.Context, processID string, height, width uint32) error {
 	if c.state.State != types.StateReady && c.state.State != types.StateRunning {
 		return fmt.Errorf("Container not ready or running, impossible to signal the container")
 	}
 
-	return c.sandbox.agent.winsizeProcess(c, processID, height, width)
+	return c.sandbox.agent.winsizeProcess(ctx, c, processID, height, width)
 }
 
 func (c *Container) ioStream(processID string) (io.WriteCloser, io.Reader, io.Reader, error) {
@@ -1106,26 +1173,14 @@ func (c *Container) ioStream(processID string) (io.WriteCloser, io.Reader, io.Re
 	return stream.stdin(), stream.stdout(), stream.stderr(), nil
 }
 
-func (c *Container) processList(options ProcessListOptions) (ProcessList, error) {
-	if err := c.checkSandboxRunning("ps"); err != nil {
-		return nil, err
-	}
-
-	if c.state.State != types.StateRunning {
-		return nil, fmt.Errorf("Container not running, impossible to list processes")
-	}
-
-	return c.sandbox.agent.processListContainer(c.sandbox, *c, options)
-}
-
-func (c *Container) stats() (*ContainerStats, error) {
+func (c *Container) stats(ctx context.Context) (*ContainerStats, error) {
 	if err := c.checkSandboxRunning("stats"); err != nil {
 		return nil, err
 	}
-	return c.sandbox.agent.statsContainer(c.sandbox, *c)
+	return c.sandbox.agent.statsContainer(ctx, c.sandbox, *c)
 }
 
-func (c *Container) update(resources specs.LinuxResources) error {
+func (c *Container) update(ctx context.Context, resources specs.LinuxResources) error {
 	if err := c.checkSandboxRunning("update"); err != nil {
 		return err
 	}
@@ -1161,14 +1216,8 @@ func (c *Container) update(resources specs.LinuxResources) error {
 		c.config.Resources.Memory.Limit = mem.Limit
 	}
 
-	if err := c.sandbox.updateResources(); err != nil {
+	if err := c.sandbox.updateResources(ctx); err != nil {
 		return err
-	}
-
-	if !c.sandbox.config.SandboxCgroupOnly {
-		if err := c.cgroupsUpdate(resources); err != nil {
-			return err
-		}
 	}
 
 	// There currently isn't a notion of cpusets.cpus or mems being tracked
@@ -1179,10 +1228,10 @@ func (c *Container) update(resources specs.LinuxResources) error {
 		resources.CPU.Cpus = ""
 	}
 
-	return c.sandbox.agent.updateContainer(c.sandbox, *c, resources)
+	return c.sandbox.agent.updateContainer(ctx, c.sandbox, *c, resources)
 }
 
-func (c *Container) pause() error {
+func (c *Container) pause(ctx context.Context) error {
 	if err := c.checkSandboxRunning("pause"); err != nil {
 		return err
 	}
@@ -1191,14 +1240,14 @@ func (c *Container) pause() error {
 		return fmt.Errorf("Container not running, impossible to pause")
 	}
 
-	if err := c.sandbox.agent.pauseContainer(c.sandbox, *c); err != nil {
+	if err := c.sandbox.agent.pauseContainer(ctx, c.sandbox, *c); err != nil {
 		return err
 	}
 
 	return c.setContainerState(types.StatePaused)
 }
 
-func (c *Container) resume() error {
+func (c *Container) resume(ctx context.Context) error {
 	if err := c.checkSandboxRunning("resume"); err != nil {
 		return err
 	}
@@ -1207,7 +1256,7 @@ func (c *Container) resume() error {
 		return fmt.Errorf("Container not paused, impossible to resume")
 	}
 
-	if err := c.sandbox.agent.resumeContainer(c.sandbox, *c); err != nil {
+	if err := c.sandbox.agent.resumeContainer(ctx, c.sandbox, *c); err != nil {
 		return err
 	}
 
@@ -1216,7 +1265,7 @@ func (c *Container) resume() error {
 
 // hotplugDrive will attempt to hotplug the container rootfs if it is backed by a
 // block device
-func (c *Container) hotplugDrive() error {
+func (c *Container) hotplugDrive(ctx context.Context) error {
 	var dev device
 	var err error
 
@@ -1260,7 +1309,7 @@ func (c *Container) hotplugDrive() error {
 			c.rootfsSuffix = ""
 		}
 		// If device mapper device, then fetch the full path of the device
-		devicePath, fsType, err = utils.GetDevicePathAndFsType(dev.mountPoint)
+		devicePath, fsType, _, err = utils.GetDevicePathAndFsTypeOptions(dev.mountPoint)
 		if err != nil {
 			return err
 		}
@@ -1276,7 +1325,7 @@ func (c *Container) hotplugDrive() error {
 		"fs-type":     fsType,
 	}).Info("Block device detected")
 
-	if err = c.plugDevice(devicePath); err != nil {
+	if err = c.plugDevice(ctx, devicePath); err != nil {
 		return err
 	}
 
@@ -1284,19 +1333,19 @@ func (c *Container) hotplugDrive() error {
 }
 
 // plugDevice will attach the rootfs if blockdevice is supported (this is rootfs specific)
-func (c *Container) plugDevice(devicePath string) error {
+func (c *Container) plugDevice(ctx context.Context, devicePath string) error {
 	var stat unix.Stat_t
 	if err := unix.Stat(devicePath, &stat); err != nil {
 		return fmt.Errorf("stat %q failed: %v", devicePath, err)
 	}
 
-	if c.checkBlockDeviceSupport() && stat.Mode&unix.S_IFBLK == unix.S_IFBLK {
+	if c.checkBlockDeviceSupport(ctx) && stat.Mode&unix.S_IFBLK == unix.S_IFBLK {
 		b, err := c.sandbox.devManager.NewDevice(config.DeviceInfo{
 			HostPath:      devicePath,
 			ContainerPath: filepath.Join(kataGuestSharedDir(), c.id),
 			DevType:       "b",
-			Major:         int64(unix.Major(stat.Rdev)),
-			Minor:         int64(unix.Minor(stat.Rdev)),
+			Major:         int64(unix.Major(uint64(stat.Rdev))),
+			Minor:         int64(unix.Minor(uint64(stat.Rdev))),
 		})
 		if err != nil {
 			return fmt.Errorf("device manager failed to create rootfs device for %q: %v", devicePath, err)
@@ -1305,7 +1354,7 @@ func (c *Container) plugDevice(devicePath string) error {
 		c.state.BlockDeviceID = b.DeviceID()
 
 		// attach rootfs device
-		if err := c.sandbox.devManager.AttachDevice(b.DeviceID(), c.sandbox); err != nil {
+		if err := c.sandbox.devManager.AttachDevice(ctx, b.DeviceID(), c.sandbox); err != nil {
 			return err
 		}
 	}
@@ -1317,12 +1366,12 @@ func (c *Container) isDriveUsed() bool {
 	return !(c.state.Fstype == "")
 }
 
-func (c *Container) removeDrive() (err error) {
+func (c *Container) removeDrive(ctx context.Context) (err error) {
 	if c.isDriveUsed() {
 		c.Logger().Info("unplugging block device")
 
 		devID := c.state.BlockDeviceID
-		err := c.sandbox.devManager.DetachDevice(devID, c.sandbox)
+		err := c.sandbox.devManager.DetachDevice(ctx, devID, c.sandbox)
 		if err != nil && err != manager.ErrDeviceNotAttached {
 			return err
 		}
@@ -1343,7 +1392,7 @@ func (c *Container) removeDrive() (err error) {
 	return nil
 }
 
-func (c *Container) attachDevices(devices []ContainerDevice) error {
+func (c *Container) attachDevices(ctx context.Context) error {
 	// there's no need to do rollback when error happens,
 	// because if attachDevices fails, container creation will fail too,
 	// and rollbackFailingContainerCreation could do all the rollbacks
@@ -1351,17 +1400,17 @@ func (c *Container) attachDevices(devices []ContainerDevice) error {
 	// since devices with large bar space require delayed attachment,
 	// the devices need to be split into two lists, normalAttachedDevs and delayAttachedDevs.
 	// so c.device is not used here. See issue https://github.com/kata-containers/runtime/issues/2460.
-	for _, dev := range devices {
-		if err := c.sandbox.devManager.AttachDevice(dev.ID, c.sandbox); err != nil {
+	for _, dev := range c.devices {
+		if err := c.sandbox.devManager.AttachDevice(ctx, dev.ID, c.sandbox); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Container) detachDevices() error {
+func (c *Container) detachDevices(ctx context.Context) error {
 	for _, dev := range c.devices {
-		err := c.sandbox.devManager.DetachDevice(dev.ID, c.sandbox)
+		err := c.sandbox.devManager.DetachDevice(ctx, dev.ID, c.sandbox)
 		if err != nil && err != manager.ErrDeviceNotAttached {
 			return err
 		}
@@ -1378,117 +1427,5 @@ func (c *Container) detachDevices() error {
 			}
 		}
 	}
-	return nil
-}
-
-// cgroupsCreate creates cgroups on the host for the associated container
-func (c *Container) cgroupsCreate() (err error) {
-	spec := c.GetPatchedOCISpec()
-	if spec == nil {
-		return errorMissingOCISpec
-	}
-
-	// https://github.com/kata-containers/runtime/issues/168
-	resources := specs.LinuxResources{
-		CPU: nil,
-	}
-
-	if spec.Linux != nil && spec.Linux.Resources != nil {
-		resources.CPU = validCPUResources(spec.Linux.Resources.CPU)
-	}
-
-	c.state.CgroupPath, err = vccgroups.ValidCgroupPath(spec.Linux.CgroupsPath, c.sandbox.config.SystemdCgroup)
-	if err != nil {
-		return fmt.Errorf("Invalid cgroup path: %v", err)
-	}
-
-	cgroup, err := cgroupsNewFunc(cgroups.V1,
-		cgroups.StaticPath(c.state.CgroupPath), &resources)
-	if err != nil {
-		return fmt.Errorf("Could not create cgroup for %v: %v", c.state.CgroupPath, err)
-	}
-
-	c.config.Resources = resources
-
-	// Add shim into cgroup
-	if c.process.Pid > 0 {
-		if err := cgroup.Add(cgroups.Process{Pid: c.process.Pid}); err != nil {
-			return fmt.Errorf("Could not add PID %d to cgroup %v: %v", c.process.Pid, spec.Linux.CgroupsPath, err)
-		}
-	}
-
-	return nil
-}
-
-// cgroupsDelete deletes the cgroups on the host for the associated container
-func (c *Container) cgroupsDelete() error {
-
-	if c.state.CgroupPath == "" {
-		c.Logger().Debug("container does not have host cgroups: nothing to update")
-		return nil
-	}
-
-	cgroup, err := cgroupsLoadFunc(cgroups.V1,
-		cgroups.StaticPath(c.state.CgroupPath))
-
-	if err == cgroups.ErrCgroupDeleted {
-		// cgroup already deleted
-		return nil
-	}
-
-	if err != nil {
-		return fmt.Errorf("Could not load container cgroup %v: %v", c.state.CgroupPath, err)
-	}
-
-	// move running process here, that way cgroup can be removed
-	parent, err := parentCgroup(cgroups.V1, c.state.CgroupPath)
-	if err != nil {
-		// parent cgroup doesn't exist, that means there are no process running
-		// and the container cgroup was removed.
-		c.Logger().WithError(err).Warn("Container cgroup doesn't exist")
-		return nil
-	}
-
-	if err := cgroup.MoveTo(parent); err != nil {
-		// Don't fail, cgroup can be deleted
-		c.Logger().WithError(err).Warn("Could not move container process into parent cgroup")
-	}
-
-	if err := cgroup.Delete(); err != nil {
-		return fmt.Errorf("Could not delete container cgroup path='%v': error='%v'", c.state.CgroupPath, err)
-	}
-
-	return nil
-}
-
-// cgroupsUpdate updates cgroups on the host for the associated container
-func (c *Container) cgroupsUpdate(resources specs.LinuxResources) error {
-
-	if c.state.CgroupPath == "" {
-		c.Logger().Debug("container does not have host cgroups: nothing to update")
-		return nil
-	}
-	cgroup, err := cgroupsLoadFunc(cgroups.V1,
-		cgroups.StaticPath(c.state.CgroupPath))
-	if err != nil {
-		return fmt.Errorf("Could not load cgroup %v: %v", c.state.CgroupPath, err)
-	}
-
-	// Issue: https://github.com/kata-containers/runtime/issues/168
-	r := specs.LinuxResources{
-		CPU: validCPUResources(resources.CPU),
-	}
-
-	// update cgroup
-	if err := cgroup.Update(&r); err != nil {
-		return fmt.Errorf("Could not update container cgroup path='%v': error='%v'", c.state.CgroupPath, err)
-	}
-
-	// store new resources
-	c.config.Resources = r
-	if err := c.storeContainer(); err != nil {
-		return err
-	}
-
 	return nil
 }

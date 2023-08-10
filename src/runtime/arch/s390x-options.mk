@@ -11,3 +11,10 @@ MACHINEACCELERATORS :=
 CPUFEATURES :=
 
 QEMUCMD := qemu-system-s390x
+
+# See https://github.com/kata-containers/osbuilder/issues/217
+NEEDS_CC_SETTING = $(shell grep -E "\<(fedora|suse)\>" /etc/os-release 2> /dev/null)
+ifneq (,$(NEEDS_CC_SETTING))
+	CC := gcc
+	export CC
+endif

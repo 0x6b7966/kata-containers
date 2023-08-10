@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -10,7 +12,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -22,8 +23,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	hv "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client"
 	models "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/models"
 	ops "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/operations"
@@ -38,10 +41,15 @@ import (
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel"
-	otelLabel "go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 )
+
+// fcTracingTags defines tags for the trace span
+var fcTracingTags = map[string]string{
+	"source":    "runtime",
+	"package":   "virtcontainers",
+	"subsystem": "hypervisor",
+	"type":      "firecracker",
+}
 
 type vmmState uint8
 
@@ -56,7 +64,7 @@ const (
 	fcTimeout = 10
 	fcSocket  = "firecracker.socket"
 	//Name of the files within jailer root
-	//Having predefined names helps with cleanup
+	//Having predefined names helps with Cleanup
 	fcKernel             = "vmlinux"
 	fcRootfs             = "rootfs"
 	fcStopSandboxTimeout = 15
@@ -76,14 +84,12 @@ const (
 	fcMetricsFifo = "metrics.fifo"
 
 	defaultFcConfig = "fcConfig.json"
-	// storagePathSuffix mirrors persist/fs/fs.go:storagePathSuffix
-	storagePathSuffix = "vc"
 )
 
 // Specify the minimum version of firecracker supported
 var fcMinSupportedVersion = semver.MustParse("0.21.1")
 
-var fcKernelParams = append(commonVirtioblkKernelRootParams, []Param{
+var fcKernelParams = []Param{
 	// The boot source is the first partition of the first block device added
 	{"pci", "off"},
 	{"reboot", "k"},
@@ -95,7 +101,7 @@ var fcKernelParams = append(commonVirtioblkKernelRootParams, []Param{
 	// Firecracker doesn't support ACPI
 	// Fix kernel error "ACPI BIOS Error (bug)"
 	{"acpi", "off"},
-}...)
+}
 
 func (s vmmState) String() string {
 	switch s {
@@ -113,8 +119,8 @@ func (s vmmState) String() string {
 // FirecrackerInfo contains information related to the hypervisor that we
 // want to store on disk
 type FirecrackerInfo struct {
-	PID     int
 	Version string
+	PID     int
 }
 
 type firecrackerState struct {
@@ -131,36 +137,36 @@ func (s *firecrackerState) set(state vmmState) {
 
 // firecracker is an Hypervisor interface implementation for the firecracker VMM.
 type firecracker struct {
-	id            string //Unique ID per pod. Normally maps to the sandbox id
-	vmPath        string //All jailed VM assets need to be under this
-	chrootBaseDir string //chroot base for the jailer
-	jailerRoot    string
-	socketPath    string
-	netNSPath     string
-	uid           string //UID and GID to be used for the VMM
-	gid           string
+	console console.Console
+	ctx     context.Context
 
-	info FirecrackerInfo
-
-	firecrackerd *exec.Cmd           //Tracks the firecracker process itself
-	connection   *client.Firecracker //Tracks the current active connection
-
-	ctx            context.Context
-	config         HypervisorConfig
 	pendingDevices []firecrackerDevice // Devices to be added before the FC VM ready
 
+	firecrackerd *exec.Cmd              //Tracks the firecracker process itself
+	fcConfig     *types.FcConfig        // Parameters configured before VM starts
+	connection   *client.FirecrackerAPI //Tracks the current active connection
+
+	id               string //Unique ID per pod. Normally maps to the sandbox id
+	vmPath           string //All jailed VM assets need to be under this
+	chrootBaseDir    string //chroot base for the jailer
+	jailerRoot       string
+	socketPath       string
+	hybridSocketPath string
+	netNSPath        string
+	uid              string //UID and GID to be used for the VMM
+	gid              string
+	fcConfigPath     string
+
+	info   FirecrackerInfo
+	config HypervisorConfig
 	state  firecrackerState
+
 	jailed bool //Set to true if jailer is enabled
-
-	fcConfigPath string
-	fcConfig     *types.FcConfig // Parameters configured before VM starts
-
-	console console.Console
 }
 
 type firecrackerDevice struct {
 	dev     interface{}
-	devType deviceType
+	devType DeviceType
 }
 
 // Logger returns a logrus logger appropriate for logging firecracker  messages
@@ -168,23 +174,10 @@ func (fc *firecracker) Logger() *logrus.Entry {
 	return virtLog.WithField("subsystem", "firecracker")
 }
 
-func (fc *firecracker) trace(name string) (otelTrace.Span, context.Context) {
-	if fc.ctx == nil {
-		fc.Logger().WithField("type", "bug").Error("trace called before context set")
-		fc.ctx = context.Background()
-	}
-
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(fc.ctx, name)
-	span.SetAttributes([]otelLabel.KeyValue{otelLabel.Key("subsystem").String("hypervisor"), otelLabel.Key("type").String("firecracker")}...)
-
-	return span, ctx
-}
-
-//At some cases, when sandbox id is too long, it will incur error of overlong
-//firecracker API unix socket(fc.socketPath).
-//In Linux, sun_path could maximumly contains 108 bytes in size.
-//(http://man7.org/linux/man-pages/man7/unix.7.html)
+// At some cases, when sandbox id is too long, it will incur error of overlong
+// firecracker API unix socket(fc.socketPath).
+// In Linux, sun_path could maximumly contains 108 bytes in size.
+// (http://man7.org/linux/man-pages/man7/unix.7.html)
 func (fc *firecracker) truncateID(id string) string {
 	if len(id) > 32 {
 		//truncate the id to only leave the size of UUID(128bit).
@@ -194,42 +187,33 @@ func (fc *firecracker) truncateID(id string) string {
 	return id
 }
 
-// For firecracker this call only sets the internal structure up.
-// The sandbox will be created and started through startSandbox().
-func (fc *firecracker) createSandbox(ctx context.Context, id string, networkNS NetworkNamespace, hypervisorConfig *HypervisorConfig) error {
+func (fc *firecracker) setConfig(config *HypervisorConfig) error {
+	fc.config = *config
+
+	return nil
+}
+
+// CreateVM For firecracker this call only sets the internal structure up.
+// The sandbox will be created and started through StartVM().
+func (fc *firecracker) CreateVM(ctx context.Context, id string, network Network, hypervisorConfig *HypervisorConfig) error {
 	fc.ctx = ctx
 
-	span, _ := fc.trace("createSandbox")
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "CreateVM", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
-	//TODO: check validity of the hypervisor config provided
+	//TODO: Check validity of the hypervisor config provided
 	//https://github.com/kata-containers/runtime/issues/1065
 	fc.id = fc.truncateID(id)
 	fc.state.set(notReady)
-	fc.config = *hypervisorConfig
 
-	// When running with jailer all resources need to be under
-	// a specific location and that location needs to have
-	// exec permission (i.e. should not be mounted noexec, e.g. /run, /var/run)
-	// Also unix domain socket names have a hard limit
-	// #define UNIX_PATH_MAX   108
-	// Keep it short and live within the jailer expected paths
-	// <chroot_base>/<exec_file_name>/<id>/
-	// Also jailer based on the id implicitly sets up cgroups under
-	// <cgroups_base>/<exec_file_name>/<id>/
-	hypervisorName := filepath.Base(hypervisorConfig.HypervisorPath)
-	//fs.RunStoragePath cannot be used as we need exec perms
-	fc.chrootBaseDir = filepath.Join("/run", storagePathSuffix)
+	if err := fc.setConfig(hypervisorConfig); err != nil {
+		return err
+	}
 
-	fc.vmPath = filepath.Join(fc.chrootBaseDir, hypervisorName, fc.id)
-	fc.jailerRoot = filepath.Join(fc.vmPath, "root") // auto created by jailer
+	fc.setPaths(&fc.config)
 
-	// Firecracker and jailer automatically creates default API socket under /run
-	// with the name of "firecracker.socket"
-	fc.socketPath = filepath.Join(fc.jailerRoot, "run", fcSocket)
-
-	// So we need to repopulate this at startSandbox where it is valid
-	fc.netNSPath = networkNS.NetNsPath
+	// So we need to repopulate this at StartVM where it is valid
+	fc.netNSPath = network.NetworkID()
 
 	// Till we create lower privileged kata user run as root
 	// https://github.com/kata-containers/runtime/issues/1869
@@ -241,8 +225,32 @@ func (fc *firecracker) createSandbox(ctx context.Context, id string, networkNS N
 	return nil
 }
 
-func (fc *firecracker) newFireClient() *client.Firecracker {
-	span, _ := fc.trace("newFireClient")
+func (fc *firecracker) setPaths(hypervisorConfig *HypervisorConfig) {
+	// When running with jailer all resources need to be under
+	// a specific location and that location needs to have
+	// exec permission (i.e. should not be mounted noexec, e.g. /run, /var/run)
+	// Also unix domain socket names have a hard limit
+	// #define UNIX_PATH_MAX   108
+	// Keep it short and live within the jailer expected paths
+	// <chroot_base>/<exec_file_name>/<id>/
+	// Also jailer based on the id implicitly sets up cgroups under
+	// <cgroups_base>/<exec_file_name>/<id>/
+	hypervisorName := filepath.Base(hypervisorConfig.HypervisorPath)
+	//fs.RunStoragePath cannot be used as we need exec perms
+	fc.chrootBaseDir = filepath.Join("/run", fs.StoragePathSuffix)
+
+	fc.vmPath = filepath.Join(fc.chrootBaseDir, hypervisorName, fc.id)
+	fc.jailerRoot = filepath.Join(fc.vmPath, "root") // auto created by jailer
+
+	// Firecracker and jailer automatically creates default API socket under /run
+	// with the name of "firecracker.socket"
+	fc.socketPath = filepath.Join(fc.jailerRoot, "run", fcSocket)
+
+	fc.hybridSocketPath = filepath.Join(fc.jailerRoot, defaultHybridVSocketName)
+}
+
+func (fc *firecracker) newFireClient(ctx context.Context) *client.FirecrackerAPI {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "newFireClient", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 	httpClient := client.NewHTTPClient(strfmt.NewFormats())
 
@@ -266,26 +274,16 @@ func (fc *firecracker) newFireClient() *client.Firecracker {
 	return httpClient
 }
 
-func (fc *firecracker) vmRunning() bool {
-	resp, err := fc.client().Operations.DescribeInstance(nil)
+func (fc *firecracker) vmRunning(ctx context.Context) bool {
+	resp, err := fc.client(ctx).Operations.DescribeInstance(nil)
 	if err != nil {
 		fc.Logger().WithError(err).Error("getting vm status failed")
 		return false
 	}
+	// The current state of the Firecracker instance (swagger:model InstanceInfo)
+	state := *resp.Payload.State
 
-	// Be explicit
-	switch *resp.Payload.State {
-	case models.InstanceInfoStateStarting:
-		// Unsure what we should do here
-		fc.Logger().WithField("unexpected-state", models.InstanceInfoStateStarting).Debug("vmRunning")
-		return false
-	case models.InstanceInfoStateRunning:
-		return true
-	case models.InstanceInfoStateUninitialized:
-		return false
-	default:
-		return false
-	}
+	return state == "Running"
 }
 
 func (fc *firecracker) getVersionNumber() (string, error) {
@@ -297,11 +295,19 @@ func (fc *firecracker) getVersionNumber() (string, error) {
 		return "", fmt.Errorf("Running checking FC version command failed: %v", err)
 	}
 
+	return fc.parseVersion(string(data))
+}
+
+func (fc *firecracker) parseVersion(data string) (string, error) {
+	// Firecracker versions 0.25 and over contains multiline output on "version" command.
+	// So we have to Check it and use first line of output to parse version.
+	lines := strings.Split(data, "\n")
+
 	var version string
-	fields := strings.Split(string(data), " ")
+	fields := strings.Split(lines[0], " ")
 	if len(fields) > 1 {
-		// The output format of `Firecracker --verion` is as follows
-		// Firecracker v0.21.1
+		// The output format of `Firecracker --version` is as follows
+		// Firecracker v0.23.1
 		version = strings.TrimPrefix(strings.TrimSpace(fields[1]), "v")
 		return version, nil
 	}
@@ -323,8 +329,8 @@ func (fc *firecracker) checkVersion(version string) error {
 }
 
 // waitVMMRunning will wait for timeout seconds for the VMM to be up and running.
-func (fc *firecracker) waitVMMRunning(timeout int) error {
-	span, _ := fc.trace("wait VMM to be running")
+func (fc *firecracker) waitVMMRunning(ctx context.Context, timeout int) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "wait VMM to be running", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	if timeout < 0 {
@@ -333,7 +339,7 @@ func (fc *firecracker) waitVMMRunning(timeout int) error {
 
 	timeStart := time.Now()
 	for {
-		if fc.vmRunning() {
+		if fc.vmRunning(ctx) {
 			return nil
 		}
 
@@ -345,12 +351,12 @@ func (fc *firecracker) waitVMMRunning(timeout int) error {
 	}
 }
 
-func (fc *firecracker) fcInit(timeout int) error {
-	span, _ := fc.trace("fcInit")
+func (fc *firecracker) fcInit(ctx context.Context, timeout int) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcInit", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	var err error
-	//FC version set and check
+	//FC version set and Check
 	if fc.info.Version, err = fc.getVersionNumber(); err != nil {
 		return err
 	}
@@ -374,7 +380,6 @@ func (fc *firecracker) fcInit(timeout int) error {
 	if fc.jailed {
 		jailedArgs := []string{
 			"--id", fc.id,
-			"--node", "0", //FIXME: Comprehend NUMA topology or explicit ignore
 			"--exec-file", fc.config.HypervisorPath,
 			"--uid", "0", //https://github.com/kata-containers/runtime/issues/1869
 			"--gid", "0",
@@ -411,17 +416,17 @@ func (fc *firecracker) fcInit(timeout int) error {
 
 	fc.info.PID = cmd.Process.Pid
 	fc.firecrackerd = cmd
-	fc.connection = fc.newFireClient()
+	fc.connection = fc.newFireClient(ctx)
 
-	if err := fc.waitVMMRunning(timeout); err != nil {
+	if err := fc.waitVMMRunning(ctx, timeout); err != nil {
 		fc.Logger().WithField("fcInit failed:", err).Debug()
 		return err
 	}
 	return nil
 }
 
-func (fc *firecracker) fcEnd() (err error) {
-	span, _ := fc.trace("fcEnd")
+func (fc *firecracker) fcEnd(ctx context.Context, waitOnly bool) (err error) {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcEnd", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	fc.Logger().Info("Stopping firecracker VM")
@@ -436,41 +441,23 @@ func (fc *firecracker) fcEnd() (err error) {
 
 	pid := fc.info.PID
 
-	// Send a SIGTERM to the VM process to try to stop it properly
-	if err = syscall.Kill(pid, syscall.SIGTERM); err != nil {
-		if err == syscall.ESRCH {
-			return nil
-		}
-		return err
+	shutdownSignal := syscall.SIGTERM
+
+	if waitOnly {
+		// NOP
+		shutdownSignal = syscall.Signal(0)
 	}
 
 	// Wait for the VM process to terminate
-	tInit := time.Now()
-	for {
-		if err = syscall.Kill(pid, syscall.Signal(0)); err != nil {
-			return nil
-		}
-
-		if time.Since(tInit).Seconds() >= fcStopSandboxTimeout {
-			fc.Logger().Warnf("VM still running after waiting %ds", fcStopSandboxTimeout)
-			break
-		}
-
-		// Let's avoid to run a too busy loop
-		time.Sleep(time.Duration(50) * time.Millisecond)
-	}
-
-	// Let's try with a hammer now, a SIGKILL should get rid of the
-	// VM process.
-	return syscall.Kill(pid, syscall.SIGKILL)
+	return utils.WaitLocalProcess(pid, fcStopSandboxTimeout, shutdownSignal, fc.Logger())
 }
 
-func (fc *firecracker) client() *client.Firecracker {
-	span, _ := fc.trace("client")
+func (fc *firecracker) client(ctx context.Context) *client.FirecrackerAPI {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "client", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	if fc.connection == nil {
-		fc.connection = fc.newFireClient()
+		fc.connection = fc.newFireClient(ctx)
 	}
 
 	return fc.connection
@@ -532,8 +519,8 @@ func (fc *firecracker) fcJailResource(src, dst string) (string, error) {
 	return absPath, nil
 }
 
-func (fc *firecracker) fcSetBootSource(path, params string) error {
-	span, _ := fc.trace("fcSetBootSource")
+func (fc *firecracker) fcSetBootSource(ctx context.Context, path, params string) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcSetBootSource", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 	fc.Logger().WithFields(logrus.Fields{"kernel-path": path,
 		"kernel-params": params}).Debug("fcSetBootSource")
@@ -553,8 +540,8 @@ func (fc *firecracker) fcSetBootSource(path, params string) error {
 	return nil
 }
 
-func (fc *firecracker) fcSetVMRootfs(path string) error {
-	span, _ := fc.trace("fcSetVMRootfs")
+func (fc *firecracker) fcSetVMRootfs(ctx context.Context, path string) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcSetVMRootfs", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	jailedRootfs, err := fc.fcJailResource(path, fcRootfs)
@@ -580,15 +567,15 @@ func (fc *firecracker) fcSetVMRootfs(path string) error {
 	return nil
 }
 
-func (fc *firecracker) fcSetVMBaseConfig(mem int64, vcpus int64, htEnabled bool) {
-	span, _ := fc.trace("fcSetVMBaseConfig")
+func (fc *firecracker) fcSetVMBaseConfig(ctx context.Context, mem int64, vcpus int64, smtEnabled bool) {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcSetVMBaseConfig", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 	fc.Logger().WithFields(logrus.Fields{"mem": mem,
-		"vcpus":     vcpus,
-		"htEnabled": htEnabled}).Debug("fcSetVMBaseConfig")
+		"vcpus":      vcpus,
+		"smtEnabled": smtEnabled}).Debug("fcSetVMBaseConfig")
 
 	cfg := &models.MachineConfiguration{
-		HtEnabled:  &htEnabled,
+		Smt:        &smtEnabled,
 		MemSizeMib: &mem,
 		VcpuCount:  &vcpus,
 	}
@@ -596,8 +583,8 @@ func (fc *firecracker) fcSetVMBaseConfig(mem int64, vcpus int64, htEnabled bool)
 	fc.fcConfig.MachineConfig = cfg
 }
 
-func (fc *firecracker) fcSetLogger() error {
-	span, _ := fc.trace("fcSetLogger")
+func (fc *firecracker) fcSetLogger(ctx context.Context) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcSetLogger", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	fcLogLevel := "Error"
@@ -611,16 +598,26 @@ func (fc *firecracker) fcSetLogger() error {
 		return fmt.Errorf("Failed setting log: %s", err)
 	}
 
+	fc.fcConfig.Logger = &models.Logger{
+		Level:   &fcLogLevel,
+		LogPath: &jailedLogFifo,
+	}
+
+	return err
+}
+
+func (fc *firecracker) fcSetMetrics(ctx context.Context) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcSetMetrics", fcTracingTags, map[string]string{"sandbox_id": fc.id})
+	defer span.End()
+
 	// listen to metrics file and transfer error info
 	jailedMetricsFifo, err := fc.fcListenToFifo(fcMetricsFifo, fc.updateMetrics)
 	if err != nil {
 		return fmt.Errorf("Failed setting log: %s", err)
 	}
 
-	fc.fcConfig.Logger = &models.Logger{
-		Level:       &fcLogLevel,
-		LogFifo:     &jailedLogFifo,
-		MetricsFifo: &jailedMetricsFifo,
+	fc.fcConfig.Metrics = &models.Metrics{
+		MetricsPath: &jailedMetricsFifo,
 	}
 
 	return err
@@ -673,7 +670,7 @@ func (fc *firecracker) fcListenToFifo(fifoName string, consumer fifoConsumer) (s
 	return jailedFifoPath, nil
 }
 
-func (fc *firecracker) fcInitConfiguration() error {
+func (fc *firecracker) fcInitConfiguration(ctx context.Context) error {
 	// Firecracker API socket(firecracker.socket) is automatically created
 	// under /run dir.
 	err := os.MkdirAll(filepath.Join(fc.jailerRoot, "run"), DirMode)
@@ -695,7 +692,7 @@ func (fc *firecracker) fcInitConfiguration() error {
 		}
 	}
 
-	fc.fcSetVMBaseConfig(int64(fc.config.MemorySize),
+	fc.fcSetVMBaseConfig(ctx, int64(fc.config.MemorySize),
 		int64(fc.config.NumVCPUs), false)
 
 	kernelPath, err := fc.config.KernelAssetPath()
@@ -703,6 +700,11 @@ func (fc *firecracker) fcInitConfiguration() error {
 		return err
 	}
 
+	params, err := GetKernelRootParams(fc.config.RootfsType, true, false)
+	if err != nil {
+		return err
+	}
+	fcKernelParams = append(params, fcKernelParams...)
 	if fc.config.Debug {
 		fcKernelParams = append(fcKernelParams, Param{"console", "ttyS0"})
 	} else {
@@ -716,7 +718,7 @@ func (fc *firecracker) fcInitConfiguration() error {
 	kernelParams := append(fc.config.KernelParams, fcKernelParams...)
 	strParams := SerializeParams(kernelParams, "=")
 	formattedParams := strings.Join(strParams, " ")
-	if err := fc.fcSetBootSource(kernelPath, formattedParams); err != nil {
+	if err := fc.fcSetBootSource(ctx, kernelPath, formattedParams); err != nil {
 		return err
 	}
 
@@ -732,21 +734,25 @@ func (fc *firecracker) fcInitConfiguration() error {
 		}
 	}
 
-	if err := fc.fcSetVMRootfs(image); err != nil {
+	if err := fc.fcSetVMRootfs(ctx, image); err != nil {
 		return err
 	}
 
-	if err := fc.createDiskPool(); err != nil {
+	if err := fc.createDiskPool(ctx); err != nil {
 		return err
 	}
 
-	if err := fc.fcSetLogger(); err != nil {
+	if err := fc.fcSetLogger(ctx); err != nil {
+		return err
+	}
+
+	if err := fc.fcSetMetrics(ctx); err != nil {
 		return err
 	}
 
 	fc.state.set(cfReady)
 	for _, d := range fc.pendingDevices {
-		if err := fc.addDevice(d.dev, d.devType); err != nil {
+		if err := fc.AddDevice(ctx, d.dev, d.devType); err != nil {
 			return err
 		}
 	}
@@ -757,14 +763,14 @@ func (fc *firecracker) fcInitConfiguration() error {
 	return nil
 }
 
-// startSandbox will start the hypervisor for the given sandbox.
+// StartVM will start the hypervisor for the given sandbox.
 // In the context of firecracker, this will start the hypervisor,
 // for configuration, but not yet start the actual virtual machine
-func (fc *firecracker) startSandbox(timeout int) error {
-	span, _ := fc.trace("startSandbox")
+func (fc *firecracker) StartVM(ctx context.Context, timeout int) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "StartVM", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
-	if err := fc.fcInitConfiguration(); err != nil {
+	if err := fc.fcInitConfiguration(ctx); err != nil {
 		return err
 	}
 
@@ -773,14 +779,14 @@ func (fc *firecracker) startSandbox(timeout int) error {
 		return errJSON
 	}
 
-	if err := ioutil.WriteFile(fc.fcConfigPath, data, 0640); err != nil {
+	if err := os.WriteFile(fc.fcConfigPath, data, 0640); err != nil {
 		return err
 	}
 
 	var err error
 	defer func() {
 		if err != nil {
-			fc.fcEnd()
+			fc.fcEnd(ctx, false)
 		}
 	}()
 
@@ -788,18 +794,21 @@ func (fc *firecracker) startSandbox(timeout int) error {
 	// are executed by kata-runtime after this call, run with the SELinux
 	// label. If these processes require privileged, we do not want to run
 	// them under confinement.
-	if err := label.SetProcessLabel(fc.config.SELinuxProcessLabel); err != nil {
-		return err
-	}
-	defer label.SetProcessLabel("")
+	if !fc.config.DisableSeLinux {
 
-	err = fc.fcInit(fcTimeout)
+		if err := label.SetProcessLabel(fc.config.SELinuxProcessLabel); err != nil {
+			return err
+		}
+		defer label.SetProcessLabel("")
+	}
+
+	err = fc.fcInit(ctx, fcTimeout)
 	if err != nil {
 		return err
 	}
 
 	// make sure 'others' don't have access to this socket
-	err = os.Chmod(filepath.Join(fc.jailerRoot, defaultHybridVSocketName), 0640)
+	err = os.Chmod(fc.hybridSocketPath, 0640)
 	if err != nil {
 		return fmt.Errorf("Could not change socket permissions: %v", err)
 	}
@@ -812,8 +821,8 @@ func fcDriveIndexToID(i int) string {
 	return "drive_" + strconv.Itoa(i)
 }
 
-func (fc *firecracker) createDiskPool() error {
-	span, _ := fc.trace("createDiskPool")
+func (fc *firecracker) createDiskPool(ctx context.Context) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "createDiskPool", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	for i := 0; i < fcDiskPoolSize; i++ {
@@ -850,8 +859,8 @@ func (fc *firecracker) umountResource(jailedPath string) {
 }
 
 // cleanup all jail artifacts
-func (fc *firecracker) cleanupJail() {
-	span, _ := fc.trace("cleanupJail")
+func (fc *firecracker) cleanupJail(ctx context.Context) {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "cleanupJail", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	fc.umountResource(fcKernel)
@@ -872,28 +881,28 @@ func (fc *firecracker) cleanupJail() {
 	}
 }
 
-// stopSandbox will stop the Sandbox's VM.
-func (fc *firecracker) stopSandbox() (err error) {
-	span, _ := fc.trace("stopSandbox")
+// StopVM will stop the Sandbox's VM.
+func (fc *firecracker) StopVM(ctx context.Context, waitOnly bool) (err error) {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "StopVM", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
-	return fc.fcEnd()
+	return fc.fcEnd(ctx, waitOnly)
 }
 
-func (fc *firecracker) pauseSandbox() error {
+func (fc *firecracker) PauseVM(ctx context.Context) error {
 	return nil
 }
 
-func (fc *firecracker) saveSandbox() error {
+func (fc *firecracker) SaveVM() error {
 	return nil
 }
 
-func (fc *firecracker) resumeSandbox() error {
+func (fc *firecracker) ResumeVM(ctx context.Context) error {
 	return nil
 }
 
-func (fc *firecracker) fcAddVsock(hvs types.HybridVSock) {
-	span, _ := fc.trace("fcAddVsock")
+func (fc *firecracker) fcAddVsock(ctx context.Context, hvs types.HybridVSock) {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcAddVsock", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	udsPath := hvs.UdsPath
@@ -901,27 +910,33 @@ func (fc *firecracker) fcAddVsock(hvs types.HybridVSock) {
 		udsPath = filepath.Join("/", defaultHybridVSocketName)
 	}
 
-	vsockID := "root"
+	// vsockID := "root"
 	ctxID := defaultGuestVSockCID
 	vsock := &models.Vsock{
 		GuestCid: &ctxID,
 		UdsPath:  &udsPath,
-		VsockID:  &vsockID,
+		VsockID:  "root",
 	}
 
 	fc.fcConfig.Vsock = vsock
 }
 
-func (fc *firecracker) fcAddNetDevice(endpoint Endpoint) {
-	span, _ := fc.trace("fcAddNetDevice")
+func (fc *firecracker) fcAddNetDevice(ctx context.Context, endpoint Endpoint) {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcAddNetDevice", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	ifaceID := endpoint.Name()
 
+	// VMFds are not used by Firecracker, as it opens the tuntap
+	// device by its name.  Let's just close those.
+	for _, f := range endpoint.NetworkPair().TapInterface.VMFds {
+		f.Close()
+	}
+
 	// The implementation of rate limiter is based on TBF.
 	// Rate Limiter defines a token bucket with a maximum capacity (size) to store tokens, and an interval for refilling purposes (refill_time).
 	// The refill-rate is derived from size and refill_time, and it is the constant rate at which the tokens replenish.
-	refillTime := uint64(1000)
+	refillTime := uint64(utils.DefaultRateLimiterRefillTimeMilliSecs)
 	var rxRateLimiter models.RateLimiter
 	rxSize := fc.config.RxRateLimiterMaxRate
 	if rxSize > 0 {
@@ -929,10 +944,13 @@ func (fc *firecracker) fcAddNetDevice(endpoint Endpoint) {
 
 		// kata-defined rxSize is in bits with scaling factors of 1000, but firecracker-defined
 		// rxSize is in bytes with scaling factors of 1024, need reversion.
-		rxSize = revertBytes(rxSize / 8)
+		rxSize = utils.RevertBytes(rxSize / 8)
+
+		iRefillTime := int64(refillTime)
+		iRxSize := int64(rxSize)
 		rxTokenBucket := models.TokenBucket{
-			RefillTime: &refillTime,
-			Size:       &rxSize,
+			RefillTime: &iRefillTime,
+			Size:       &iRxSize,
 		}
 		rxRateLimiter = models.RateLimiter{
 			Bandwidth: &rxTokenBucket,
@@ -946,10 +964,12 @@ func (fc *firecracker) fcAddNetDevice(endpoint Endpoint) {
 
 		// kata-defined txSize is in bits with scaling factors of 1000, but firecracker-defined
 		// txSize is in bytes with scaling factors of 1024, need reversion.
-		txSize = revertBytes(txSize / 8)
+		txSize = utils.RevertBytes(txSize / 8)
+		iRefillTime := int64(refillTime)
+		iTxSize := int64(txSize)
 		txTokenBucket := models.TokenBucket{
-			RefillTime: &refillTime,
-			Size:       &txSize,
+			RefillTime: &iRefillTime,
+			Size:       &iTxSize,
 		}
 		txRateLimiter = models.RateLimiter{
 			Bandwidth: &txTokenBucket,
@@ -957,19 +977,18 @@ func (fc *firecracker) fcAddNetDevice(endpoint Endpoint) {
 	}
 
 	ifaceCfg := &models.NetworkInterface{
-		AllowMmdsRequests: false,
-		GuestMac:          endpoint.HardwareAddr(),
-		IfaceID:           &ifaceID,
-		HostDevName:       &endpoint.NetworkPair().TapInterface.TAPIface.Name,
-		RxRateLimiter:     &rxRateLimiter,
-		TxRateLimiter:     &txRateLimiter,
+		GuestMac:      endpoint.HardwareAddr(),
+		IfaceID:       &ifaceID,
+		HostDevName:   &endpoint.NetworkPair().TapInterface.TAPIface.Name,
+		RxRateLimiter: &rxRateLimiter,
+		TxRateLimiter: &txRateLimiter,
 	}
 
 	fc.fcConfig.NetworkInterfaces = append(fc.fcConfig.NetworkInterfaces, ifaceCfg)
 }
 
-func (fc *firecracker) fcAddBlockDrive(drive config.BlockDrive) error {
-	span, _ := fc.trace("fcAddBlockDrive")
+func (fc *firecracker) fcAddBlockDrive(ctx context.Context, drive config.BlockDrive) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcAddBlockDrive", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	driveID := drive.ID
@@ -994,8 +1013,8 @@ func (fc *firecracker) fcAddBlockDrive(drive config.BlockDrive) error {
 }
 
 // Firecracker supports replacing the host drive used once the VM has booted up
-func (fc *firecracker) fcUpdateBlockDrive(path, id string) error {
-	span, _ := fc.trace("fcUpdateBlockDrive")
+func (fc *firecracker) fcUpdateBlockDrive(ctx context.Context, path, id string) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "fcUpdateBlockDrive", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	// Use the global block index as an index into the pool of the devices
@@ -1005,21 +1024,21 @@ func (fc *firecracker) fcUpdateBlockDrive(path, id string) error {
 
 	driveFc := &models.PartialDrive{
 		DriveID:    &id,
-		PathOnHost: &path, //This is the only property that can be modified
+		PathOnHost: path, //This is the only property that can be modified
 	}
 
 	driveParams.SetBody(driveFc)
-	if _, err := fc.client().Operations.PatchGuestDriveByID(driveParams); err != nil {
+	if _, err := fc.client(ctx).Operations.PatchGuestDriveByID(driveParams); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// addDevice will add extra devices to firecracker.  Limited to configure before the
+// AddDevice will add extra devices to firecracker.  Limited to configure before the
 // virtual machine starts.  Devices include drivers and network interfaces only.
-func (fc *firecracker) addDevice(devInfo interface{}, devType deviceType) error {
-	span, _ := fc.trace("addDevice")
+func (fc *firecracker) AddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) error {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "AddDevice", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	fc.state.RLock()
@@ -1039,13 +1058,13 @@ func (fc *firecracker) addDevice(devInfo interface{}, devType deviceType) error 
 	switch v := devInfo.(type) {
 	case Endpoint:
 		fc.Logger().WithField("device-type-endpoint", devInfo).Info("Adding device")
-		fc.fcAddNetDevice(v)
+		fc.fcAddNetDevice(ctx, v)
 	case config.BlockDrive:
 		fc.Logger().WithField("device-type-blockdrive", devInfo).Info("Adding device")
-		err = fc.fcAddBlockDrive(v)
+		err = fc.fcAddBlockDrive(ctx, v)
 	case types.HybridVSock:
 		fc.Logger().WithField("device-type-hybrid-vsock", devInfo).Info("Adding device")
-		fc.fcAddVsock(v)
+		fc.fcAddVsock(ctx, v)
 	default:
 		fc.Logger().WithField("unknown-device-type", devInfo).Error("Adding device")
 	}
@@ -1055,12 +1074,16 @@ func (fc *firecracker) addDevice(devInfo interface{}, devType deviceType) error 
 
 // hotplugBlockDevice supported in Firecracker VMM
 // hot add or remove a block device.
-func (fc *firecracker) hotplugBlockDevice(drive config.BlockDrive, op operation) (interface{}, error) {
+func (fc *firecracker) hotplugBlockDevice(ctx context.Context, drive config.BlockDrive, op Operation) (interface{}, error) {
+	if drive.Swap {
+		return nil, fmt.Errorf("firecracker doesn't support swap")
+	}
+
 	var path string
 	var err error
 	driveID := fcDriveIndexToID(drive.Index)
 
-	if op == addDevice {
+	if op == AddDevice {
 		//The drive placeholder has to exist prior to Update
 		path, err = fc.fcJailResource(drive.File, driveID)
 		if err != nil {
@@ -1072,47 +1095,52 @@ func (fc *firecracker) hotplugBlockDevice(drive config.BlockDrive, op operation)
 		fc.umountResource(driveID)
 		// use previous raw file created at createDiskPool, that way
 		// the resource is released by firecracker and it can be destroyed in the host
-		path = filepath.Join(fc.jailerRoot, driveID)
+		if fc.jailed {
+			// use path relative to the jail
+			path = filepath.Join("/", driveID)
+		} else {
+			path = filepath.Join(fc.jailerRoot, driveID)
+		}
 	}
 
-	return nil, fc.fcUpdateBlockDrive(path, driveID)
+	return nil, fc.fcUpdateBlockDrive(ctx, path, driveID)
 }
 
 // hotplugAddDevice supported in Firecracker VMM
-func (fc *firecracker) hotplugAddDevice(devInfo interface{}, devType deviceType) (interface{}, error) {
-	span, _ := fc.trace("hotplugAddDevice")
+func (fc *firecracker) HotplugAddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error) {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "HotplugAddDevice", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	switch devType {
-	case blockDev:
-		return fc.hotplugBlockDevice(*devInfo.(*config.BlockDrive), addDevice)
+	case BlockDev:
+		return fc.hotplugBlockDevice(ctx, *devInfo.(*config.BlockDrive), AddDevice)
 	default:
 		fc.Logger().WithFields(logrus.Fields{"devInfo": devInfo,
-			"deviceType": devType}).Warn("hotplugAddDevice: unsupported device")
+			"deviceType": devType}).Warn("HotplugAddDevice: unsupported device")
 		return nil, fmt.Errorf("Could not hot add device: unsupported device: %v, type: %v",
 			devInfo, devType)
 	}
 }
 
 // hotplugRemoveDevice supported in Firecracker VMM
-func (fc *firecracker) hotplugRemoveDevice(devInfo interface{}, devType deviceType) (interface{}, error) {
-	span, _ := fc.trace("hotplugRemoveDevice")
+func (fc *firecracker) HotplugRemoveDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error) {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "HotplugRemoveDevice", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 
 	switch devType {
-	case blockDev:
-		return fc.hotplugBlockDevice(*devInfo.(*config.BlockDrive), removeDevice)
+	case BlockDev:
+		return fc.hotplugBlockDevice(ctx, *devInfo.(*config.BlockDrive), RemoveDevice)
 	default:
 		fc.Logger().WithFields(logrus.Fields{"devInfo": devInfo,
-			"deviceType": devType}).Error("hotplugRemoveDevice: unsupported device")
+			"deviceType": devType}).Error("HotplugRemoveDevice: unsupported device")
 		return nil, fmt.Errorf("Could not hot remove device: unsupported device: %v, type: %v",
 			devInfo, devType)
 	}
 }
 
-// getSandboxConsole builds the path of the console where we can read
-// logs coming from the sandbox.
-func (fc *firecracker) getSandboxConsole(id string) (string, string, error) {
+// GetVMConsole builds the path of the console where we can read logs coming
+// from the sandbox.
+func (fc *firecracker) GetVMConsole(ctx context.Context, id string) (string, string, error) {
 	master, slave, err := console.NewPty()
 	if err != nil {
 		fc.Logger().Debugf("Error create pseudo tty: %v", err)
@@ -1123,13 +1151,13 @@ func (fc *firecracker) getSandboxConsole(id string) (string, string, error) {
 	return consoleProtoPty, slave, nil
 }
 
-func (fc *firecracker) disconnect() {
+func (fc *firecracker) Disconnect(ctx context.Context) {
 	fc.state.set(notReady)
 }
 
 // Adds all capabilities supported by firecracker implementation of hypervisor interface
-func (fc *firecracker) capabilities() types.Capabilities {
-	span, _ := fc.trace("capabilities")
+func (fc *firecracker) Capabilities(ctx context.Context) types.Capabilities {
+	span, _ := katatrace.Trace(ctx, fc.Logger(), "Capabilities", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
 	var caps types.Capabilities
 	caps.SetBlockDeviceHotplugSupport()
@@ -1137,15 +1165,19 @@ func (fc *firecracker) capabilities() types.Capabilities {
 	return caps
 }
 
-func (fc *firecracker) hypervisorConfig() HypervisorConfig {
+func (fc *firecracker) HypervisorConfig() HypervisorConfig {
 	return fc.config
 }
 
-func (fc *firecracker) resizeMemory(reqMemMB uint32, memoryBlockSizeMB uint32, probe bool) (uint32, memoryDevice, error) {
-	return 0, memoryDevice{}, nil
+func (fc *firecracker) GetTotalMemoryMB(ctx context.Context) uint32 {
+	return fc.config.MemorySize
 }
 
-func (fc *firecracker) resizeVCPUs(reqVCPUs uint32) (currentVCPUs uint32, newVCPUs uint32, err error) {
+func (fc *firecracker) ResizeMemory(ctx context.Context, reqMemMB uint32, memoryBlockSizeMB uint32, probe bool) (uint32, MemoryDevice, error) {
+	return 0, MemoryDevice{}, nil
+}
+
+func (fc *firecracker) ResizeVCPUs(ctx context.Context, reqVCPUs uint32) (currentVCPUs uint32, newVCPUs uint32, err error) {
 	return 0, 0, nil
 }
 
@@ -1153,8 +1185,8 @@ func (fc *firecracker) resizeVCPUs(reqVCPUs uint32) (currentVCPUs uint32, newVCP
 //
 // As suggested by https://github.com/firecracker-microvm/firecracker/issues/718,
 // let's use `ps -T -p <pid>` to get fc vcpu info.
-func (fc *firecracker) getThreadIDs() (vcpuThreadIDs, error) {
-	var vcpuInfo vcpuThreadIDs
+func (fc *firecracker) GetThreadIDs(ctx context.Context) (VcpuThreadIDs, error) {
+	var vcpuInfo VcpuThreadIDs
 
 	vcpuInfo.vcpus = make(map[int]int)
 	parent, err := utils.NewProc(fc.info.PID)
@@ -1177,7 +1209,11 @@ func (fc *firecracker) getThreadIDs() (vcpuThreadIDs, error) {
 		if len(cpus) != 2 {
 			return vcpuInfo, errors.Errorf("Invalid fc thread info: %v", comm)
 		}
-		cpuID, err := strconv.ParseInt(cpus[1], 10, 32)
+
+		//Remove the leading whitespace
+		cpuIdStr := strings.TrimSpace(cpus[1])
+
+		cpuID, err := strconv.ParseInt(cpuIdStr, 10, 32)
 		if err != nil {
 			return vcpuInfo, errors.Wrapf(err, "Invalid fc thread info: %v", comm)
 		}
@@ -1187,34 +1223,38 @@ func (fc *firecracker) getThreadIDs() (vcpuThreadIDs, error) {
 	return vcpuInfo, nil
 }
 
-func (fc *firecracker) cleanup() error {
-	fc.cleanupJail()
+func (fc *firecracker) Cleanup(ctx context.Context) error {
+	fc.cleanupJail(ctx)
 	return nil
 }
 
-func (fc *firecracker) getPids() []int {
+func (fc *firecracker) GetPids() []int {
 	return []int{fc.info.PID}
+}
+
+func (fc *firecracker) GetVirtioFsPid() *int {
+	return nil
 }
 
 func (fc *firecracker) fromGrpc(ctx context.Context, hypervisorConfig *HypervisorConfig, j []byte) error {
 	return errors.New("firecracker is not supported by VM cache")
 }
 
-func (fc *firecracker) toGrpc() ([]byte, error) {
+func (fc *firecracker) toGrpc(ctx context.Context) ([]byte, error) {
 	return nil, errors.New("firecracker is not supported by VM cache")
 }
 
-func (fc *firecracker) save() (s persistapi.HypervisorState) {
+func (fc *firecracker) Save() (s hv.HypervisorState) {
 	s.Pid = fc.info.PID
 	s.Type = string(FirecrackerHypervisor)
 	return
 }
 
-func (fc *firecracker) load(s persistapi.HypervisorState) {
+func (fc *firecracker) Load(s hv.HypervisorState) {
 	fc.info.PID = s.Pid
 }
 
-func (fc *firecracker) check() error {
+func (fc *firecracker) Check() error {
 	if err := syscall.Kill(fc.info.PID, syscall.Signal(0)); err != nil {
 		return errors.Wrapf(err, "failed to ping fc process")
 	}
@@ -1222,32 +1262,21 @@ func (fc *firecracker) check() error {
 	return nil
 }
 
-func (fc *firecracker) generateSocket(id string) (interface{}, error) {
+func (fc *firecracker) GenerateSocket(id string) (interface{}, error) {
 	fc.Logger().Debug("Using hybrid-vsock endpoint")
-	udsPath := filepath.Join(fc.jailerRoot, defaultHybridVSocketName)
+
+	// Method is being run outside of the normal container workflow
+	if fc.jailerRoot == "" {
+		fc.id = id
+		fc.setPaths(&fc.config)
+	}
 
 	return types.HybridVSock{
-		UdsPath: udsPath,
+		UdsPath: fc.hybridSocketPath,
 		Port:    uint32(vSockPort),
 	}, nil
 }
 
-func (fc *firecracker) isRateLimiterBuiltin() bool {
+func (fc *firecracker) IsRateLimiterBuiltin() bool {
 	return true
-}
-
-// In firecracker, it accepts the size of rate limiter in scaling factors of 2^10(1024)
-// But in kata-defined rate limiter, for better Human-readability, we prefer scaling factors of 10^3(1000).
-// func revertByte reverts num from scaling factors of 1000 to 1024, e.g. 10000000(10MB) to 10485760.
-func revertBytes(num uint64) uint64 {
-	a := num / 1000
-	b := num % 1000
-	if a == 0 {
-		return num
-	} else {
-		return 1024*revertBytes(a) + b
-	}
-}
-
-func (fc *firecracker) setSandbox(sandbox *Sandbox) {
 }

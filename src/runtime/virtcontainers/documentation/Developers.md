@@ -1,22 +1,9 @@
-
-Table of Contents
-=================
-
-   * [Prerequisites](#prerequisites)
-   * [Building](#building)
-   * [Testing](#testing)
-   * [Submitting changes](#submitting-changes)
-
 # Prerequisites
 
 `virtcontainers` has a few prerequisites for development:
 
-- docker
 - CNI
 - golang
-
-A number of these can be installed using the
-[virtcontainers-setup.sh](../utils/virtcontainers-setup.sh) script.
 
 # Building
 
@@ -52,4 +39,3 @@ This will:
 
 For details on the format and how to submit changes, refer to the
 [Contributing](../../../../CONTRIBUTING.md) document.
-

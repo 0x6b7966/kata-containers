@@ -15,9 +15,9 @@ import (
 	"testing"
 
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
+	resCtrl "github.com/kata-containers/kata-containers/src/runtime/pkg/resourcecontrol"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
-	vccgroups "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/mock"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
@@ -49,7 +49,7 @@ func newEmptySpec() *specs.Spec {
 	return &specs.Spec{
 		Linux: &specs.Linux{
 			Resources:   &specs.LinuxResources{},
-			CgroupsPath: vccgroups.DefaultCgroupPath,
+			CgroupsPath: resCtrl.DefaultResourceControllerID,
 		},
 		Process: &specs.Process{
 			Capabilities: &specs.LinuxCapabilities{},
@@ -74,20 +74,10 @@ func newBasicTestCmd() types.Cmd {
 	return cmd
 }
 
-func rmSandboxDir(sid string) error {
-	store, err := persist.GetDriver()
-	if err != nil {
-		return fmt.Errorf("failed to get fs persist driver: %v", err)
-	}
-
-	store.Destroy(sid)
-	return nil
-}
-
 func newTestSandboxConfigNoop() SandboxConfig {
 	bundlePath := filepath.Join(testDir, testBundle)
 	containerAnnotations[annotations.BundlePathKey] = bundlePath
-	// containerAnnotations["com.github.containers.virtcontainers.pkg.oci.container_type"] = "pod_sandbox"
+	containerAnnotations[annotations.ContainerTypeKey] = "pod_sandbox"
 
 	emptySpec := newEmptySpec()
 
@@ -141,13 +131,21 @@ func newTestSandboxConfigKataAgent() SandboxConfig {
 }
 
 func TestCreateSandboxNoopAgentSuccessful(t *testing.T) {
-	defer cleanUp()
 	assert := assert.New(t)
+	if tc.NotValid(ktu.NeedRoot()) {
+		t.Skip(testDisabledAsNonRoot)
+	}
+	defer cleanUp()
+
+	// Pre-create the directory path to avoid panic error. Without this change, ff the test is run as a non-root user,
+	// this test will fail because of permission denied error in chown syscall in the utils.MkdirAllWithInheritedOwner() method
+	err := os.MkdirAll(fs.MockRunStoragePath(), DirMode)
+	assert.NoError(err)
 
 	config := newTestSandboxConfigNoop()
 
 	ctx := WithNewAgentFunc(context.Background(), newMockAgent)
-	p, err := CreateSandbox(ctx, config, nil)
+	p, err := CreateSandbox(ctx, config, nil, nil)
 	assert.NoError(err)
 	assert.NotNil(p)
 
@@ -155,7 +153,7 @@ func TestCreateSandboxNoopAgentSuccessful(t *testing.T) {
 	assert.True(ok)
 	assert.NotNil(s)
 
-	sandboxDir := filepath.Join(s.newStore.RunStoragePath(), p.ID())
+	sandboxDir := filepath.Join(s.store.RunStoragePath(), p.ID())
 	_, err = os.Stat(sandboxDir)
 	assert.NoError(err)
 }
@@ -170,31 +168,38 @@ func TestCreateSandboxKataAgentSuccessful(t *testing.T) {
 
 	config := newTestSandboxConfigKataAgent()
 
+	url, err := mock.GenerateKataMockHybridVSock()
+	assert.NoError(err)
+	defer mock.RemoveKataMockHybridVSock(url)
+
 	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
-	err := hybridVSockTTRPCMock.Start(fmt.Sprintf("mock://%s", MockHybridVSockPath))
+	err = hybridVSockTTRPCMock.Start(url)
 	assert.NoError(err)
 	defer hybridVSockTTRPCMock.Stop()
 
 	ctx := WithNewAgentFunc(context.Background(), newMockAgent)
-	p, err := CreateSandbox(ctx, config, nil)
+	p, err := CreateSandbox(ctx, config, nil, nil)
 	assert.NoError(err)
 	assert.NotNil(p)
 
 	s, ok := p.(*Sandbox)
 	assert.True(ok)
-	sandboxDir := filepath.Join(s.newStore.RunStoragePath(), p.ID())
+	sandboxDir := filepath.Join(s.store.RunStoragePath(), p.ID())
 	_, err = os.Stat(sandboxDir)
 	assert.NoError(err)
 }
 
 func TestCreateSandboxFailing(t *testing.T) {
+	if tc.NotValid(ktu.NeedRoot()) {
+		t.Skip(testDisabledAsNonRoot)
+	}
 	defer cleanUp()
 	assert := assert.New(t)
 
 	config := SandboxConfig{}
 
 	ctx := WithNewAgentFunc(context.Background(), newMockAgent)
-	p, err := CreateSandbox(ctx, config, nil)
+	p, err := CreateSandbox(ctx, config, nil, nil)
 	assert.Error(err)
 	assert.Nil(p.(*Sandbox))
 }
@@ -202,26 +207,6 @@ func TestCreateSandboxFailing(t *testing.T) {
 /*
  * Benchmarks
  */
-
-func createNewSandboxConfig(hType HypervisorType) SandboxConfig {
-	hypervisorConfig := HypervisorConfig{
-		KernelPath:     "/usr/share/kata-containers/vmlinux.container",
-		ImagePath:      "/usr/share/kata-containers/kata-containers.img",
-		HypervisorPath: "/usr/bin/qemu-system-x86_64",
-	}
-
-	netConfig := NetworkConfig{}
-
-	return SandboxConfig{
-		ID:               testSandboxID,
-		HypervisorType:   hType,
-		HypervisorConfig: hypervisorConfig,
-
-		AgentConfig: KataAgentConfig{},
-
-		NetworkConfig: netConfig,
-	}
-}
 
 func newTestContainerConfigNoop(contID string) ContainerConfig {
 	// Define the container command and bundle.
@@ -242,7 +227,7 @@ func createAndStartSandbox(ctx context.Context, config SandboxConfig) (sandbox V
 	err error) {
 
 	// Create sandbox
-	sandbox, err = CreateSandbox(ctx, config, nil)
+	sandbox, err = CreateSandbox(ctx, config, nil, nil)
 	if sandbox == nil || err != nil {
 		return nil, "", err
 	}
@@ -251,14 +236,14 @@ func createAndStartSandbox(ctx context.Context, config SandboxConfig) (sandbox V
 	if !ok {
 		return nil, "", fmt.Errorf("Could not get Sandbox")
 	}
-	sandboxDir = filepath.Join(s.newStore.RunStoragePath(), sandbox.ID())
+	sandboxDir = filepath.Join(s.store.RunStoragePath(), sandbox.ID())
 	_, err = os.Stat(sandboxDir)
 	if err != nil {
 		return nil, "", err
 	}
 
 	// Start sandbox
-	err = sandbox.Start()
+	err = sandbox.Start(ctx)
 	if err != nil {
 		return nil, "", err
 	}
@@ -267,20 +252,27 @@ func createAndStartSandbox(ctx context.Context, config SandboxConfig) (sandbox V
 }
 
 func TestReleaseSandbox(t *testing.T) {
+	if tc.NotValid(ktu.NeedRoot()) {
+		t.Skip(testDisabledAsNonRoot)
+	}
 	defer cleanUp()
 
 	config := newTestSandboxConfigNoop()
 
 	ctx := WithNewAgentFunc(context.Background(), newMockAgent)
-	s, err := CreateSandbox(ctx, config, nil)
+	s, err := CreateSandbox(ctx, config, nil, nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, s)
 
-	err = s.Release()
+	err = s.Release(ctx)
 	assert.Nil(t, err, "sandbox release failed: %v", err)
 }
 
 func TestCleanupContainer(t *testing.T) {
+	if tc.NotValid(ktu.NeedRoot()) {
+		t.Skip(testDisabledAsNonRoot)
+	}
+
 	config := newTestSandboxConfigNoop()
 	assert := assert.New(t)
 
@@ -295,12 +287,12 @@ func TestCleanupContainer(t *testing.T) {
 	for _, contID := range contIDs {
 		contConfig := newTestContainerConfigNoop(contID)
 
-		c, err := p.CreateContainer(contConfig)
+		c, err := p.CreateContainer(ctx, contConfig)
 		if c == nil || err != nil {
 			t.Fatal(err)
 		}
 
-		c, err = p.StartContainer(c.ID())
+		c, err = p.StartContainer(context.Background(), c.ID())
 		if c == nil || err != nil {
 			t.Fatal(err)
 		}
@@ -312,7 +304,7 @@ func TestCleanupContainer(t *testing.T) {
 
 	s, ok := p.(*Sandbox)
 	assert.True(ok)
-	sandboxDir := filepath.Join(s.newStore.RunStoragePath(), p.ID())
+	sandboxDir := filepath.Join(s.store.RunStoragePath(), p.ID())
 
 	_, err = os.Stat(sandboxDir)
 	if err == nil {

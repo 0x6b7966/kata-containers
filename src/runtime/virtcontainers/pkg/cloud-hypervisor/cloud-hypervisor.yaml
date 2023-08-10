@@ -8,10 +8,9 @@ info:
   version: 0.3.0
 
 servers:
-- url: http://localhost/api/v1
+  - url: http://localhost/api/v1
 
 paths:
-
   /vmm.ping:
     get:
       summary: Ping the VMM to check for API server availability
@@ -21,7 +20,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/VmmPingResponse'
+                $ref: "#/components/schemas/VmmPingResponse"
 
   /vmm.shutdown:
     put:
@@ -40,7 +39,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/VmInfo'
+                $ref: "#/components/schemas/VmInfo"
 
   /vm.counters:
     get:
@@ -51,7 +50,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/VmCounters'
+                $ref: "#/components/schemas/VmCounters"
 
   /vm.create:
     put:
@@ -62,7 +61,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VmConfig'
+              $ref: "#/components/schemas/VmConfig"
         required: true
       responses:
         204:
@@ -134,6 +133,18 @@ paths:
         405:
           description: The VM instance could not reboot because it is not booted.
 
+  /vm.power-button:
+    put:
+      summary: Trigger a power button in the VM
+      operationId: power-buttonVM
+      responses:
+        204:
+          description: Power button successfully triggered in the VM
+        404:
+          description: The button could not be triggered because it is not created yet
+        405:
+          description: The button could not be triggered because it is not booted.
+
   /vm.resize:
     put:
       summary: Resize the VM
@@ -142,7 +153,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VmResize'
+              $ref: "#/components/schemas/VmResize"
         required: true
       responses:
         204:
@@ -158,7 +169,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VmResizeZone'
+              $ref: "#/components/schemas/VmResizeZone"
         required: true
       responses:
         204:
@@ -174,7 +185,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VmAddDevice'
+              $ref: "#/components/schemas/DeviceConfig"
         required: true
       responses:
         200:
@@ -182,7 +193,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PciDeviceInfo'
+                $ref: "#/components/schemas/PciDeviceInfo"
+        204:
+          description: The new device was successfully (cold) added to the VM instance.
         404:
           description: The new device could not be added to the VM instance.
 
@@ -194,7 +207,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VmRemoveDevice'
+              $ref: "#/components/schemas/VmRemoveDevice"
         required: true
       responses:
         204:
@@ -210,7 +223,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/DiskConfig'
+              $ref: "#/components/schemas/DiskConfig"
         required: true
       responses:
         200:
@@ -218,7 +231,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PciDeviceInfo'
+                $ref: "#/components/schemas/PciDeviceInfo"
+        204:
+          description: The new disk was successfully (cold) added to the VM instance.
         500:
           description: The new disk could not be added to the VM instance.
 
@@ -230,7 +245,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/FsConfig'
+              $ref: "#/components/schemas/FsConfig"
         required: true
       responses:
         200:
@@ -238,7 +253,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PciDeviceInfo'
+                $ref: "#/components/schemas/PciDeviceInfo"
+        204:
+          description: The new device was successfully (cold) added to the VM instance.
         500:
           description: The new device could not be added to the VM instance.
 
@@ -250,7 +267,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PmemConfig'
+              $ref: "#/components/schemas/PmemConfig"
         required: true
       responses:
         200:
@@ -258,7 +275,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PciDeviceInfo'
+                $ref: "#/components/schemas/PciDeviceInfo"
+        204:
+          description: The new device was successfully (cold) added to the VM instance.
         500:
           description: The new device could not be added to the VM instance.
 
@@ -270,7 +289,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/NetConfig'
+              $ref: "#/components/schemas/NetConfig"
         required: true
       responses:
         200:
@@ -278,7 +297,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PciDeviceInfo'
+                $ref: "#/components/schemas/PciDeviceInfo"
+        204:
+          description: The new device was successfully (cold) added to the VM instance.
         500:
           description: The new device could not be added to the VM instance.
 
@@ -290,7 +311,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VsockConfig'
+              $ref: "#/components/schemas/VsockConfig"
         required: true
       responses:
         200:
@@ -298,10 +319,33 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PciDeviceInfo'
+                $ref: "#/components/schemas/PciDeviceInfo"
+        204:
+          description: The new device was successfully (cold) added to the VM instance.
         500:
           description: The new device could not be added to the VM instance.
 
+  /vm.add-vdpa:
+    put:
+      summary: Add a new vDPA device to the VM
+      requestBody:
+        description: The details of the new vDPA device
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VdpaConfig"
+        required: true
+      responses:
+        200:
+          description: The new vDPA device was successfully added to the VM instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PciDeviceInfo"
+        204:
+          description: The new vDPA device was successfully (cold) added to the VM instance.
+        500:
+          description: The new vDPA device could not be added to the VM instance.
 
   /vm.snapshot:
     put:
@@ -311,7 +355,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/VmSnapshotConfig'
+              $ref: "#/components/schemas/VmSnapshotConfig"
         required: true
       responses:
         204:
@@ -321,6 +365,24 @@ paths:
         405:
           description: The VM instance could not be snapshotted because it is not booted.
 
+  /vm.coredump:
+    put:
+      summary: Takes a VM coredump.
+      requestBody:
+        description: The coredump configuration
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmCoredumpData"
+        required: true
+      responses:
+        204:
+          description: The VM instance was successfully coredumped.
+        404:
+          description: The VM instance could not be coredumped because it is not created.
+        405:
+          description: The VM instance could not be coredumped because it is not booted.
+
   /vm.restore:
     put:
       summary: Restore a VM from a snapshot.
@@ -329,7 +391,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RestoreConfig'
+              $ref: "#/components/schemas/RestoreConfig"
         required: true
       responses:
         204:
@@ -337,26 +399,62 @@ paths:
         404:
           description: The VM instance could not be restored because it is already created.
 
+  /vm.receive-migration:
+    put:
+      summary: Receive a VM migration from URL
+      requestBody:
+        description: The URL for the reception of migration state
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReceiveMigrationData"
+        required: true
+      responses:
+        204:
+          description: The VM migration was successfully received.
+        500:
+          description: The VM migration could not be received.
+
+  /vm.send-migration:
+    put:
+      summary: Send a VM migration to URL
+      requestBody:
+        description: The URL for sending the migration state
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMigrationData"
+        required: true
+      responses:
+        204:
+          description: The VM migration was successfully sent.
+        500:
+          description: The VM migration could not be sent.
+
 components:
   schemas:
-
     VmmPingResponse:
       required:
-      - version
+        - version
       type: object
       properties:
+        build_version:
+          type: string
         version:
           type: string
+        pid:
+          type: integer
+          format: int64
       description: Virtual Machine Monitor information
 
     VmInfo:
       required:
-      - config
-      - state
+        - config
+        - state
       type: object
       properties:
         config:
-          $ref: '#/components/schemas/VmConfig'
+          $ref: "#/components/schemas/VmConfig"
         state:
           type: string
           enum: [Created, Running, Shutdown, Paused]
@@ -366,7 +464,7 @@ components:
         device_tree:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/DeviceNode'
+            $ref: "#/components/schemas/DeviceNode"
       description: Virtual Machine information
 
     DeviceNode:
@@ -384,9 +482,8 @@ components:
           items:
             type: string
         pci_bdf:
-          type: integer
-          format: int32
-        
+          type: string
+
     VmCounters:
       type: object
       additionalProperties:
@@ -397,8 +494,8 @@ components:
 
     PciDeviceInfo:
       required:
-      - id
-      - bdf
+        - id
+        - bdf
       type: object
       properties:
         id:
@@ -407,66 +504,102 @@ components:
           type: string
       description: Information about a PCI device
 
+    PayloadConfig:
+      type: object
+      properties:
+        firmware:
+          type: string
+        kernel:
+          type: string
+        cmdline:
+          type: string
+        initramfs:
+          type: string
+      description: Payloads to boot in guest
+
     VmConfig:
       required:
-      - kernel
+        - payload
       type: object
       properties:
         cpus:
-          $ref: '#/components/schemas/CpusConfig'
+          $ref: "#/components/schemas/CpusConfig"
         memory:
-          $ref: '#/components/schemas/MemoryConfig'
-        kernel:
-          $ref: '#/components/schemas/KernelConfig'
-        initramfs:
-          $ref: '#/components/schemas/InitramfsConfig'
-        cmdline:
-          $ref: '#/components/schemas/CmdLineConfig'
+          $ref: "#/components/schemas/MemoryConfig"
+        payload:
+          $ref: "#/components/schemas/PayloadConfig"
         disks:
           type: array
           items:
-            $ref: '#/components/schemas/DiskConfig'
+            $ref: "#/components/schemas/DiskConfig"
         net:
           type: array
           items:
-            $ref: '#/components/schemas/NetConfig'
+            $ref: "#/components/schemas/NetConfig"
         rng:
-          $ref: '#/components/schemas/RngConfig'
+          $ref: "#/components/schemas/RngConfig"
         balloon:
-          $ref: '#/components/schemas/BalloonConfig'
+          $ref: "#/components/schemas/BalloonConfig"
         fs:
           type: array
           items:
-            $ref: '#/components/schemas/FsConfig'
+            $ref: "#/components/schemas/FsConfig"
         pmem:
           type: array
           items:
-            $ref: '#/components/schemas/PmemConfig'
+            $ref: "#/components/schemas/PmemConfig"
         serial:
-          $ref: '#/components/schemas/ConsoleConfig'
+          $ref: "#/components/schemas/ConsoleConfig"
         console:
-          $ref: '#/components/schemas/ConsoleConfig'
+          $ref: "#/components/schemas/ConsoleConfig"
         devices:
           type: array
           items:
-            $ref: '#/components/schemas/DeviceConfig'
+            $ref: "#/components/schemas/DeviceConfig"
+        vdpa:
+          type: array
+          items:
+            $ref: "#/components/schemas/VdpaConfig"
         vsock:
-            $ref: '#/components/schemas/VsockConfig'
+          $ref: "#/components/schemas/VsockConfig"
         sgx_epc:
           type: array
           items:
-            $ref: '#/components/schemas/SgxEpcConfig'
+            $ref: "#/components/schemas/SgxEpcConfig"
         numa:
           type: array
           items:
-            $ref: '#/components/schemas/NumaConfig'
+            $ref: "#/components/schemas/NumaConfig"
         iommu:
           type: boolean
           default: false
         watchdog:
           type: boolean
           default: false
+        platform:
+          $ref: "#/components/schemas/PlatformConfig"
+        tpm:
+          $ref: "#/components/schemas/TpmConfig"
       description: Virtual machine configuration
+
+    CpuAffinity:
+      required:
+        - vcpu
+        - host_cpus
+      type: object
+      properties:
+        vcpu:
+          type: integer
+        host_cpus:
+          type: array
+          items:
+            type: integer
+
+    CpuFeatures:
+      type: object
+      properties:
+        amx:
+          type: boolean
 
     CpuTopology:
       type: object
@@ -482,8 +615,8 @@ components:
 
     CpusConfig:
       required:
-      - boot_vcpus
-      - max_vcpus
+        - boot_vcpus
+        - max_vcpus
       type: object
       properties:
         boot_vcpus:
@@ -495,14 +628,46 @@ components:
           default: 1
           type: integer
         topology:
-            $ref: '#/components/schemas/CpuTopology'
+          $ref: "#/components/schemas/CpuTopology"
+        kvm_hyperv:
+          type: boolean
+          default: false
         max_phys_bits:
           type: integer
+        affinity:
+          type: array
+          items:
+            $ref: "#/components/schemas/CpuAffinity"
+        features:
+          $ref: "#/components/schemas/CpuFeatures"
+
+    PlatformConfig:
+      type: object
+      properties:
+        num_pci_segments:
+          type: integer
+          format: int16
+        iommu_segments:
+          type: array
+          items:
+            type: integer
+            format: int16
+        serial_number:
+          type: string
+        uuid:
+          type: string
+        oem_strings:
+          type: array
+          items:
+            type: string
+        tdx:
+          type: boolean
+          default: false
 
     MemoryZoneConfig:
       required:
-      - id
-      - size
+        - id
+        - size
       type: object
       properties:
         id:
@@ -522,6 +687,9 @@ components:
         hugepages:
           type: boolean
           default: false
+        hugepage_size:
+          type: integer
+          format: int64
         host_numa_node:
           type: integer
           format: int32
@@ -531,10 +699,13 @@ components:
         hotplugged_size:
           type: integer
           format: int64
+        prefault:
+          type: boolean
+          default: false
 
     MemoryConfig:
       required:
-      - size
+        - size
       type: object
       properties:
         size:
@@ -552,46 +723,72 @@ components:
           default: false
         hotplug_method:
           type: string
-          default: "acpi"
+          default: "Acpi"
         shared:
           type: boolean
           default: false
         hugepages:
           type: boolean
           default: false
+        hugepage_size:
+          type: integer
+          format: int64
+        prefault:
+          type: boolean
+          default: false
+        thp:
+          type: boolean
+          default: true
         zones:
           type: array
           items:
-            $ref: '#/components/schemas/MemoryZoneConfig'
+            $ref: "#/components/schemas/MemoryZoneConfig"
 
-    KernelConfig:
+    TokenBucket:
       required:
-      - path
+        - size
+        - refill_time
       type: object
       properties:
-        path:
-          type: string
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The total number of tokens this bucket can hold.
+        one_time_burst:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The initial size of a token bucket.
+        refill_time:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The amount of milliseconds it takes for the bucket to refill.
+      description:
+        Defines a token bucket with a maximum capacity (_size_), an initial burst size
+        (_one_time_burst_) and an interval for refilling purposes (_refill_time_).
+        The refill-rate is derived from _size_ and _refill_time_, and it is the constant
+        rate at which the tokens replenish. The refill process only starts happening after
+        the initial burst budget is consumed.
+        Consumption from the token bucket is unbounded in speed which allows for bursts
+        bound in size by the amount of tokens available.
+        Once the token bucket is empty, consumption speed is bound by the refill-rate.
 
-    InitramfsConfig:
-      nullable: true
-      required:
-      - path
+    RateLimiterConfig:
       type: object
       properties:
-        path:
-          type: string
-
-    CmdLineConfig:
-      required:
-      - args
-      type: object
-      properties:
-        args:
-          type: string
+        bandwidth:
+          $ref: "#/components/schemas/TokenBucket"
+        ops:
+          $ref: "#/components/schemas/TokenBucket"
+      description:
+        Defines an IO rate limiter with independent bytes/s and ops/s limits.
+        Limits are defined by configuring each of the _bandwidth_ and _ops_ token buckets.
 
     DiskConfig:
       required:
-      - path
+        - path
       type: object
       properties:
         path:
@@ -616,9 +813,11 @@ components:
           default: false
         vhost_socket:
           type: string
-        poll_queue:
-          type: boolean
-          default: true
+        rate_limiter_config:
+          $ref: "#/components/schemas/RateLimiterConfig"
+        pci_segment:
+          type: integer
+          format: int16
         id:
           type: string
 
@@ -627,7 +826,6 @@ components:
       properties:
         tap:
           type: string
-          default: ""
         ip:
           type: string
           default: "192.168.249.1"
@@ -636,6 +834,10 @@ components:
           default: "255.255.255.0"
         mac:
           type: string
+        host_mac:
+          type: string
+        mtu:
+          type: integer
         iommu:
           type: boolean
           default: false
@@ -650,12 +852,20 @@ components:
           default: false
         vhost_socket:
           type: string
+        vhost_mode:
+          type: string
+          default: "Client"
         id:
           type: string
+        pci_segment:
+          type: integer
+          format: int16
+        rate_limiter_config:
+          $ref: "#/components/schemas/RateLimiterConfig"
 
     RngConfig:
       required:
-      - src
+        - src
       type: object
       properties:
         src:
@@ -667,21 +877,27 @@ components:
 
     BalloonConfig:
       required:
-      - size
+        - size
       type: object
       properties:
         size:
           type: integer
           format: int64
+        deflate_on_oom:
+          type: boolean
+          default: false
+          description: Deflate balloon when the guest is under memory pressure.
+        free_page_reporting:
+          type: boolean
+          default: false
+          description: Enable guest to report free pages.
 
     FsConfig:
       required:
-      - cache_size
-      - dax
-      - num_queues
-      - queue_size
-      - socket
-      - tag
+        - num_queues
+        - queue_size
+        - socket
+        - tag
       type: object
       properties:
         tag:
@@ -694,19 +910,15 @@ components:
         queue_size:
           type: integer
           default: 1024
-        dax:
-          type: boolean
-          default: true
-        cache_size:
+        pci_segment:
           type: integer
-          format: int64
-          default: 8589934592
+          format: int16
         id:
           type: string
 
     PmemConfig:
       required:
-      - file
+        - file
       type: object
       properties:
         file:
@@ -717,32 +929,32 @@ components:
         iommu:
           type: boolean
           default: false
-        mergeable:
-          type: boolean
-          default: false
         discard_writes:
           type: boolean
           default: false
+        pci_segment:
+          type: integer
+          format: int16
         id:
           type: string
 
     ConsoleConfig:
       required:
-      - mode
+        - mode
       type: object
       properties:
         file:
           type: string
         mode:
           type: string
-          enum: [Off, Tty, File, Null]
+          enum: [Off, Pty, Tty, File, Null]
         iommu:
           type: boolean
           default: false
 
     DeviceConfig:
       required:
-      - path
+        - path
       type: object
       properties:
         path:
@@ -750,13 +962,44 @@ components:
         iommu:
           type: boolean
           default: false
+        pci_segment:
+          type: integer
+          format: int16
+        id:
+          type: string
+
+    TpmConfig:
+      required:
+        - socket
+      type: object
+      properties:
+        socket:
+          type: string
+
+    VdpaConfig:
+      required:
+        - path
+        - num_queues
+      type: object
+      properties:
+        path:
+          type: string
+        num_queues:
+          type: integer
+          default: 1
+        iommu:
+          type: boolean
+          default: false
+        pci_segment:
+          type: integer
+          format: int16
         id:
           type: string
 
     VsockConfig:
       required:
-      - cid
-      - socket
+        - cid
+        - socket
       type: object
       properties:
         cid:
@@ -770,14 +1013,20 @@ components:
         iommu:
           type: boolean
           default: false
+        pci_segment:
+          type: integer
+          format: int16
         id:
           type: string
 
     SgxEpcConfig:
       required:
-      - size
+        - id
+        - size
       type: object
       properties:
+        id:
+          type: string
         size:
           type: integer
           format: int64
@@ -787,8 +1036,8 @@ components:
 
     NumaDistance:
       required:
-      - destination
-      - distance
+        - destination
+        - distance
       type: object
       properties:
         destination:
@@ -800,7 +1049,7 @@ components:
 
     NumaConfig:
       required:
-      - guest_numa_id
+        - guest_numa_id
       type: object
       properties:
         guest_numa_id:
@@ -814,8 +1063,12 @@ components:
         distances:
           type: array
           items:
-            $ref: '#/components/schemas/NumaDistance'
+            $ref: "#/components/schemas/NumaDistance"
         memory_zones:
+          type: array
+          items:
+            type: string
+        sgx_epc_sections:
           type: array
           items:
             type: string
@@ -845,17 +1098,6 @@ components:
           type: integer
           format: int64
 
-    VmAddDevice:
-      type: object
-      properties:
-        path:
-          type: string
-        iommu:
-          type: boolean
-          default: false
-        id:
-          type: string
-
     VmRemoveDevice:
       type: object
       properties:
@@ -868,12 +1110,36 @@ components:
         destination_url:
           type: string
 
+    VmCoredumpData:
+      type: object
+      properties:
+        destination_url:
+          type: string
+
     RestoreConfig:
       required:
-      - source_url
+        - source_url
       type: object
       properties:
         source_url:
           type: string
         prefault:
+          type: boolean
+
+    ReceiveMigrationData:
+      required:
+        - receiver_url
+      type: object
+      properties:
+        receiver_url:
+          type: string
+
+    SendMigrationData:
+      required:
+        - destination_url
+      type: object
+      properties:
+        destination_url:
+          type: string
+        local:
           type: boolean

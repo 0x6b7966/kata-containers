@@ -14,54 +14,42 @@ PROJECT_COMPONENT = kata-agent
 
 TARGET = $(PROJECT_COMPONENT)
 
-SOURCES := \
-  $(shell find . 2>&1 | grep -E '.*\.rs$$') \
-  Cargo.toml
-
 VERSION_FILE := ./VERSION
 VERSION := $(shell grep -v ^\# $(VERSION_FILE))
 COMMIT_NO := $(shell git rev-parse HEAD 2>/dev/null || true)
-COMMIT_NO_SHORT := $(shell git rev-parse --short HEAD 2>/dev/null || true)
 COMMIT := $(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO})
 COMMIT_MSG = $(if $(COMMIT),$(COMMIT),unknown)
 
 # Exported to allow cargo to see it
 export VERSION_COMMIT := $(if $(COMMIT),$(VERSION)-$(COMMIT),$(VERSION))
 
-##VAR BUILD_TYPE=release|debug type of rust build
-BUILD_TYPE = release
+EXTRA_RUSTFEATURES :=
 
-##VAR ARCH=arch target to build (format: uname -m)
-ARCH = $(shell uname -m)
-##VAR LIBC=musl|gnu
-LIBC ?= musl
-ifneq ($(LIBC),musl)
-    ifeq ($(LIBC),gnu)
-        override LIBC = gnu
-    else
-        $(error "ERROR: A non supported LIBC value was passed. Supported values are musl and gnu")
-    endif
+##VAR SECCOMP=yes|no define if agent enables seccomp feature
+SECCOMP ?= yes
+
+# Enable seccomp feature of rust build
+ifeq ($(SECCOMP),yes)
+    override EXTRA_RUSTFEATURES += seccomp
 endif
+
+include ../../utils.mk
 
 ifeq ($(ARCH), ppc64le)
     override ARCH = powerpc64le
-    override LIBC = gnu
-    $(warning "WARNING: powerpc64le-unknown-linux-musl target is unavailable")
 endif
 
-ifeq ($(ARCH), s390x)
-    override LIBC = gnu
-    $(warning "WARNING: s390x-unknown-linux-musl target is unavailable")
+##VAR STANDARD_OCI_RUNTIME=yes|no define if agent enables standard oci runtime feature
+STANDARD_OCI_RUNTIME := no
+
+# Enable standard oci runtime feature of rust build
+ifeq ($(STANDARD_OCI_RUNTIME),yes)
+    override EXTRA_RUSTFEATURES += standard-oci-runtime
 endif
 
-
-EXTRA_RUSTFLAGS :=
-ifeq ($(ARCH), aarch64)
-    override EXTRA_RUSTFLAGS = -C link-arg=-lgcc
-    $(warning "WARNING: aarch64-musl needs extra symbols from libgcc")
+ifneq ($(EXTRA_RUSTFEATURES),)
+    override EXTRA_RUSTFEATURES := --features "$(EXTRA_RUSTFEATURES)"
 endif
-
-TRIPLE = $(ARCH)-unknown-linux-$(LIBC)
 
 TARGET_PATH = target/$(TRIPLE)/$(BUILD_TYPE)/$(TARGET)
 
@@ -118,29 +106,24 @@ define INSTALL_FILE
 	install -D -m 644 $1 $(DESTDIR)$2/$1 || exit 1;
 endef
 
+.DEFAULT_GOAL := default
+
 ##TARGET default: build code
 default: $(TARGET) show-header
 
+static-checks-build: $(GENERATED_CODE)
+
 $(TARGET): $(GENERATED_CODE) $(TARGET_PATH)
 
-$(TARGET_PATH): $(SOURCES) | show-summary
-	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) --$(BUILD_TYPE)
+$(TARGET_PATH): show-summary
+	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
 
 $(GENERATED_FILES): %: %.in
 	@sed $(foreach r,$(GENERATED_REPLACEMENTS),-e 's|@$r@|$($r)|g') "$<" > "$@"
 
 ##TARGET optimize: optimized  build
-optimize: $(SOURCES) | show-summary show-header
-	@RUSTFLAGS="-C link-arg=-s $(EXTRA_RUSTFLAGS) --deny-warnings" cargo build --target $(TRIPLE) --$(BUILD_TYPE)
-
-
-##TARGET clippy: run clippy linter
-clippy: $(GENERATED_CODE)
-	cargo clippy --all-targets --all-features --release \
-		-- \
-		-Aclippy::redundant_allocation \
-		-D warnings
-
+optimize: show-summary show-header
+	@RUSTFLAGS="-C link-arg=-s $(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
 
 ##TARGET install: install agent
 install: install-services
@@ -152,12 +135,16 @@ clean:
 	@rm -f $(GENERATED_FILES)
 	@rm -f tarpaulin-report.html
 
+vendor:
+	@cargo vendor
+
+
 #TARGET test: run cargo tests
 test:
-	@cargo test --all --target $(TRIPLE)
+	@cargo test --all --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
 
 ##TARGET check: run test
-check: test
+check: $(GENERATED_FILES) standard_rust_check
 
 ##TARGET run: build and run agent
 run:
@@ -219,10 +206,11 @@ codecov-html: check_tarpaulin
 
 .PHONY: \
 	help \
+	optimize \
 	show-header \
 	show-summary \
-	optimize
+	vendor
 
 ##TARGET generate-protocols: generate/update grpc agent protocols
 generate-protocols:
-	protocols/hack/update-generated-proto.sh all
+	../libs/protocols/hack/update-generated-proto.sh all

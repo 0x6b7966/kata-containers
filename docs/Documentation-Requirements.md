@@ -1,16 +1,3 @@
-* [Introduction](#introduction)
-* [General requirements](#general-requirements)
-* [Linking advice](#linking-advice)
-* [Notes](#notes)
-* [Warnings and other admonitions](#warnings-and-other-admonitions)
-* [Files and command names](#files-and-command-names)
-* [Code blocks](#code-blocks)
-* [Images](#images)
-* [Spelling](#spelling)
-* [Names](#names)
-* [Version numbers](#version-numbers)
-* [The apostrophe](#the-apostrophe)
-
 # Introduction
 
 This document outlines the requirements for all documentation in the [Kata
@@ -23,10 +10,6 @@ All documents must:
 - Be written in simple English.
 - Be written in [GitHub Flavored Markdown](https://github.github.com/gfm) format.
 - Have a `.md` file extension.
-- Include a TOC (table of contents) at the top of the document with links to
-  all heading sections. We recommend using the
-  [`kata-check-markdown`](https://github.com/kata-containers/tests/tree/master/cmd/check-markdown)
-  tool to generate the TOC.
 - Be linked to from another document in the same repository.
 
   Although GitHub allows navigation of the entire repository, it should be
@@ -42,6 +25,10 @@ All documents must:
   non-interactively. If this is possible, the document can be tested by the CI
   which can then execute the commands specified to ensure the instructions are
   correct. This avoids documents becoming out of date over time.
+
+> **Note:**
+>
+> Do not add a table of contents (TOC) since GitHub will auto-generate one.
 
 # Linking advice
 
@@ -118,7 +105,7 @@ This section lists requirements for displaying commands and command output.
 The requirements must be adhered to since documentation containing code blocks
 is validated by the CI system, which executes the command blocks with the help
 of the
-[doc-to-script](https://github.com/kata-containers/tests/tree/master/.ci/kata-doc-to-script.sh)
+[doc-to-script](https://github.com/kata-containers/tests/tree/main/.ci/kata-doc-to-script.sh)
 utility.
 
 - If a document includes commands the user should run, they **MUST** be shown
@@ -202,7 +189,7 @@ and compare them with standard tools (e.g. `diff(1)`).
 
 Since this project uses a number of terms not found in conventional
 dictionaries, we have a
-[spell checking tool](https://github.com/kata-containers/tests/tree/master/cmd/check-spelling)
+[spell checking tool](https://github.com/kata-containers/tests/tree/main/cmd/check-spelling)
 that checks both dictionary words and the additional terms we use.
 
 Run the spell checking tool on your document before raising a PR to ensure it

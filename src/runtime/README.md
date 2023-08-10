@@ -1,43 +1,27 @@
-[![Build Status](https://travis-ci.org/kata-containers/kata-containers.svg?branch=master)](https://travis-ci.org/kata-containers/kata-containers)
-[![Build Status](http://jenkins.katacontainers.io/job/kata-containers-runtime-ubuntu-18-04-master/badge/icon)](http://jenkins.katacontainers.io/job/kata-containers-runtime-ubuntu-18-04-master/)
 [![Go Report Card](https://goreportcard.com/badge/github.com/kata-containers/kata-containers)](https://goreportcard.com/report/github.com/kata-containers/kata-containers)
-[![GoDoc](https://godoc.org/github.com/kata-containers/runtime?status.svg)](https://godoc.org/github.com/kata-containers/runtime)
 
 # Runtime
 
-This repository contains the runtime for the
-[Kata Containers](https://github.com/kata-containers) project.
+## Binary names
+
+This repository contains the following components:
+
+| Binary name | Description |
+|-|-|
+| `containerd-shim-kata-v2` | The [shimv2 runtime](../../docs/design/architecture/README.md#runtime) |
+| `kata-runtime` | [utility program](../../docs/design/architecture/README.md#utility-program) |
+| `kata-monitor` | [metrics collector daemon](cmd/kata-monitor/README.md) |
 
 For details of the other Kata Containers repositories, see the
 [repository summary](https://github.com/kata-containers/kata-containers).
 
-* [Introduction](#introduction)
-* [License](#license)
-* [Platform support](#platform-support)
-    * [Hardware requirements](#hardware-requirements)
-* [Download and install](#download-and-install)
-* [Quick start for developers](#quick-start-for-developers)
-* [Architecture overview](#architecture-overview)
-* [Configuration](#configuration)
-    * [Hypervisor specific configuration](#hypervisor-specific-configuration)
-    * [Stateless systems](#stateless-systems)
-* [Logging](#logging)
-    * [Kata OCI](#kata-oci)
-    * [Kata containerd shimv2](#kata-containerd-shimv2)
-* [Debugging](#debugging)
-* [Limitations](#limitations)
-* [Community](#community)
-    * [Contact](#contact)
-* [Further information](#further-information)
-* [Additional packages](#additional-packages)
-
 ## Introduction
 
-`kata-runtime`, referred to as "the runtime", is the Command-Line Interface
-(CLI) part of the Kata Containers runtime component. It leverages the
+The `containerd-shim-kata-v2` [binary](#binary-names) is the Kata
+Containers [shimv2](../../docs/design/architecture/README.md#shim-v2-architecture) runtime. It leverages the
 [virtcontainers](virtcontainers)
 package to provide a high-performance standards-compliant runtime that creates
-hardware-virtualized [Linux](https://www.kernel.org/) containers running on Linux hosts.
+hardware-virtualized [Linux](https://www.kernel.org) containers running on Linux hosts.
 
 The runtime is
 [OCI](https://github.com/opencontainers/runtime-spec)-compatible,
@@ -46,67 +30,81 @@ The runtime is
  allowing it
 to work seamlessly with both Docker and Kubernetes respectively.
 
-## License
-
-The code is licensed under an Apache 2.0 license.
-
-See [the license file](LICENSE) for further details.
-
-## Platform support
-
-Kata Containers currently works on systems supporting the following
-technologies:
-
-- [Intel](https://www.intel.com) VT-x technology.
-- [ARM](https://www.arm.com) Hyp mode (virtualization extension).
-- [IBM](https://www.ibm.com) Power Systems.
-- [IBM](https://www.ibm.com) Z mainframes.
-### Hardware requirements
-
-The runtime has a built-in command to determine if your host system is capable
-of running and creating a Kata Container:
-
-```bash
-$ kata-runtime check
-```
-
-> **Note:**
->
-> - By default, only a brief success / failure message is printed.
-> If more details are needed, the `--verbose` flag can be used to display the
-> list of all the checks performed.
->
-> - `root` permission is needed to check if the system is capable of running
-> Kata containers. In this case, additional checks are performed (e.g., if another
-> incompatible hypervisor is running).
-
 ## Download and install
 
-[![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/kata-containers)
-
-See the [installation guides](https://github.com/kata-containers/documentation/tree/master/install/README.md)
+See the [installation guides](../../docs/install/README.md)
 available for various operating systems.
-
-## Quick start for developers
-
-See the
-[developer guide](../../docs/Developer-Guide.md).
 
 ## Architecture overview
 
-See the [architecture overview](../../docs/design/architecture.md)
+See the [architecture overview](../../docs/design/architecture)
 for details on the Kata Containers design.
 
 ## Configuration
 
 The runtime uses a TOML format configuration file called `configuration.toml`.
-The file contains comments explaining all options.
+The file is divided into sections for settings related to various
+parts of the system including the runtime itself, the [agent](../agent) and
+the [hypervisor](#hypervisor-specific-configuration).
+
+Each option has a comment explaining its use.
 
 > **Note:**
 >
 > The initial values in the configuration file provide a good default configuration.
 > You may need to modify this file to optimise or tailor your system, or if you have
 > specific requirements.
+
+### Configuration file location
+
+#### Runtime configuration file location
+
+The shimv2 runtime looks for its configuration in the following places (in order):
+
+- The `io.data containers.config.config_path` annotation specified
+  in the OCI configuration file (`config.json` file) used to create the pod sandbox.
+
+- The containerd
+  [shimv2](/docs/design/architecture/README.md#shim-v2-architecture)
+  options passed to the runtime.
+
+- The value of the `KATA_CONF_FILE` environment variable.
+
+- The [default configuration paths](#stateless-systems).
+
+#### Utility program configuration file location
+
+The `kata-runtime` utility program looks for its configuration in the
+following locations (in order):
+
+- The path specified by the `--config` command-line option.
+
+- The value of the `KATA_CONF_FILE` environment variable.
+
+- The [default configuration paths](#stateless-systems).
+
+> **Note:** For both binaries, the first path that exists will be used.
+
+#### Drop-in configuration file fragments
+
+To enable changing configuration without changing the configuration file
+itself, drop-in configuration file fragments are supported.  Once a
+configuration file is parsed, if there is a subdirectory called `config.d` in
+the same directory as the configuration file its contents will be loaded
+in alphabetical order and each item will be parsed as a config file.  Settings
+loaded from these configuration file fragments override settings loaded from
+the main configuration file and earlier fragments.  Users are encouraged to use
+familiar naming conventions to order the fragments (e.g. `config.d/10-this`,
+`config.d/20-that` etc.).
+
+Non-existent or empty `config.d` directory is not an error (in other words, not
+using configuration file fragments is fine).  On the other hand, if fragments
+are used, they must be valid - any errors while parsing fragments (unreadable
+fragment files, contents not valid TOML) are treated the same as errors
+while parsing the main configuration file.  A `config.d` subdirectory affects
+only the `configuration.toml` _in the same directory_.  For fragments in
+`config.d` to be parsed, there has to be a valid main configuration file _in
+that location_ (it can be empty though).
 
 ### Hypervisor specific configuration
 
@@ -132,13 +130,6 @@ runtime attempts to load. The first path that exists will be used:
 $ kata-runtime --show-default-config-paths
 ```
 
-Aside from the built-in locations, it is possible to specify the path to a
-custom configuration file using the `--config` option:
-
-```bash
-$ kata-runtime --config=/some/where/configuration.toml ...
-```
-
 The runtime will log the full path to the configuration file it is using. See
 the [logging](#logging) section for further details.
 
@@ -153,30 +144,18 @@ $ kata-runtime env
 
 For detailed information and analysis on obtaining logs for other system
 components, see the documentation for the
-[`kata-log-parser`](https://github.com/kata-containers/tests/tree/master/cmd/log-parser)
+[`kata-log-parser`](../tools/log-parser)
 tool.
-
-For runtime logs, see the following sections for the CRI-O and containerd shimv2 based runtimes.
-
-### Kata OCI
-
-The Kata OCI runtime (including when used with CRI-O), provides `--log=` and `--log-format=` options.
-However, the runtime also always logs to the system log (`syslog` or `journald`).
-
-To view runtime log output:
-
-```bash
-$ sudo journalctl -t kata-runtime
-```
 
 ### Kata containerd shimv2
 
 The Kata containerd shimv2 runtime logs through `containerd`, and its logs will be sent
 to wherever the `containerd` logs are directed. However, the
-shimv2 runtime also always logs to the system log (`syslog` or `journald`) under the
-identifier name of `kata`.
+shimv2 runtime also always logs to the system log (`syslog` or `journald`) using the `kata` identifier.
 
-To view the `shimv2` runtime log output:
+> **Note:** Kata logging [requires containerd debug to be enabled](../../docs/Developer-Guide.md#enabling-full-containerd-debug).
+
+To view the `shimv2` runtime logs:
 
 ```bash
 $ sudo journalctl -t kata
@@ -199,7 +178,7 @@ See [the community repository](https://github.com/kata-containers/community).
 
 ### Contact
 
-See [how to reach the community](https://github.com/kata-containers/community/blob/master/CONTRIBUTING.md#contact).
+See [how to reach the community](https://github.com/kata-containers/community/blob/main/CONTRIBUTING.md#contact).
 
 ## Further information
 

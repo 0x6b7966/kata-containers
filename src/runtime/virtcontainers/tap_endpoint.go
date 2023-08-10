@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Huawei Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -6,15 +8,18 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/uuid"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/uuid"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
+
+var tapTrace = getNetworkTrace(TapEndpointType)
 
 // TapEndpoint represents just a tap endpoint
 type TapEndpoint struct {
@@ -67,15 +72,18 @@ func (endpoint *TapEndpoint) SetProperties(properties NetworkInfo) {
 }
 
 // Attach for tap endpoint adds the tap interface to the hypervisor.
-func (endpoint *TapEndpoint) Attach(s *Sandbox) error {
+func (endpoint *TapEndpoint) Attach(ctx context.Context, s *Sandbox) error {
 	return fmt.Errorf("TapEndpoint does not support Attach, if you're using docker please use --net none")
 }
 
 // Detach for the tap endpoint tears down the tap
-func (endpoint *TapEndpoint) Detach(netNsCreated bool, netNsPath string) error {
+func (endpoint *TapEndpoint) Detach(ctx context.Context, netNsCreated bool, netNsPath string) error {
 	if !netNsCreated && netNsPath != "" {
 		return nil
 	}
+
+	span, _ := tapTrace(ctx, "Detach", endpoint)
+	defer span.End()
 
 	networkLogger().WithField("endpoint-type", TapEndpointType).Info("Detaching endpoint")
 	return doNetNS(netNsPath, func(_ ns.NetNS) error {
@@ -84,14 +92,18 @@ func (endpoint *TapEndpoint) Detach(netNsCreated bool, netNsPath string) error {
 }
 
 // HotAttach for the tap endpoint uses hot plug device
-func (endpoint *TapEndpoint) HotAttach(h hypervisor) error {
+func (endpoint *TapEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
 	networkLogger().Info("Hot attaching tap endpoint")
-	if err := tapNetwork(endpoint, h.hypervisorConfig().NumVCPUs, h.hypervisorConfig().DisableVhostNet); err != nil {
+
+	span, ctx := tapTrace(ctx, "HotAttach", endpoint)
+	defer span.End()
+
+	if err := tapNetwork(endpoint, h.HypervisorConfig().NumVCPUs, h.HypervisorConfig().DisableVhostNet); err != nil {
 		networkLogger().WithError(err).Error("Error bridging tap ep")
 		return err
 	}
 
-	if _, err := h.hotplugAddDevice(endpoint, netDev); err != nil {
+	if _, err := h.HotplugAddDevice(ctx, endpoint, NetDev); err != nil {
 		networkLogger().WithError(err).Error("Error attach tap ep")
 		return err
 	}
@@ -99,15 +111,19 @@ func (endpoint *TapEndpoint) HotAttach(h hypervisor) error {
 }
 
 // HotDetach for the tap endpoint uses hot pull device
-func (endpoint *TapEndpoint) HotDetach(h hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *TapEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
 	networkLogger().Info("Hot detaching tap endpoint")
+
+	span, ctx := tapTrace(ctx, "HotDetach", endpoint)
+	defer span.End()
+
 	if err := doNetNS(netNsPath, func(_ ns.NetNS) error {
 		return unTapNetwork(endpoint.TapInterface.TAPIface.Name)
 	}); err != nil {
 		networkLogger().WithError(err).Warn("Error un-bridging tap ep")
 	}
 
-	if _, err := h.hotplugRemoveDevice(endpoint, netDev); err != nil {
+	if _, err := h.HotplugRemoveDevice(ctx, endpoint, NetDev); err != nil {
 		networkLogger().WithError(err).Error("Error detach tap ep")
 		return err
 	}
@@ -142,7 +158,7 @@ func tapNetwork(endpoint *TapEndpoint, numCPUs uint32, disableVhostNet bool) err
 	if err != nil {
 		return err
 	}
-	defer netHandle.Delete()
+	defer netHandle.Close()
 
 	tapLink, fds, err := createLink(netHandle, endpoint.TapInterface.TAPIface.Name, &netlink.Tuntap{}, int(numCPUs))
 	if err != nil {
@@ -178,7 +194,7 @@ func unTapNetwork(name string) error {
 	if err != nil {
 		return err
 	}
-	defer netHandle.Delete()
+	defer netHandle.Close()
 	tapLink, err := getLinkByName(netHandle, name, &netlink.Tuntap{})
 	if err != nil {
 		return fmt.Errorf("Could not get TAP interface: %s", err)

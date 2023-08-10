@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Context, Result};
 use futures::{future, StreamExt, TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
-use protobuf::RepeatedField;
+use nix::errno::Errno;
 use protocols::types::{ARPNeighbor, IPAddress, IPFamily, Interface, Route};
 use rtnetlink::{new_connection, packet, IpVersion};
 use std::convert::{TryFrom, TryInto};
@@ -63,7 +63,7 @@ impl Handle {
     pub async fn update_interface(&mut self, iface: &Interface) -> Result<()> {
         // The reliable way to find link is using hardware address
         // as filter. However, hardware filter might not be supported
-        // by netlink, we may have to dump link list and the find the
+        // by netlink, we may have to dump link list and then find the
         // target link. filter using name or family is supported, but
         // we cannot use that to find target link.
         // let's try if hardware address filter works. -_-
@@ -82,11 +82,32 @@ impl Handle {
 
         // Add new ip addresses from request
         for ip_address in &iface.IPAddresses {
-            let ip = IpAddr::from_str(&ip_address.get_address())?;
-            let mask = u8::from_str_radix(ip_address.get_mask(), 10)?;
+            let ip = IpAddr::from_str(ip_address.address())?;
+            let mask = ip_address.mask().parse::<u8>()?;
 
             self.add_addresses(link.index(), std::iter::once(IpNetwork::new(ip, mask)?))
                 .await?;
+        }
+
+        // we need to update the link's interface name, thus we should rename the existed link whose name
+        // is the same with the link's request name, otherwise, it would update the link failed with the
+        // name conflicted.
+        let mut new_link = None;
+        if link.name() != iface.name {
+            if let Ok(link) = self.find_link(LinkFilter::Name(iface.name.as_str())).await {
+                // update the existing interface name with a temporary name, otherwise
+                // it would failed to udpate this interface with an existing name.
+                let mut request = self.handle.link().set(link.index());
+                request.message_mut().header = link.header.clone();
+
+                request
+                    .name(format!("{}_temp", link.name()))
+                    .up()
+                    .execute()
+                    .await?;
+
+                new_link = Some(link);
+            }
         }
 
         // Update link
@@ -100,6 +121,14 @@ impl Handle {
             .up()
             .execute()
             .await?;
+
+        // swap the updated iface's name.
+        if let Some(nlink) = new_link {
+            let mut request = self.handle.link().set(nlink.index());
+            request.message_mut().header = nlink.header.clone();
+
+            request.name(link.name()).up().execute().await?;
+        }
 
         Ok(())
     }
@@ -151,7 +180,7 @@ impl Handle {
                 .map(|p| p.try_into())
                 .collect::<Result<Vec<IPAddress>>>()?;
 
-            iface.IPAddresses = RepeatedField::from_vec(ips);
+            iface.IPAddresses = ips;
 
             list.push(iface);
         }
@@ -177,7 +206,7 @@ impl Handle {
                 .with_context(|| format!("Failed to parse MAC address: {}", addr))?;
 
             // Hardware filter might not be supported by netlink,
-            // we may have to dump link list and the find the target link.
+            // we may have to dump link list and then find the target link.
             stream
                 .try_filter(|f| {
                     let result = f.nlas.iter().any(|n| match n {
@@ -312,7 +341,6 @@ impl Handle {
 
         for route in list {
             let link = self.find_link(LinkFilter::Name(&route.device)).await?;
-            let is_v6 = is_ipv6(route.get_gateway()) || is_ipv6(route.get_dest());
 
             const MAIN_TABLE: u8 = packet::constants::RT_TABLE_MAIN;
             const UNICAST: u8 = packet::constants::RTN_UNICAST;
@@ -334,7 +362,7 @@ impl Handle {
 
             // `rtnetlink` offers a separate request builders for different IP versions (IP v4 and v6).
             // This if branch is a bit clumsy because it does almost the same.
-            if is_v6 {
+            if route.family() == IPFamily::v6 {
                 let dest_addr = if !route.dest.is_empty() {
                     Ipv6Network::from_str(&route.dest)?
                 } else {
@@ -364,14 +392,17 @@ impl Handle {
                     request = request.gateway(ip);
                 }
 
-                request.execute().await.with_context(|| {
-                    format!(
-                        "Failed to add IP v6 route (src: {}, dst: {}, gtw: {})",
-                        route.get_source(),
-                        route.get_dest(),
-                        route.get_gateway()
-                    )
-                })?;
+                if let Err(rtnetlink::Error::NetlinkError(message)) = request.execute().await {
+                    if Errno::from_i32(message.code.abs()) != Errno::EEXIST {
+                        return Err(anyhow!(
+                            "Failed to add IP v6 route (src: {}, dst: {}, gtw: {},Err: {})",
+                            route.source(),
+                            route.dest(),
+                            route.gateway(),
+                            message
+                        ));
+                    }
+                }
             } else {
                 let dest_addr = if !route.dest.is_empty() {
                     Ipv4Network::from_str(&route.dest)?
@@ -402,7 +433,17 @@ impl Handle {
                     request = request.gateway(ip);
                 }
 
-                request.execute().await?;
+                if let Err(rtnetlink::Error::NetlinkError(message)) = request.execute().await {
+                    if Errno::from_i32(message.code.abs()) != Errno::EEXIST {
+                        return Err(anyhow!(
+                            "Failed to add IP v4 route (src: {}, dst: {}, gtw: {},Err: {})",
+                            route.source(),
+                            route.dest(),
+                            route.gateway(),
+                            message
+                        ));
+                    }
+                }
             }
         }
 
@@ -493,7 +534,7 @@ impl Handle {
             self.add_arp_neighbor(&neigh).await.map_err(|err| {
                 anyhow!(
                     "Failed to add ARP neighbor {}: {:?}",
-                    neigh.get_toIPAddress().get_address(),
+                    neigh.toIPAddress().address(),
                     err
                 )
             })?;
@@ -510,13 +551,15 @@ impl Handle {
             .as_ref()
             .map(|to| to.address.as_str()) // Extract address field
             .and_then(|addr| if addr.is_empty() { None } else { Some(addr) }) // Make sure it's not empty
-            .ok_or(nix::Error::Sys(nix::errno::Errno::EINVAL))?;
+            .ok_or_else(|| anyhow!("Unable to determine ip address of ARP neighbor"))?;
 
-        let ip = IpAddr::from_str(&ip_address)
+        let ip = IpAddr::from_str(ip_address)
             .map_err(|e| anyhow!("Failed to parse IP {}: {:?}", ip_address, e))?;
 
         // Import rtnetlink objects that make sense only for this function
-        use packet::constants::{NDA_UNSPEC, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST};
+        use packet::constants::{
+            NDA_UNSPEC, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST,
+        };
         use packet::neighbour::{NeighbourHeader, NeighbourMessage};
         use packet::nlas::neighbour::Nla;
         use packet::{NetlinkMessage, NetlinkPayload, RtnlMessage};
@@ -542,12 +585,10 @@ impl Handle {
                 ntype: NDA_UNSPEC as u8,
             },
             nlas: {
-                let mut nlas = vec![];
-
-                nlas.push(Nla::Destination(match ip {
+                let mut nlas = vec![Nla::Destination(match ip {
                     IpAddr::V4(v4) => v4.octets().to_vec(),
                     IpAddr::V6(v6) => v6.octets().to_vec(),
-                }));
+                })];
 
                 if !neigh.lladdr.is_empty() {
                     nlas.push(Nla::LinkLocalAddress(
@@ -561,7 +602,7 @@ impl Handle {
 
         // Send request and ACK
         let mut req = NetlinkMessage::from(RtnlMessage::NewNeighbour(message));
-        req.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE;
+        req.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
 
         let mut response = self.handle.request(req)?;
         while let Some(message) = response.next().await {
@@ -596,10 +637,6 @@ fn format_address(data: &[u8]) -> Result<String> {
     }
 }
 
-fn is_ipv6(str: &str) -> bool {
-    Ipv6Addr::from_str(str).is_ok()
-}
-
 fn parse_mac_address(addr: &str) -> Result<[u8; 6]> {
     let mut split = addr.splitn(6, ':');
 
@@ -608,7 +645,7 @@ fn parse_mac_address(addr: &str) -> Result<[u8; 6]> {
         let v = u8::from_str_radix(
             split
                 .next()
-                .ok_or(nix::Error::Sys(nix::errno::Errno::EINVAL))?,
+                .ok_or_else(|| anyhow!("Invalid MAC address {}", addr))?,
             16,
         )?;
         Ok(v)
@@ -716,7 +753,7 @@ impl TryFrom<Address> for IPAddress {
         let mask = format!("{}", value.0.header.prefix_len);
 
         Ok(IPAddress {
-            family,
+            family: family.into(),
             address,
             mask,
             ..Default::default()
@@ -768,10 +805,10 @@ impl Address {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skip_if_not_root;
     use rtnetlink::packet;
     use std::iter;
     use std::process::Command;
+    use test_utils::skip_if_not_root;
 
     #[tokio::test]
     async fn find_link_by_name() {
@@ -934,26 +971,16 @@ mod tests {
         assert_eq!(bytes, [0xAB, 0x0C, 0xDE, 0x12, 0x34, 0x56]);
     }
 
-    #[test]
-    fn check_ipv6() {
-        assert!(is_ipv6("::1"));
-        assert!(is_ipv6("2001:0:3238:DFE1:63::FEFB"));
-
-        assert!(!is_ipv6(""));
-        assert!(!is_ipv6("127.0.0.1"));
-        assert!(!is_ipv6("10.10.10.10"));
-    }
-
     fn clean_env_for_test_add_one_arp_neighbor(dummy_name: &str, ip: &str) {
         // ip link delete dummy
         Command::new("ip")
-            .args(&["link", "delete", dummy_name])
+            .args(["link", "delete", dummy_name])
             .output()
             .expect("prepare: failed to delete dummy");
 
         // ip neigh del dev dummy ip
         Command::new("ip")
-            .args(&["neigh", "del", dummy_name, ip])
+            .args(["neigh", "del", dummy_name, ip])
             .output()
             .expect("prepare: failed to delete neigh");
     }
@@ -968,19 +995,19 @@ mod tests {
 
         // ip link add dummy type dummy
         Command::new("ip")
-            .args(&["link", "add", dummy_name, "type", "dummy"])
+            .args(["link", "add", dummy_name, "type", "dummy"])
             .output()
             .expect("failed to add dummy interface");
 
         // ip addr add 192.168.0.2/16 dev dummy
         Command::new("ip")
-            .args(&["addr", "add", "192.168.0.2/16", "dev", dummy_name])
+            .args(["addr", "add", "192.168.0.2/16", "dev", dummy_name])
             .output()
             .expect("failed to add ip for dummy");
 
         // ip link set dummy up;
         Command::new("ip")
-            .args(&["link", "set", dummy_name, "up"])
+            .args(["link", "set", dummy_name, "up"])
             .output()
             .expect("failed to up dummy");
     }
@@ -1012,7 +1039,7 @@ mod tests {
 
         // ip neigh show dev dummy ip
         let stdout = Command::new("ip")
-            .args(&["neigh", "show", "dev", dummy_name, to_ip])
+            .args(["neigh", "show", "dev", dummy_name, to_ip])
             .output()
             .expect("failed to show neigh")
             .stdout;

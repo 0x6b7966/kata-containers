@@ -1,16 +1,5 @@
 # Virtualization in Kata Containers
 
-- [Virtualization in Kata Containers](#virtualization-in-kata-containers)
-  - [Mapping container concepts to virtual machine technologies](#mapping-container-concepts-to-virtual-machine-technologies)
-  - [Kata Containers Hypervisor and VMM support](#kata-containers-hypervisor-and-vmm-support)
-    - [QEMU/KVM](#qemukvm)
-      - [Machine accelerators](#machine-accelerators)
-      - [Hotplug devices](#hotplug-devices)
-    - [Firecracker/KVM](#firecrackerkvm)
-    - [Cloud Hypervisor/KVM](#cloud-hypervisorkvm)
-    - [Summary](#summary)
-
-
 Kata Containers, a second layer of isolation is created on top of those provided by traditional namespace-containers. The
 hardware virtualization interface is the basis of this additional layer. Kata will launch a lightweight virtual machine,
 and use the guest’s Linux kernel to create a container workload, or workloads in the case of multi-container pods. In Kubernetes
@@ -50,9 +39,9 @@ Details of each solution and a summary are provided below.
 Kata Containers with QEMU has complete compatibility with Kubernetes.
 
 Depending on the host architecture, Kata Containers supports various machine types,
-for example `pc` and `q35` on x86 systems, `virt` on ARM systems and `pseries` on IBM Power systems. The default Kata Containers
-machine type is `pc`. The machine type and its [`Machine accelerators`](#machine-accelerators) can
-be changed by editing the runtime [`configuration`](./architecture.md/#configuration) file.
+for example `q35` on x86 systems, `virt` on ARM systems and `pseries` on IBM Power systems. The default Kata Containers
+machine type is `q35`. The machine type and its [`Machine accelerators`](#machine-accelerators) can
+be changed by editing the runtime [`configuration`](architecture/README.md#configuration) file.
 
 Devices and features used:
 - virtio VSOCK or virtio serial
@@ -71,9 +60,8 @@ Machine accelerators are architecture specific and can be used to improve the pe
 and enable specific features of the machine types. The following machine accelerators
 are used in Kata Containers:
 
-- NVDIMM: This machine accelerator is x86 specific and only supported by `pc` and
-`q35` machine types. `nvdimm` is used to provide the root filesystem as a persistent
-memory device to the Virtual Machine.
+- NVDIMM: This machine accelerator is x86 specific and only supported by `q35` machine types.
+`nvdimm` is used to provide the root filesystem as a persistent memory device to the Virtual Machine.
 
 #### Hotplug devices
 
@@ -122,7 +110,7 @@ Devices and features used:
 - VFIO
 - hotplug
 - seccomp filters
-- [HTTP OpenAPI](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/master/vmm/src/api/openapi/cloud-hypervisor.yaml)
+- [HTTP OpenAPI](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/vmm/src/api/openapi/cloud-hypervisor.yaml)
 
 ### Summary
 

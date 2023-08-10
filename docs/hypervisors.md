@@ -1,11 +1,5 @@
 # Hypervisors
 
-* [Hypervisors](#hypervisors)
-    * [Introduction](#introduction)
-    * [Types](#types)
-    * [Determine currently configured hypervisor](#determine-currently-configured-hypervisor)
-    * [Choose a Hypervisor](#choose-a-hypervisor)
-
 ## Introduction
 
 Kata Containers supports multiple hypervisors. This document provides a very
@@ -39,6 +33,7 @@ are available, their default values and how each setting can be used.
 [Cloud Hypervisor] | rust | `aarch64`, `x86_64` | Type 2 ([KVM]) | `configuration-clh.toml` |
 [Firecracker] | rust | `aarch64`, `x86_64` | Type 2 ([KVM]) | `configuration-fc.toml` |
 [QEMU] | C | all | Type 2 ([KVM]) | `configuration-qemu.toml` |
+[`Dragonball`] | rust | `aarch64`, `x86_64` | Type 2 ([KVM]) | `configuration-dragonball.toml` |
 
 ## Determine currently configured hypervisor
 
@@ -58,6 +53,7 @@ the hypervisors:
 [Cloud Hypervisor] | Low latency, small memory footprint, small attack surface | Minimal | | excellent | excellent | High performance modern cloud workloads | |
 [Firecracker] | Very slimline | Extremely minimal | Doesn't support all device types | excellent | excellent | Serverless / FaaS | |
 [QEMU] | Lots of features | Lots | | good | good | Good option for most users | | All users |
+[`Dragonball`] | Built-in VMM,  low CPU and memory overhead| Minimal | | excellent | excellent | Optimized for most container workloads | `out-of-the-box` Kata Containers experience |
 
 For further details, see the [Virtualization in Kata Containers](design/virtualization.md) document and the official documentation for each hypervisor.
 
@@ -66,3 +62,4 @@ For further details, see the [Virtualization in Kata Containers](design/virtuali
 [Firecracker]: https://github.com/firecracker-microvm/firecracker
 [KVM]: https://en.wikipedia.org/wiki/Kernel-based_Virtual_Machine
 [QEMU]: http://www.qemu-project.org
+[`Dragonball`]: https://github.com/openanolis/dragonball-sandbox

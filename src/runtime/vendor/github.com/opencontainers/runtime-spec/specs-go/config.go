@@ -15,7 +15,7 @@ type Spec struct {
 	// Mounts configures additional mounts (on top of Root).
 	Mounts []Mount `json:"mounts,omitempty"`
 	// Hooks configures callbacks for container lifecycle events.
-	Hooks *Hooks `json:"hooks,omitempty" platform:"linux,solaris"`
+	Hooks *Hooks `json:"hooks,omitempty" platform:"linux,solaris,zos"`
 	// Annotations contains arbitrary metadata for the container.
 	Annotations map[string]string `json:"annotations,omitempty"`
 
@@ -27,6 +27,8 @@ type Spec struct {
 	Windows *Windows `json:"windows,omitempty" platform:"windows"`
 	// VM specifies configuration for virtual-machine-based containers.
 	VM *VM `json:"vm,omitempty" platform:"vm"`
+	// ZOS is platform-specific configuration for z/OS based containers.
+	ZOS *ZOS `json:"zos,omitempty" platform:"zos"`
 }
 
 // Process contains information to start a specific application inside the container.
@@ -49,7 +51,7 @@ type Process struct {
 	// Capabilities are Linux capabilities that are kept for the process.
 	Capabilities *LinuxCapabilities `json:"capabilities,omitempty" platform:"linux"`
 	// Rlimits specifies rlimit options to apply to the process.
-	Rlimits []POSIXRlimit `json:"rlimits,omitempty" platform:"linux,solaris"`
+	Rlimits []POSIXRlimit `json:"rlimits,omitempty" platform:"linux,solaris,zos"`
 	// NoNewPrivileges controls whether additional privileges could be gained by processes in the container.
 	NoNewPrivileges bool `json:"noNewPrivileges,omitempty" platform:"linux"`
 	// ApparmorProfile specifies the apparmor profile for the container.
@@ -60,7 +62,7 @@ type Process struct {
 	SelinuxLabel string `json:"selinuxLabel,omitempty" platform:"linux"`
 }
 
-// LinuxCapabilities specifies the whitelist of capabilities that are kept for a process.
+// LinuxCapabilities specifies the list of allowed capabilities that are kept for a process.
 // http://man7.org/linux/man-pages/man7/capabilities.7.html
 type LinuxCapabilities struct {
 	// Bounding is the set of capabilities checked by the kernel.
@@ -86,9 +88,11 @@ type Box struct {
 // User specifies specific user (and group) information for the container process.
 type User struct {
 	// UID is the user id.
-	UID uint32 `json:"uid" platform:"linux,solaris"`
+	UID uint32 `json:"uid" platform:"linux,solaris,zos"`
 	// GID is the group id.
-	GID uint32 `json:"gid" platform:"linux,solaris"`
+	GID uint32 `json:"gid" platform:"linux,solaris,zos"`
+	// Umask is the umask for the init process.
+	Umask *uint32 `json:"umask,omitempty" platform:"linux,solaris,zos"`
 	// AdditionalGids are additional group ids set for the container's process.
 	AdditionalGids []uint32 `json:"additionalGids,omitempty" platform:"linux,solaris"`
 	// Username is the user name.
@@ -108,7 +112,7 @@ type Mount struct {
 	// Destination is the absolute path where the mount will be placed in the container.
 	Destination string `json:"destination"`
 	// Type specifies the mount kind.
-	Type string `json:"type,omitempty" platform:"linux,solaris"`
+	Type string `json:"type,omitempty" platform:"linux,solaris,zos"`
 	// Source specifies the source path of the mount.
 	Source string `json:"source,omitempty"`
 	// Options are fstab style mount options.
@@ -123,13 +127,26 @@ type Hook struct {
 	Timeout *int     `json:"timeout,omitempty"`
 }
 
+// Hooks specifies a command that is run in the container at a particular event in the lifecycle of a container
 // Hooks for container setup and teardown
 type Hooks struct {
-	// Prestart is a list of hooks to be run before the container process is executed.
+	// Prestart is Deprecated. Prestart is a list of hooks to be run before the container process is executed.
+	// It is called in the Runtime Namespace
 	Prestart []Hook `json:"prestart,omitempty"`
+	// CreateRuntime is a list of hooks to be run after the container has been created but before pivot_root or any equivalent operation has been called
+	// It is called in the Runtime Namespace
+	CreateRuntime []Hook `json:"createRuntime,omitempty"`
+	// CreateContainer is a list of hooks to be run after the container has been created but before pivot_root or any equivalent operation has been called
+	// It is called in the Container Namespace
+	CreateContainer []Hook `json:"createContainer,omitempty"`
+	// StartContainer is a list of hooks to be run after the start operation is called but before the container process is started
+	// It is called in the Container Namespace
+	StartContainer []Hook `json:"startContainer,omitempty"`
 	// Poststart is a list of hooks to be run after the container process is started.
+	// It is called in the Runtime Namespace
 	Poststart []Hook `json:"poststart,omitempty"`
 	// Poststop is a list of hooks to be run after the container process exits.
+	// It is called in the Runtime Namespace
 	Poststop []Hook `json:"poststop,omitempty"`
 }
 
@@ -163,8 +180,10 @@ type Linux struct {
 	// MountLabel specifies the selinux context for the mounts in the container.
 	MountLabel string `json:"mountLabel,omitempty"`
 	// IntelRdt contains Intel Resource Director Technology (RDT) information for
-	// handling resource constraints (e.g., L3 cache, memory bandwidth) for the container
+	// handling resource constraints and monitoring metrics (e.g., L3 cache, memory bandwidth) for the container
 	IntelRdt *LinuxIntelRdt `json:"intelRdt,omitempty"`
+	// Personality contains configuration for the Linux personality syscall
+	Personality *LinuxPersonality `json:"personality,omitempty"`
 }
 
 // LinuxNamespace is the configuration for a Linux namespace
@@ -183,17 +202,17 @@ const (
 	// PIDNamespace for isolating process IDs
 	PIDNamespace LinuxNamespaceType = "pid"
 	// NetworkNamespace for isolating network devices, stacks, ports, etc
-	NetworkNamespace = "network"
+	NetworkNamespace LinuxNamespaceType = "network"
 	// MountNamespace for isolating mount points
-	MountNamespace = "mount"
+	MountNamespace LinuxNamespaceType = "mount"
 	// IPCNamespace for isolating System V IPC, POSIX message queues
-	IPCNamespace = "ipc"
+	IPCNamespace LinuxNamespaceType = "ipc"
 	// UTSNamespace for isolating hostname and NIS domain name
-	UTSNamespace = "uts"
+	UTSNamespace LinuxNamespaceType = "uts"
 	// UserNamespace for isolating user and group IDs
-	UserNamespace = "user"
+	UserNamespace LinuxNamespaceType = "user"
 	// CgroupNamespace for isolating cgroup hierarchies
-	CgroupNamespace = "cgroup"
+	CgroupNamespace LinuxNamespaceType = "cgroup"
 )
 
 // LinuxIDMapping specifies UID/GID mappings
@@ -219,6 +238,7 @@ type POSIXRlimit struct {
 // LinuxHugepageLimit structure corresponds to limiting kernel hugepages
 type LinuxHugepageLimit struct {
 	// Pagesize is the hugepage size
+	// Format: "<size><unit-prefix>B' (e.g. 64KB, 2MB, 1GB, etc.)
 	Pagesize string `json:"pageSize"`
 	// Limit is the limit of "hugepagesize" hugetlb usage
 	Limit uint64 `json:"limit"`
@@ -290,6 +310,8 @@ type LinuxMemory struct {
 	Swappiness *uint64 `json:"swappiness,omitempty"`
 	// DisableOOMKiller disables the OOM killer for out of memory conditions
 	DisableOOMKiller *bool `json:"disableOOMKiller,omitempty"`
+	// Enables hierarchical memory accounting
+	UseHierarchy *bool `json:"useHierarchy,omitempty"`
 }
 
 // LinuxCPU for Linux cgroup 'cpu' resource management
@@ -334,7 +356,7 @@ type LinuxRdma struct {
 
 // LinuxResources has container runtime resource constraints
 type LinuxResources struct {
-	// Devices configures the device whitelist.
+	// Devices configures the device allowlist.
 	Devices []LinuxDeviceCgroup `json:"devices,omitempty"`
 	// Memory restriction configuration
 	Memory *LinuxMemory `json:"memory,omitempty"`
@@ -352,6 +374,8 @@ type LinuxResources struct {
 	// Limits are a set of key value pairs that define RDMA resource limits,
 	// where the key is device name and value is resource limits.
 	Rdma map[string]LinuxRdma `json:"rdma,omitempty"`
+	// Unified resources.
+	Unified map[string]string `json:"unified,omitempty"`
 }
 
 // LinuxDevice represents the mknod information for a Linux special device file
@@ -372,7 +396,8 @@ type LinuxDevice struct {
 	GID *uint32 `json:"gid,omitempty"`
 }
 
-// LinuxDeviceCgroup represents a device rule for the whitelist controller
+// LinuxDeviceCgroup represents a device rule for the devices specified to
+// the device controller
 type LinuxDeviceCgroup struct {
 	// Allow or deny
 	Allow bool `json:"allow"`
@@ -384,6 +409,28 @@ type LinuxDeviceCgroup struct {
 	Minor *int64 `json:"minor,omitempty"`
 	// Cgroup access permissions format, rwm.
 	Access string `json:"access,omitempty"`
+}
+
+// LinuxPersonalityDomain refers to a personality domain.
+type LinuxPersonalityDomain string
+
+// LinuxPersonalityFlag refers to an additional personality flag. None are currently defined.
+type LinuxPersonalityFlag string
+
+// Define domain and flags for Personality
+const (
+	// PerLinux is the standard Linux personality
+	PerLinux LinuxPersonalityDomain = "LINUX"
+	// PerLinux32 sets personality to 32 bit
+	PerLinux32 LinuxPersonalityDomain = "LINUX32"
+)
+
+// LinuxPersonality represents the Linux personality syscall input
+type LinuxPersonality struct {
+	// Domain for the personality
+	Domain LinuxPersonalityDomain `json:"domain"`
+	// Additional flags
+	Flags []LinuxPersonalityFlag `json:"flags,omitempty"`
 }
 
 // Solaris contains platform-specific configuration for Solaris application containers.
@@ -553,13 +600,20 @@ type VMImage struct {
 
 // LinuxSeccomp represents syscall restrictions
 type LinuxSeccomp struct {
-	DefaultAction LinuxSeccompAction `json:"defaultAction"`
-	Architectures []Arch             `json:"architectures,omitempty"`
-	Syscalls      []LinuxSyscall     `json:"syscalls,omitempty"`
+	DefaultAction    LinuxSeccompAction `json:"defaultAction"`
+	DefaultErrnoRet  *uint              `json:"defaultErrnoRet,omitempty"`
+	Architectures    []Arch             `json:"architectures,omitempty"`
+	Flags            []LinuxSeccompFlag `json:"flags,omitempty"`
+	ListenerPath     string             `json:"listenerPath,omitempty"`
+	ListenerMetadata string             `json:"listenerMetadata,omitempty"`
+	Syscalls         []LinuxSyscall     `json:"syscalls,omitempty"`
 }
 
 // Arch used for additional architectures
 type Arch string
+
+// LinuxSeccompFlag is a flag to pass to seccomp(2).
+type LinuxSeccompFlag string
 
 // Additional architectures permitted to be used for system calls
 // By default only the native architecture of the kernel is permitted
@@ -582,6 +636,7 @@ const (
 	ArchS390X       Arch = "SCMP_ARCH_S390X"
 	ArchPARISC      Arch = "SCMP_ARCH_PARISC"
 	ArchPARISC64    Arch = "SCMP_ARCH_PARISC64"
+	ArchRISCV64     Arch = "SCMP_ARCH_RISCV64"
 )
 
 // LinuxSeccompAction taken upon Seccomp rule match
@@ -589,11 +644,15 @@ type LinuxSeccompAction string
 
 // Define actions for Seccomp rules
 const (
-	ActKill  LinuxSeccompAction = "SCMP_ACT_KILL"
-	ActTrap  LinuxSeccompAction = "SCMP_ACT_TRAP"
-	ActErrno LinuxSeccompAction = "SCMP_ACT_ERRNO"
-	ActTrace LinuxSeccompAction = "SCMP_ACT_TRACE"
-	ActAllow LinuxSeccompAction = "SCMP_ACT_ALLOW"
+	ActKill        LinuxSeccompAction = "SCMP_ACT_KILL"
+	ActKillProcess LinuxSeccompAction = "SCMP_ACT_KILL_PROCESS"
+	ActKillThread  LinuxSeccompAction = "SCMP_ACT_KILL_THREAD"
+	ActTrap        LinuxSeccompAction = "SCMP_ACT_TRAP"
+	ActErrno       LinuxSeccompAction = "SCMP_ACT_ERRNO"
+	ActTrace       LinuxSeccompAction = "SCMP_ACT_TRACE"
+	ActAllow       LinuxSeccompAction = "SCMP_ACT_ALLOW"
+	ActLog         LinuxSeccompAction = "SCMP_ACT_LOG"
+	ActNotify      LinuxSeccompAction = "SCMP_ACT_NOTIFY"
 )
 
 // LinuxSeccompOperator used to match syscall arguments in Seccomp
@@ -620,13 +679,15 @@ type LinuxSeccompArg struct {
 
 // LinuxSyscall is used to match a syscall in Seccomp
 type LinuxSyscall struct {
-	Names  []string           `json:"names"`
-	Action LinuxSeccompAction `json:"action"`
-	Args   []LinuxSeccompArg  `json:"args,omitempty"`
+	Names    []string           `json:"names"`
+	Action   LinuxSeccompAction `json:"action"`
+	ErrnoRet *uint              `json:"errnoRet,omitempty"`
+	Args     []LinuxSeccompArg  `json:"args,omitempty"`
 }
 
-// LinuxIntelRdt has container runtime resource constraints for Intel RDT
-// CAT and MBA features which introduced in Linux 4.10 and 4.12 kernel
+// LinuxIntelRdt has container runtime resource constraints for Intel RDT CAT and MBA
+// features and flags enabling Intel RDT CMT and MBM features.
+// Intel RDT features are available in Linux 4.14 and newer kernel versions.
 type LinuxIntelRdt struct {
 	// The identity for RDT Class of Service
 	ClosID string `json:"closID,omitempty"`
@@ -639,4 +700,36 @@ type LinuxIntelRdt struct {
 	// The unit of memory bandwidth is specified in "percentages" by
 	// default, and in "MBps" if MBA Software Controller is enabled.
 	MemBwSchema string `json:"memBwSchema,omitempty"`
+
+	// EnableCMT is the flag to indicate if the Intel RDT CMT is enabled. CMT (Cache Monitoring Technology) supports monitoring of
+	// the last-level cache (LLC) occupancy for the container.
+	EnableCMT bool `json:"enableCMT,omitempty"`
+
+	// EnableMBM is the flag to indicate if the Intel RDT MBM is enabled. MBM (Memory Bandwidth Monitoring) supports monitoring of
+	// total and local memory bandwidth for the container.
+	EnableMBM bool `json:"enableMBM,omitempty"`
+}
+
+// ZOS contains platform-specific configuration for z/OS based containers.
+type ZOS struct {
+	// Devices are a list of device nodes that are created for the container
+	Devices []ZOSDevice `json:"devices,omitempty"`
+}
+
+// ZOSDevice represents the mknod information for a z/OS special device file
+type ZOSDevice struct {
+	// Path to the device.
+	Path string `json:"path"`
+	// Device type, block, char, etc.
+	Type string `json:"type"`
+	// Major is the device's major number.
+	Major int64 `json:"major"`
+	// Minor is the device's minor number.
+	Minor int64 `json:"minor"`
+	// FileMode permission bits for the device.
+	FileMode *os.FileMode `json:"fileMode,omitempty"`
+	// UID of the device.
+	UID *uint32 `json:"uid,omitempty"`
+	// Gid of the device.
+	GID *uint32 `json:"gid,omitempty"`
 }

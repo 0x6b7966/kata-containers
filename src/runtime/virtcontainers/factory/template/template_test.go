@@ -9,20 +9,21 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/mock"
 )
 
 const testDisabledAsNonRoot = "Test disabled as requires root privileges"
 
 func TestTemplateFactory(t *testing.T) {
-	if os.Geteuid() != 0 {
+	// template is broken on arm64, so, temporarily disable it on arm64
+	if runtime.GOARCH == "arm64" || os.Geteuid() != 0 {
 		t.Skip(testDisabledAsNonRoot)
 	}
 
@@ -30,8 +31,7 @@ func TestTemplateFactory(t *testing.T) {
 
 	templateWaitForAgent = 1 * time.Microsecond
 
-	testDir := fs.MockStorageRootPath()
-	defer fs.MockStorageDestroy()
+	testDir := t.TempDir()
 
 	hyperConfig := vc.HypervisorConfig{
 		KernelPath: testDir,
@@ -47,8 +47,13 @@ func TestTemplateFactory(t *testing.T) {
 
 	ctx := context.Background()
 
+	url, err := mock.GenerateKataMockHybridVSock()
+	assert.NoError(err)
+	defer mock.RemoveKataMockHybridVSock(url)
+	vc.MockHybridVSockPath = url
+
 	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
-	err = hybridVSockTTRPCMock.Start(fmt.Sprintf("mock://%s", vc.MockHybridVSockPath))
+	err = hybridVSockTTRPCMock.Start(url)
 	assert.NoError(err)
 	defer hybridVSockTTRPCMock.Stop()
 
@@ -63,7 +68,7 @@ func TestTemplateFactory(t *testing.T) {
 	vm, err := f.GetBaseVM(ctx, vmConfig)
 	assert.Nil(err)
 
-	err = vm.Stop()
+	err = vm.Stop(ctx)
 	assert.Nil(err)
 
 	// Fetch
@@ -93,13 +98,13 @@ func TestTemplateFactory(t *testing.T) {
 	vm, err = tt.GetBaseVM(ctx, vmConfig)
 	assert.Nil(err)
 
-	err = vm.Stop()
+	err = vm.Stop(ctx)
 	assert.Nil(err)
 
 	vm, err = f.GetBaseVM(ctx, vmConfig)
 	assert.Nil(err)
 
-	err = vm.Stop()
+	err = vm.Stop(ctx)
 	assert.Nil(err)
 
 	err = tt.createTemplateVM(ctx)
@@ -108,16 +113,31 @@ func TestTemplateFactory(t *testing.T) {
 	vm, err = tt.GetBaseVM(ctx, vmConfig)
 	assert.Nil(err)
 
-	err = vm.Stop()
+	err = vm.Stop(ctx)
 	assert.Nil(err)
 
 	vm, err = f.GetBaseVM(ctx, vmConfig)
 	assert.Nil(err)
 
-	err = vm.Stop()
+	err = vm.Stop(ctx)
 	assert.Nil(err)
 
-	// CloseFactory
+	// make tt.statePath is busy
+	os.Chdir(tt.statePath)
+
+	// CloseFactory, there is no need to call tt.CloseFactory(ctx)
 	f.CloseFactory(ctx)
-	tt.CloseFactory(ctx)
+
+	//umount may take more time. Check periodically if the mount exists
+	waitTime, delay := 20, 1*time.Second
+	for check := waitTime; check > 0; {
+		// expect tt.statePath not exist, if exist, it means this case failed.
+		_, err = os.Stat(tt.statePath)
+		if err != nil {
+			break
+		}
+		check -= 1
+		time.Sleep(delay)
+	}
+	assert.True(os.IsNotExist(err), fmt.Sprintf("mount still present after waiting %d seconds", waitTime))
 }

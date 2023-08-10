@@ -9,7 +9,6 @@ package persist
 import (
 	"fmt"
 
-	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
@@ -23,28 +22,13 @@ const (
 )
 
 var (
-	// NewStoreFeature is an experimental feature
-	NewStoreFeature = exp.Feature{
-		Name:        "newstore",
-		Description: "This is a new storage driver which reorganized disk data structures, it has to be an experimental feature since it breaks backward compatibility.",
-		ExpRelease:  "2.0",
-	}
 	expErr           error
 	supportedDrivers = map[string]initFunc{
 
 		RootFSName:     fs.Init,
 		RootlessFSName: fs.RootlessInit,
 	}
-	mockTesting = false
 )
-
-func init() {
-	expErr = exp.Register(NewStoreFeature)
-}
-
-func EnableMockTesting() {
-	mockTesting = true
-}
 
 // GetDriver returns new PersistDriver according to driver name
 func GetDriverByName(name string) (persistapi.PersistDriver, error) {
@@ -67,8 +51,9 @@ func GetDriver() (persistapi.PersistDriver, error) {
 		return nil, expErr
 	}
 
-	if mockTesting {
-		return fs.MockFSInit()
+	mock, err := fs.MockAutoInit()
+	if mock != nil || err != nil {
+		return mock, err
 	}
 
 	if rootless.IsRootless() {

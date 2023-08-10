@@ -6,20 +6,32 @@
 # List of available components
 COMPONENTS =
 
+COMPONENTS += libs
 COMPONENTS += agent
+COMPONENTS += dragonball
 COMPONENTS += runtime
-COMPONENTS += trace-forwarder
+COMPONENTS += runtime-rs
 
 # List of available tools
 TOOLS =
 
 TOOLS += agent-ctl
+TOOLS += kata-ctl
+TOOLS += log-parser
+TOOLS += log-parser-rs
+TOOLS += runk
+TOOLS += trace-forwarder
 
-STANDARD_TARGETS = build check clean install test
+STANDARD_TARGETS = build check clean install static-checks-build test vendor
+
+# Variables for the build-and-publish-kata-debug target
+KATA_DEBUG_REGISTRY ?= ""
+KATA_DEBUG_TAG ?= ""
+
+default: all
 
 include utils.mk
-
-all: build
+include ./tools/packaging/kata-deploy/local-build/Makefile
 
 # Create the rules
 $(eval $(call create_all_rules,$(COMPONENTS),$(TOOLS),$(STANDARD_TARGETS)))
@@ -29,4 +41,20 @@ $(eval $(call create_all_rules,$(COMPONENTS),$(TOOLS),$(STANDARD_TARGETS)))
 generate-protocols:
 	make -C src/agent generate-protocols
 
-.PHONY: all default
+# Some static checks rely on generated source files of components.
+static-checks: static-checks-build
+	bash ci/static-checks.sh
+
+docs-url-alive-check:
+	bash ci/docs-url-alive-check.sh
+
+build-and-publish-kata-debug:
+	bash tools/packaging/kata-debug/kata-debug-build-and-upload-payload.sh ${KATA_DEBUG_REGISTRY} ${KATA_DEBUG_TAG} 
+
+.PHONY: \
+	all \
+	kata-tarball \
+	install-tarball \
+	default \
+	static-checks \
+	docs-url-alive-check

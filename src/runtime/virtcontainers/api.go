@@ -9,16 +9,21 @@ import (
 	"context"
 	"runtime"
 
-	deviceApi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
-	deviceConfig "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
+	deviceApi "github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
+	deviceConfig "github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
+	resCtrl "github.com/kata-containers/kata-containers/src/runtime/pkg/resourcecontrol"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/compatoci"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/label"
-	otelTrace "go.opentelemetry.io/otel/trace"
 )
+
+// apiTracingTags defines tags for the trace span
+var apiTracingTags = map[string]string{
+	"source":    "runtime",
+	"package":   "virtcontainers",
+	"subsystem": "api",
+}
 
 func init() {
 	runtime.LockOSThread()
@@ -26,43 +31,30 @@ func init() {
 
 var virtLog = logrus.WithField("source", "virtcontainers")
 
-// trace creates a new tracing span based on the specified name and parent
-// context.
-func trace(parent context.Context, name string) (otelTrace.Span, context.Context) {
-	tracer := otel.Tracer("kata")
-	ctx, span := tracer.Start(parent, name)
-	span.SetAttributes([]label.KeyValue{
-		label.Key("source").String("virtcontainers"),
-		label.Key("component").String("virtcontainers"),
-		label.Key("subsystem").String("api")}...)
-
-	return span, ctx
-}
-
 // SetLogger sets the logger for virtcontainers package.
 func SetLogger(ctx context.Context, logger *logrus.Entry) {
 	fields := virtLog.Data
 	virtLog = logger.WithFields(fields)
-
+	SetHypervisorLogger(virtLog) // TODO: this will move to hypervisors pkg
 	deviceApi.SetLogger(virtLog)
 	compatoci.SetLogger(virtLog)
 	deviceConfig.SetLogger(virtLog)
-	cgroups.SetLogger(virtLog)
+	resCtrl.SetLogger(virtLog)
 }
 
 // CreateSandbox is the virtcontainers sandbox creation entry point.
 // CreateSandbox creates a sandbox and its containers. It does not start them.
-func CreateSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factory) (VCSandbox, error) {
-	span, ctx := trace(ctx, "CreateSandbox")
+func CreateSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factory, prestartHookFunc func(context.Context) error) (VCSandbox, error) {
+	span, ctx := katatrace.Trace(ctx, virtLog, "CreateSandbox", apiTracingTags)
 	defer span.End()
 
-	s, err := createSandboxFromConfig(ctx, sandboxConfig, factory)
+	s, err := createSandboxFromConfig(ctx, sandboxConfig, factory, prestartHookFunc)
 
 	return s, err
 }
 
-func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, factory Factory) (_ *Sandbox, err error) {
-	span, ctx := trace(ctx, "createSandboxFromConfig")
+func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, factory Factory, prestartHookFunc func(context.Context) error) (_ *Sandbox, err error) {
+	span, ctx := katatrace.Trace(ctx, virtLog, "createSandboxFromConfig", apiTracingTags)
 	defer span.End()
 
 	// Create the sandbox.
@@ -71,61 +63,50 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 		return nil, err
 	}
 
-	// cleanup sandbox resources in case of any failure
+	// Cleanup sandbox resources in case of any failure
 	defer func() {
 		if err != nil {
-			s.Delete()
+			s.Delete(ctx)
 		}
 	}()
 
 	// Create the sandbox network
-	if err = s.createNetwork(); err != nil {
+	if err = s.createNetwork(ctx); err != nil {
 		return nil, err
 	}
 
 	// network rollback
 	defer func() {
 		if err != nil {
-			s.removeNetwork()
+			s.removeNetwork(ctx)
 		}
 	}()
 
-	// Move runtime to sandbox cgroup so all process are created there.
-	if s.config.SandboxCgroupOnly {
-		if err := s.createCgroupManager(); err != nil {
-			return nil, err
-		}
-
-		if err := s.setupSandboxCgroup(); err != nil {
-			return nil, err
-		}
+	// Set the sandbox host cgroups.
+	if err := s.setupResourceController(); err != nil {
+		return nil, err
 	}
 
 	// Start the VM
-	if err = s.startVM(); err != nil {
+	if err = s.startVM(ctx, prestartHookFunc); err != nil {
 		return nil, err
 	}
 
 	// rollback to stop VM if error occurs
 	defer func() {
 		if err != nil {
-			s.stopVM()
+			s.stopVM(ctx)
 		}
 	}()
 
-	s.postCreatedNetwork()
+	s.postCreatedNetwork(ctx)
 
-	if err = s.getAndStoreGuestDetails(); err != nil {
+	if err = s.getAndStoreGuestDetails(ctx); err != nil {
 		return nil, err
 	}
 
 	// Create Containers
-	if err = s.createContainers(); err != nil {
-		return nil, err
-	}
-
-	// The sandbox is completely created now, we can store it.
-	if err = s.storeSandbox(); err != nil {
+	if err = s.createContainers(ctx); err != nil {
 		return nil, err
 	}
 
@@ -136,7 +117,7 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 // in the sandbox left, do stop the sandbox and delete it. Those serial operations will be done exclusively by
 // locking the sandbox.
 func CleanupContainer(ctx context.Context, sandboxID, containerID string, force bool) error {
-	span, ctx := trace(ctx, "CleanupContainer")
+	span, ctx := katatrace.Trace(ctx, virtLog, "CleanupContainer", apiTracingTags)
 	defer span.End()
 
 	if sandboxID == "" {
@@ -157,14 +138,14 @@ func CleanupContainer(ctx context.Context, sandboxID, containerID string, force 
 	if err != nil {
 		return err
 	}
-	defer s.Release()
+	defer s.Release(ctx)
 
-	_, err = s.StopContainer(containerID, force)
+	_, err = s.StopContainer(ctx, containerID, force)
 	if err != nil && !force {
 		return err
 	}
 
-	_, err = s.DeleteContainer(containerID)
+	_, err = s.DeleteContainer(ctx, containerID)
 	if err != nil && !force {
 		return err
 	}
@@ -173,11 +154,11 @@ func CleanupContainer(ctx context.Context, sandboxID, containerID string, force 
 		return nil
 	}
 
-	if err = s.Stop(force); err != nil && !force {
+	if err = s.Stop(ctx, force); err != nil && !force {
 		return err
 	}
 
-	if err = s.Delete(); err != nil {
+	if err = s.Delete(ctx); err != nil {
 		return err
 	}
 

@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Huawei Corporation
 // Copyright (c) 2019 Intel Corporation
 //
@@ -7,6 +9,7 @@
 package virtcontainers
 
 import (
+	"context"
 	"fmt"
 	"net"
 
@@ -14,21 +17,23 @@ import (
 	"github.com/vishvananda/netlink"
 
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
+
+var tuntapTrace = getNetworkTrace(TuntapEndpointType)
 
 // TuntapEndpoint represents just a tap endpoint
 type TuntapEndpoint struct {
-	NetPair            NetworkInterfacePair
-	TuntapInterface    TuntapInterface
-	EndpointProperties NetworkInfo
 	EndpointType       EndpointType
 	PCIPath            vcTypes.PciPath
+	TuntapInterface    TuntapInterface
+	EndpointProperties NetworkInfo
+	NetPair            NetworkInterfacePair
 	RxRateLimiter      bool
 	TxRateLimiter      bool
 }
 
-// Properties returns the properties of the tap interface.
+// Properties returns the properties of the tun/tap interface.
 func (endpoint *TuntapEndpoint) Properties() NetworkInfo {
 	return endpoint.EndpointProperties
 }
@@ -38,12 +43,12 @@ func (endpoint *TuntapEndpoint) Name() string {
 	return endpoint.TuntapInterface.Name
 }
 
-// HardwareAddr returns the mac address that is assigned to the tap interface
+// HardwareAddr returns the mac address that is assigned to the tun/tap interface
 func (endpoint *TuntapEndpoint) HardwareAddr() string {
 	return endpoint.TuntapInterface.TAPIface.HardAddr
 }
 
-// Type identifies the endpoint as a tap endpoint.
+// Type identifies the endpoint as a tun/tap endpoint.
 func (endpoint *TuntapEndpoint) Type() EndpointType {
 	return endpoint.EndpointType
 }
@@ -68,21 +73,28 @@ func (endpoint *TuntapEndpoint) SetProperties(properties NetworkInfo) {
 	endpoint.EndpointProperties = properties
 }
 
-// Attach for tap endpoint adds the tap interface to the hypervisor.
-func (endpoint *TuntapEndpoint) Attach(s *Sandbox) error {
+// Attach for tun/tap endpoint adds the tap interface to the hypervisor.
+func (endpoint *TuntapEndpoint) Attach(ctx context.Context, s *Sandbox) error {
+	span, ctx := tuntapTrace(ctx, "Attach", endpoint)
+	defer span.End()
+
 	h := s.hypervisor
-	if err := xConnectVMNetwork(endpoint, h); err != nil {
+	if err := xConnectVMNetwork(ctx, endpoint, h); err != nil {
 		networkLogger().WithError(err).Error("Error bridging virtual endpoint")
 		return err
 	}
-	return h.addDevice(endpoint, netDev)
+
+	return h.AddDevice(ctx, endpoint, NetDev)
 }
 
-// Detach for the tap endpoint tears down the tap
-func (endpoint *TuntapEndpoint) Detach(netNsCreated bool, netNsPath string) error {
+// Detach for the tun/tap endpoint tears down the tap
+func (endpoint *TuntapEndpoint) Detach(ctx context.Context, netNsCreated bool, netNsPath string) error {
 	if !netNsCreated && netNsPath != "" {
 		return nil
 	}
+
+	span, _ := tuntapTrace(ctx, "Detach", endpoint)
+	defer span.End()
 
 	networkLogger().WithField("endpoint-type", TuntapEndpointType).Info("Detaching endpoint")
 	return doNetNS(netNsPath, func(_ ns.NetNS) error {
@@ -90,32 +102,40 @@ func (endpoint *TuntapEndpoint) Detach(netNsCreated bool, netNsPath string) erro
 	})
 }
 
-// HotAttach for the tap endpoint uses hot plug device
-func (endpoint *TuntapEndpoint) HotAttach(h hypervisor) error {
-	networkLogger().Info("Hot attaching tap endpoint")
-	if err := tuntapNetwork(endpoint, h.hypervisorConfig().NumVCPUs, h.hypervisorConfig().DisableVhostNet); err != nil {
-		networkLogger().WithError(err).Error("Error bridging tap ep")
+// HotAttach for the tun/tap endpoint uses hot plug device
+func (endpoint *TuntapEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
+	networkLogger().Info("Hot attaching tun/tap endpoint")
+
+	span, ctx := tuntapTrace(ctx, "HotAttach", endpoint)
+	defer span.End()
+
+	if err := tuntapNetwork(endpoint, h.HypervisorConfig().NumVCPUs, h.HypervisorConfig().DisableVhostNet); err != nil {
+		networkLogger().WithError(err).Error("Error bridging tun/tap ep")
 		return err
 	}
 
-	if _, err := h.hotplugAddDevice(endpoint, netDev); err != nil {
-		networkLogger().WithError(err).Error("Error attach tap ep")
+	if _, err := h.HotplugAddDevice(ctx, endpoint, NetDev); err != nil {
+		networkLogger().WithError(err).Error("Error attach tun/tap ep")
 		return err
 	}
 	return nil
 }
 
-// HotDetach for the tap endpoint uses hot pull device
-func (endpoint *TuntapEndpoint) HotDetach(h hypervisor, netNsCreated bool, netNsPath string) error {
-	networkLogger().Info("Hot detaching tap endpoint")
+// HotDetach for the tun/tap endpoint uses hot pull device
+func (endpoint *TuntapEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
+	networkLogger().Info("Hot detaching tun/tap endpoint")
+
+	span, ctx := tuntapTrace(ctx, "HotDetach", endpoint)
+	defer span.End()
+
 	if err := doNetNS(netNsPath, func(_ ns.NetNS) error {
 		return unTuntapNetwork(endpoint.TuntapInterface.TAPIface.Name)
 	}); err != nil {
-		networkLogger().WithError(err).Warn("Error un-bridging tap ep")
+		networkLogger().WithError(err).Warn("Error un-bridging tun/tap ep")
 	}
 
-	if _, err := h.hotplugRemoveDevice(endpoint, netDev); err != nil {
-		networkLogger().WithError(err).Error("Error detach tap ep")
+	if _, err := h.HotplugRemoveDevice(ctx, endpoint, NetDev); err != nil {
+		networkLogger().WithError(err).Error("Error detach tun/tap ep")
 		return err
 	}
 	return nil
@@ -155,7 +175,7 @@ func tuntapNetwork(endpoint *TuntapEndpoint, numCPUs uint32, disableVhostNet boo
 	if err != nil {
 		return err
 	}
-	defer netHandle.Delete()
+	defer netHandle.Close()
 
 	tapLink, _, err := createLink(netHandle, endpoint.TuntapInterface.TAPIface.Name, &netlink.Tuntap{}, int(numCPUs))
 	if err != nil {
@@ -183,7 +203,7 @@ func unTuntapNetwork(name string) error {
 	if err != nil {
 		return err
 	}
-	defer netHandle.Delete()
+	defer netHandle.Close()
 	tapLink, err := getLinkByName(netHandle, name, &netlink.Tuntap{})
 	if err != nil {
 		return fmt.Errorf("Could not get TAP interface: %s", err)

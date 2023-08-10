@@ -21,17 +21,26 @@ const (
 	FAMILY_ALL  = unix.AF_UNSPEC
 	FAMILY_V4   = unix.AF_INET
 	FAMILY_V6   = unix.AF_INET6
-	FAMILY_MPLS = AF_MPLS
+	FAMILY_MPLS = unix.AF_MPLS
 	// Arbitrary set value (greater than default 4k) to allow receiving
 	// from kernel more verbose messages e.g. for statistics,
 	// tc rules or filters, or other more memory requiring data.
 	RECEIVE_BUFFER_SIZE = 65536
+	// Kernel netlink pid
+	PidKernel     uint32 = 0
+	SizeofCnMsgOp        = 0x18
 )
 
 // SupportedNlFamilies contains the list of netlink families this netlink package supports
 var SupportedNlFamilies = []int{unix.NETLINK_ROUTE, unix.NETLINK_XFRM, unix.NETLINK_NETFILTER}
 
 var nextSeqNr uint32
+
+// Default netlink socket timeout, 60s
+var SocketTimeoutTv = unix.Timeval{Sec: 60, Usec: 0}
+
+// ErrorMessageReporting is the default error message reporting configuration for the new netlink sockets
+var EnableErrorMessageReporting bool = false
 
 // GetIPFamily returns the family type of a net.IP.
 func GetIPFamily(ip net.IP) int {
@@ -75,9 +84,67 @@ func Swap32(i uint32) uint32 {
 	return (i&0xff000000)>>24 | (i&0xff0000)>>8 | (i&0xff00)<<8 | (i&0xff)<<24
 }
 
+const (
+	NLMSGERR_ATTR_UNUSED = 0
+	NLMSGERR_ATTR_MSG    = 1
+	NLMSGERR_ATTR_OFFS   = 2
+	NLMSGERR_ATTR_COOKIE = 3
+	NLMSGERR_ATTR_POLICY = 4
+)
+
 type NetlinkRequestData interface {
 	Len() int
 	Serialize() []byte
+}
+
+const (
+	PROC_CN_MCAST_LISTEN = 1
+	PROC_CN_MCAST_IGNORE
+)
+
+type CbID struct {
+	Idx uint32
+	Val uint32
+}
+
+type CnMsg struct {
+	ID     CbID
+	Seq    uint32
+	Ack    uint32
+	Length uint16
+	Flags  uint16
+}
+
+type CnMsgOp struct {
+	CnMsg
+	// here we differ from the C header
+	Op uint32
+}
+
+func NewCnMsg(idx, val, op uint32) *CnMsgOp {
+	var cm CnMsgOp
+
+	cm.ID.Idx = idx
+	cm.ID.Val = val
+
+	cm.Ack = 0
+	cm.Seq = 1
+	cm.Length = uint16(binary.Size(op))
+	cm.Op = op
+
+	return &cm
+}
+
+func (msg *CnMsgOp) Serialize() []byte {
+	return (*(*[SizeofCnMsgOp]byte)(unsafe.Pointer(msg)))[:]
+}
+
+func DeserializeCnMsgOp(b []byte) *CnMsgOp {
+	return (*CnMsgOp)(unsafe.Pointer(&b[0:SizeofCnMsgOp][0]))
+}
+
+func (msg *CnMsgOp) Len() int {
+	return SizeofCnMsgOp
 }
 
 // IfInfomsg is related to links, but it is used for list requests as well
@@ -247,6 +314,12 @@ func (msg *IfInfomsg) EncapType() string {
 	return fmt.Sprintf("unknown%d", msg.Type)
 }
 
+// Round the length of a netlink message up to align it properly.
+// Taken from syscall/netlink_linux.go by The Go Authors under BSD-style license.
+func nlmAlignOf(msglen int) int {
+	return (msglen + syscall.NLMSG_ALIGNTO - 1) & ^(syscall.NLMSG_ALIGNTO - 1)
+}
+
 func rtaAlignOf(attrlen int) int {
 	return (attrlen + unix.RTA_ALIGNTO - 1) & ^(unix.RTA_ALIGNTO - 1)
 }
@@ -255,6 +328,29 @@ func NewIfInfomsgChild(parent *RtAttr, family int) *IfInfomsg {
 	msg := NewIfInfomsg(family)
 	parent.children = append(parent.children, msg)
 	return msg
+}
+
+type Uint32Attribute struct {
+	Type  uint16
+	Value uint32
+}
+
+func (a *Uint32Attribute) Serialize() []byte {
+	native := NativeEndian()
+	buf := make([]byte, rtaAlignOf(8))
+	native.PutUint16(buf[0:2], 8)
+	native.PutUint16(buf[2:4], a.Type)
+
+	if a.Type&NLA_F_NET_BYTEORDER != 0 {
+		binary.BigEndian.PutUint32(buf[4:], a.Value)
+	} else {
+		native.PutUint32(buf[4:], a.Value)
+	}
+	return buf
+}
+
+func (a *Uint32Attribute) Len() int {
+	return 8
 }
 
 // Extend RtAttr to handle data and children
@@ -401,6 +497,19 @@ func (req *NetlinkRequest) Execute(sockType int, resType uint16) ([][]byte, erro
 		if err != nil {
 			return nil, err
 		}
+
+		if err := s.SetSendTimeout(&SocketTimeoutTv); err != nil {
+			return nil, err
+		}
+		if err := s.SetReceiveTimeout(&SocketTimeoutTv); err != nil {
+			return nil, err
+		}
+		if EnableErrorMessageReporting {
+			if err := s.SetExtAck(true); err != nil {
+				return nil, err
+			}
+		}
+
 		defer s.Close()
 	} else {
 		s.Lock()
@@ -420,9 +529,12 @@ func (req *NetlinkRequest) Execute(sockType int, resType uint16) ([][]byte, erro
 
 done:
 	for {
-		msgs, err := s.Receive()
+		msgs, from, err := s.Receive()
 		if err != nil {
 			return nil, err
+		}
+		if from.Pid != PidKernel {
+			return nil, fmt.Errorf("Wrong sender portid %d, expected %d", from.Pid, PidKernel)
 		}
 		for _, m := range msgs {
 			if m.Header.Seq != req.Seq {
@@ -432,18 +544,41 @@ done:
 				return nil, fmt.Errorf("Wrong Seq nr %d, expected %d", m.Header.Seq, req.Seq)
 			}
 			if m.Header.Pid != pid {
-				return nil, fmt.Errorf("Wrong pid %d, expected %d", m.Header.Pid, pid)
+				continue
 			}
-			if m.Header.Type == unix.NLMSG_DONE {
-				break done
-			}
-			if m.Header.Type == unix.NLMSG_ERROR {
+			if m.Header.Type == unix.NLMSG_DONE || m.Header.Type == unix.NLMSG_ERROR {
 				native := NativeEndian()
-				error := int32(native.Uint32(m.Data[0:4]))
-				if error == 0 {
+				errno := int32(native.Uint32(m.Data[0:4]))
+				if errno == 0 {
 					break done
 				}
-				return nil, syscall.Errno(-error)
+				var err error
+				err = syscall.Errno(-errno)
+
+				unreadData := m.Data[4:]
+				if m.Header.Flags|unix.NLM_F_ACK_TLVS != 0 && len(unreadData) > syscall.SizeofNlMsghdr {
+					// Skip the echoed request message.
+					echoReqH := (*syscall.NlMsghdr)(unsafe.Pointer(&unreadData[0]))
+					unreadData = unreadData[nlmAlignOf(int(echoReqH.Len)):]
+
+					// Annotate `err` using nlmsgerr attributes.
+					for len(unreadData) >= syscall.SizeofRtAttr {
+						attr := (*syscall.RtAttr)(unsafe.Pointer(&unreadData[0]))
+						attrData := unreadData[syscall.SizeofRtAttr:attr.Len]
+
+						switch attr.Type {
+						case NLMSGERR_ATTR_MSG:
+							err = fmt.Errorf("%w: %s", err, string(attrData))
+
+						default:
+							// TODO: handle other NLMSGERR_ATTR types
+						}
+
+						unreadData = unreadData[rtaAlignOf(int(attr.Len)):]
+					}
+				}
+
+				return nil, err
 			}
 			if resType != 0 && m.Header.Type != resType {
 				continue
@@ -617,22 +752,31 @@ func (s *NetlinkSocket) Send(request *NetlinkRequest) error {
 	return nil
 }
 
-func (s *NetlinkSocket) Receive() ([]syscall.NetlinkMessage, error) {
+func (s *NetlinkSocket) Receive() ([]syscall.NetlinkMessage, *unix.SockaddrNetlink, error) {
 	fd := int(atomic.LoadInt32(&s.fd))
 	if fd < 0 {
-		return nil, fmt.Errorf("Receive called on a closed socket")
+		return nil, nil, fmt.Errorf("Receive called on a closed socket")
 	}
+	var fromAddr *unix.SockaddrNetlink
 	var rb [RECEIVE_BUFFER_SIZE]byte
-	nr, _, err := unix.Recvfrom(fd, rb[:], 0)
+	nr, from, err := unix.Recvfrom(fd, rb[:], 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	fromAddr, ok := from.(*unix.SockaddrNetlink)
+	if !ok {
+		return nil, nil, fmt.Errorf("Error converting to netlink sockaddr")
 	}
 	if nr < unix.NLMSG_HDRLEN {
-		return nil, fmt.Errorf("Got short response from netlink")
+		return nil, nil, fmt.Errorf("Got short response from netlink")
 	}
 	rb2 := make([]byte, nr)
 	copy(rb2, rb[:nr])
-	return syscall.ParseNetlinkMessage(rb2)
+	nl, err := syscall.ParseNetlinkMessage(rb2)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nl, fromAddr, nil
 }
 
 // SetSendTimeout allows to set a send timeout on the socket
@@ -647,6 +791,16 @@ func (s *NetlinkSocket) SetReceiveTimeout(timeout *unix.Timeval) error {
 	// Set a read timeout of SOCKET_READ_TIMEOUT, this will allow the Read to periodically unblock and avoid that a routine
 	// remains stuck on a recvmsg on a closed fd
 	return unix.SetsockoptTimeval(int(s.fd), unix.SOL_SOCKET, unix.SO_RCVTIMEO, timeout)
+}
+
+// SetExtAck requests error messages to be reported on the socket
+func (s *NetlinkSocket) SetExtAck(enable bool) error {
+	var enableN int
+	if enable {
+		enableN = 1
+	}
+
+	return unix.SetsockoptInt(int(s.fd), unix.SOL_NETLINK, unix.NETLINK_EXT_ACK, enableN)
 }
 
 func (s *NetlinkSocket) GetPid() (uint32, error) {

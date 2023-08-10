@@ -75,7 +75,7 @@ assets:
       url: "https://github.com/cloud-hypervisor/cloud-hypervisor"
       uscan-url: >-
         https://github.com/cloud-hypervisor/cloud-hypervisor/tags.*/v?(\d\S+)\.tar\.gz
-      version: "v0.12.0"
+      version: "v33.0"
 
     firecracker:
       description: "Firecracker micro-VMM"
@@ -83,13 +83,13 @@ assets:
       uscan-url: >-
         https://github.com/firecracker-microvm/firecracker/tags
         .*/v?(\d\S+)\.tar\.gz
-      version: "v0.21.1"
+      version: "v1.3.3"
 
     qemu:
       description: "VMM that uses KVM"
       url: "https://github.com/qemu/qemu"
-      version: "5.2.0"
-      tag: "v5.2.0"
+      version: "v7.2.0"
+      tag: "v7.2.0"
       # Do not include any non-full release versions
       # Break the line *without CR or space being appended*, to appease
       # yamllint, and note the deliberate ' ' at the end of the expression.
@@ -98,17 +98,22 @@ assets:
       uscan-url: >-
         https://github.com/qemu/qemu/tags
         .*/v?(\d\S+)\.tar\.gz
-      architecture:
-        aarch64:
-          version: "5.1.0"
-          branch: "master"
-          tag: "v5.1.0"
-          commit: "d0ed6a69d399ae193959225cdeaa9382746c91cc"
 
     qemu-experimental:
       description: "QEMU with virtiofs support"
-      url: "https://gitlab.com/virtio-fs/qemu.git"
-      tag: "qemu5.0-virtiofs-with51bits-dax"
+      url: "https://github.com/qemu/qemu"
+      version: "7a800cf9496fddddf71b21a00991e0ec757a170a"
+
+    qemu-tdx-experimental:
+      # yamllint disable-line rule:line-length
+      description: "QEMU with TDX support - based on https://github.com/intel/tdx-tools/releases/tag/2023ww01"
+      url: "https://github.com/kata-containers/qemu"
+      tag: "ad4c7f529a279685da84297773b4ec8080153c2d-plus-TDX-v1.3"
+
+    qemu-snp-experimental:
+      description: "QEMU with experimental SNP support (no UPM)"
+      url: "https://github.com/AMDESE/qemu"
+      tag: "3b6a2b6b7466f6dea53243900b7516c3f29027b7"
 
   image:
     description: |
@@ -117,17 +122,20 @@ assets:
     url: "https://github.com/kata-containers/kata-containers/tools/osbuilder"
     architecture:
       aarch64:
-        name: "ubuntu"
-        version: "latest"
+        name: &default-image-name "ubuntu"
+        version: &default-image-version "latest"
       ppc64le:
-        name: "centos"
-        version: "latest"
+        name: *default-image-name
+        version: *default-image-version
       s390x:
-        name: "ubuntu"
-        version: "latest"
+        name: *default-image-name
+        version: *default-image-version
       x86_64:
-        name: &default-image-name "clearlinux"
-        version: "latest"
+        name: *default-image-name
+        version: *default-image-version
+        tdx:
+          name: *default-image-name
+          version: *default-image-version
     meta:
       image-type: *default-image-name
 
@@ -139,28 +147,53 @@ assets:
     architecture:
       aarch64:
         name: &default-initrd-name "alpine"
-        version: &default-initrd-version "3.12"
+        version: &default-initrd-version "3.15"
+      # Do not use Alpine on ppc64le & s390x, the agent cannot use musl because
+      # there is no such Rust target
       ppc64le:
-        name: *default-initrd-name
-        version: *default-initrd-version
+        name: &glibc-initrd-name "ubuntu"
+        version: &glibc-initrd-version "20.04"
       s390x:
-        name: *default-initrd-name
-        version: *default-initrd-version
+        name: *glibc-initrd-name
+        version: *glibc-initrd-version
       x86_64:
         name: *default-initrd-name
         version: *default-initrd-version
+        mariner:
+          name: "cbl-mariner"
+          version: "2.0"
+        sev:
+          name: *glibc-initrd-name
+          version: *glibc-initrd-version
 
   kernel:
     description: "Linux kernel optimised for virtual machines"
-    url: "https://cdn.kernel.org/pub/linux/kernel/v4.x/"
-    uscan-url: >-
-      https://mirrors.edge.kernel.org/pub/linux/kernel/v5.x/linux-(5\.4\..+)\.tar\.gz
-    version: "v5.4.71"
+    url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
+    version: "v6.1.38"
+    sev:
+      description: "Linux kernel that supports SEV and SNP"
+      url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
+      version: "v5.19.2"
+    snp:
+      description: "Linux kernel that supports AMD SEV-SNP for VMs"
+      url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
+      version: "v5.19.2"
 
-  kernel-experimental:
-    description: "Linux kernel with virtio-fs support"
-    url: "https://gitlab.com/virtio-fs/linux.git"
-    tag: "kata-v5.6-april-09-2020"
+  kernel-arm-experimental:
+    description: "Linux kernel with cpu/mem hotplug support on arm64"
+    url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
+    version: "v5.15.7"
+
+  kernel-dragonball-experimental:
+    description: "Linux kernel with Dragonball VMM optimizations like upcall"
+    url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
+    version: "v5.10.25"
+
+  kernel-tdx-experimental:
+    # yamllint disable-line rule:line-length
+    description: "Linux kernel with TDX support -- based on https://github.com/intel/tdx-tools/releases/tag/2023ww01"
+    url: "https://github.com/kata-containers/linux/archive/refs/tags"
+    version: "5.19-TDX-v2.2"
 
 externals:
   description: "Third-party projects used by the system"
@@ -168,43 +201,53 @@ externals:
   cni-plugins:
     description: "CNI network plugins"
     url: "https://github.com/containernetworking/plugins"
-    commit: "485be65581341430f9106a194a98f0f2412245fb"
+    version: "v1.2.0"
 
   conmon:
     description: "An OCI container runtime monitor"
     url: "https://github.com/containers/conmon"
-    version: "v2.0.5"
+    version: "v2.0.10"
 
   crio:
     description: |
       OCI-based Kubernetes Container Runtime Interface implementation
     url: "https://github.com/cri-o/cri-o"
-    version: "v1.18.4-4-g6dee3891e"
-    meta:
-      openshift: "6273bea4c9ed788aeb3d051ebf2d030060c05b6c"
-      crictl: 1.0.0-beta.2
+    branch: "release-1.23"
 
-  cri-containerd:
+  containerd:
     description: |
-      Containerd Plugin for Kubernetes Container Runtime Interface.
-    url: "github.com/containerd/cri"
-    tarball_url: "https://storage.googleapis.com/cri-containerd-release"
-    # Next commit from 1.3 branch contains fix to be able to run
-    # tests using go 1.13
-    version: "v1.3.7"
+      Containerd for Kubernetes Container Runtime Interface.
+    url: "github.com/containerd/containerd"
+    tarball_url: "https://github.com/containerd/containerd/releases/download"
+    # containerd from v1.5.0 used the path unix socket
+    # instead of abstract socket, thus kata wouldn's support the containerd's
+    # version older than them.
+    version: "v1.6.8"
+    lts: "v1.6"
+    active: "v1.7"
 
   critools:
     description: "CLI tool for Container Runtime Interface (CRI)"
     url: "https://github.com/kubernetes-sigs/cri-tools"
-    version: "1.18.0"
+    version: "1.23.0"
+    # As we don't want to disrupt what we have on the `tests` repo, let's
+    # create a "latest" entry and use that for the GitHub actions tests.
+    latest: "v1.27"
 
-  docker:
-    description: "Moby project container manager"
-    notes: "Docker Swarm requires an older version of Docker."
-    url: "https://github.com/moby/moby"
-    version: "v18.06-ce"
-    meta:
-      swarm-version: "1.12.1"
+  cryptsetup:
+    description: "A utility used to setup disk encryption, integrity protection"
+    url: "https://gitlab.com/cryptsetup/cryptsetup"
+    version: "v2.5.0"
+
+  gperf:
+    description: "GNU gperf is a perfect hash function generator"
+    url: "http://ftp.gnu.org/pub/gnu/gperf/"
+    version: "3.1"
+
+  lvm2:
+    description: "LVM2 and device-mapper tools and libraries"
+    url: "https://github.com/lvmteam/lvm2"
+    version: "v2_03_16"
 
   kubernetes:
     description: "Kubernetes project container manager"
@@ -214,18 +257,12 @@ externals:
     uscan-url: >-
       https://github.com/kubernetes/kubernetes/tags
       .*/v?([\d\.]+)\.tar\.gz
-    version: "1.18.9-00"
+    version: "1.23.1-00"
 
-  openshift:
-    description: |
-      Distribution of Kubernetes optimized for continuous application
-      development and multi-tenant deployment.
-    url: "https://github.com/openshift/origin"
-    uscan-url: >-
-      https://github.com/openshift/origin/tags
-      .*/v?([\d\.]+)\.tar\.gz
-    version: "v3.10.0"
-    commit: "dd10d17"
+  libseccomp:
+    description: "High level interface to Linux seccomp filter"
+    url: "https://github.com/seccomp/libseccomp"
+    version: "2.5.4"
 
   runc:
     description: "OCI CLI reference runtime implementation"
@@ -235,20 +272,55 @@ externals:
     uscan-url: >-
       https://github.com/opencontainers/runc/tags
       .*/v?(\d\S+)\.tar\.gz
-    version: "v1.0.0-rc5"
+    version: "v1.1.4"
 
-  musl:
-    description: |
-      The musl library is used to build the rust agent.
-    url: "https://www.musl-libc.org/"
-    uscan-url: >-
-      https://www.musl-libc.org/releases/
-      musl-([\d\.]+)\.tar\.gz
-    version: "1.1.23"
+  nydus:
+    description: "Nydus image acceleration service"
+    url: "https://github.com/dragonflyoss/image-service"
+    version: "v2.2.1"
+
+  nydus-snapshotter:
+    description: "Snapshotter for Nydus image acceleration service"
+    url: "https://github.com/containerd/nydus-snapshotter"
+    version: "v0.3.3"
+
+  ovmf:
+    description: "Firmware, implementation of UEFI for virtual machines."
+    url: "https://github.com/tianocore/edk2"
+    x86_64:
+      description: "Vanilla firmware build"
+      version: "edk2-stable202202"
+      package: "OvmfPkg/OvmfPkgX64.dsc"
+      package_output_dir: "OvmfX64"
+    sev:
+      description: "AmdSev build needed for SEV measured direct boot."
+      version: "edk2-stable202302"
+      package: "OvmfPkg/AmdSev/AmdSevX64.dsc"
+      package_output_dir: "AmdSev"
+    tdx:
+      # yamllint disable-line rule:line-length
+      description: "QEMU with TDX support - based on https://github.com/intel/tdx-tools/releases/tag/2023ww01"
+      version: "edk2-stable202211"
+      package: "OvmfPkg/IntelTdx/IntelTdxX64.dsc"
+      package_output_dir: "IntelTdx"
+
+  td-shim:
+    description: "Confidential Containers Shim Firmware"
+    url: "https://github.com/confidential-containers/td-shim"
+    version: "cf9592ef70bd6ba4c7ab1330d278a743f5ba3133"
+    toolchain: "nightly-2022-05-15"
+
+  virtiofsd:
+    description: "vhost-user virtio-fs device backend written in Rust"
+    url: "https://gitlab.com/virtio-fs/virtiofsd"
+    version: "v1.6.1"
+    toolchain: "1.66.0"
     meta:
-      description: |
-        'newest-version' is the latest version known to work.
-      newest-version: "1.1.23"
+      # From https://gitlab.com/virtio-fs/virtiofsd/-/releases/v1.7.0,
+      # this is the link labelled virtiofsd-v1.7.0.zip
+      #
+      # yamllint disable-line rule:line-length
+      binary: "https://gitlab.com/virtio-fs/virtiofsd/uploads/dc56ecbf86ce1226bdc31f946cfded75/virtiofsd-v1.7.0.zip"
 
 languages:
   description: |
@@ -258,25 +330,32 @@ languages:
   golang:
     description: "Google's 'go' language"
     notes: "'version' is the default minimum version used by this project."
-    issue: "https://github.com/golang/go/issues/20676"
-    uscan-url: >-
-      https://github.com/golang/go/tags .*/go?([\d\.]+)\.tar\.gz
-    version: "1.11.10"
+    version: "1.19.3"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.14.4"
+      newest-version: "1.19.3"
 
   rust:
     description: "Rust language"
     notes: "'version' is the default minimum version used by this project."
-    version: "1.38.0"
+    version: "1.69.0"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.47.0"
+      newest-version: "1.69.0"
+
+  golangci-lint:
+    description: "golangci-lint"
+    notes: "'version' is the default minimum version used by this project."
+    version: "1.50.1"
+    meta:
+      description: |
+        'newest-version' is the latest version known to work when
+        building Kata
+      newest-version: "1.50.1"
 
 specs:
   description: "Details of important specifications"
@@ -287,7 +366,7 @@ specs:
     uscan-url: >-
       https://github.com/opencontainers/runtime-spec/tags
       .*/v?(\d\S+)\.tar\.gz
-    version: "v1.0.0-rc5"
+    version: "v1.0.2"
 
 plugins:
   description: |

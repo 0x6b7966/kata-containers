@@ -10,37 +10,39 @@ import (
 	"os"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/manager"
-	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/manager"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestSandboxRestore(t *testing.T) {
 	var err error
 	assert := assert.New(t)
 	sconfig := SandboxConfig{
-		ID:           "test-exp",
-		Experimental: []exp.Feature{persist.NewStoreFeature},
+		ID: "test-exp",
 	}
 	container := make(map[string]*Container)
 	container["test-exp"] = &Container{}
 
+	network, err := NewNetwork()
+	assert.NoError(err)
+
 	sandbox := Sandbox{
 		id:         "test-exp",
 		containers: container,
-		devManager: manager.NewDeviceManager(manager.VirtioSCSI, false, "", nil),
+		devManager: manager.NewDeviceManager(config.VirtioSCSI, false, "", 0, nil),
 		hypervisor: &mockHypervisor{},
+		network:    network,
 		ctx:        context.Background(),
 		config:     &sconfig,
 		state:      types.SandboxState{BlockIndexMap: make(map[int]struct{})},
 	}
 
-	sandbox.newStore, err = persist.GetDriver()
+	sandbox.store, err = persist.GetDriver()
 	assert.NoError(err)
-	assert.NotNil(sandbox.newStore)
+	assert.NotNil(sandbox.store)
 
 	// if we don't call Save(), we can get nothing from disk
 	err = sandbox.Restore()
@@ -57,7 +59,7 @@ func TestSandboxRestore(t *testing.T) {
 	assert.Equal(sandbox.state.GuestMemoryBlockSizeMB, uint32(0))
 	assert.Equal(len(sandbox.state.BlockIndexMap), 0)
 
-	// set state data and save again
+	// set state data and Save again
 	sandbox.state.State = types.StateString("running")
 	sandbox.state.GuestMemoryBlockSizeMB = uint32(1024)
 	sandbox.state.BlockIndexMap[2] = struct{}{}
@@ -67,7 +69,7 @@ func TestSandboxRestore(t *testing.T) {
 
 	// empty the sandbox
 	sandbox.state = types.SandboxState{}
-	if sandbox.newStore, err = persist.GetDriver(); err != nil || sandbox.newStore == nil {
+	if sandbox.store, err = persist.GetDriver(); err != nil || sandbox.store == nil {
 		t.Fatal("failed to get persist driver")
 	}
 

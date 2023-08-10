@@ -1,47 +1,36 @@
-# Kata Containers installation user guides
+# Kata Containers installation guides
 
-* [Kata Containers installation user guides](#kata-containers-installation-user-guides)
-    * [Prerequisites](#prerequisites)
-    * [Legacy installation](#legacy-installation)
-    * [Packaged installation methods](#packaged-installation-methods)
-        * [Official packages](#official-packages)
-        * [Snap Installation](#snap-installation)
-        * [Automatic Installation](#automatic-installation)
-        * [Manual Installation](#manual-installation)
-    * [Build from source installation](#build-from-source-installation)
-    * [Installing on a Cloud Service Platform](#installing-on-a-cloud-service-platform)
-    * [Further information](#further-information)
-
-The following is an overview of the different installation methods available. All of these methods equally result
-in a system configured to run Kata Containers.
+The following is an overview of the different installation methods available. 
 
 ## Prerequisites
 
-Kata Containers requires nested virtualization or bare metal.
-See the
-[hardware requirements](/src/runtime/README.md#hardware-requirements)
-to see if your system is capable of running Kata Containers.
-
-## Legacy installation
-
-If you wish to install a legacy 1.x version of Kata Containers, see
-[the Kata Containers 1.x installation documentation](https://github.com/kata-containers/documentation/tree/master/install/).
+Kata Containers requires nested virtualization or bare metal. Check 
+[hardware requirements](/src/runtime/README.md#hardware-requirements) to see if your system is capable of running Kata 
+Containers.
 
 ## Packaged installation methods
 
-> **Notes:**
->
-> - Packaged installation methods uses your distribution's native package format (such as RPM or DEB).
-> - You are strongly encouraged to choose an installation method that provides
->   automatic updates, to ensure you benefit from security updates and bug fixes.
+Packaged installation methods uses your distribution's native package format (such as RPM or DEB).
 
-| Installation method                                  | Description                                                         | Automatic updates | Use case                                                 |
-|------------------------------------------------------|---------------------------------------------------------------------|-------------------|----------------------------------------------------------|
-| [Using official distro packages](#official-packages) | Kata packages provided by Linux distributions official repositories | yes               | Recommended for most users.                              |
-| [Using snap](#snap-installation)                     | Easy to install                                                     | yes               | Good alternative to official distro packages.            |
-| [Automatic](#automatic-installation)                 | Run a single command to install a full system                       | **No!**           | For those wanting the latest release quickly.            |
-| [Manual](#manual-installation)                       | Follow a guide step-by-step to install a working system             | **No!**           | For those who want the latest release with more control. |
-| [Build from source](#build-from-source-installation) | Build the software components manually                              | **No!**           | Power users and developers only.                         |
+> **Note:** We encourage installation methods that provides automatic updates, it ensures security updates and bug fixes are
+> easily applied.
+
+| Installation method                                  | Description                                                                                  | Automatic updates | Use case                                                                                      |
+|------------------------------------------------------|----------------------------------------------------------------------------------------------|-------------------|-----------------------------------------------------------------------------------------------|
+| [Using kata-deploy](#kata-deploy-installation)       | The preferred way to deploy the Kata Containers distributed binaries on a Kubernetes cluster | **No!**           | Best way to give it a try on kata-containers on an already up and running Kubernetes cluster. | 
+| [Using official distro packages](#official-packages) | Kata packages provided by Linux distributions official repositories                          | yes               | Recommended for most users.                                                                   |
+| [Automatic](#automatic-installation)                 | Run a single command to install a full system                                                | **No!**           | For those wanting the latest release quickly.                                                 |
+| [Manual](#manual-installation)                       | Follow a guide step-by-step to install a working system                                      | **No!**           | For those who want the latest release with more control.                                      |
+| [Build from source](#build-from-source-installation) | Build the software components manually                                                       | **No!**           | Power users and developers only.                                                              |
+
+### Kata Deploy Installation
+
+Kata Deploy provides a Dockerfile, which contains all of the binaries and
+artifacts required to run Kata Containers, as well as reference DaemonSets,
+which can be utilized to install Kata Containers on a running Kubernetes
+cluster.
+
+[Use Kata Deploy](/tools/packaging/kata-deploy/README.md) to install Kata Containers on a Kubernetes Cluster.
 
 ### Official packages
 
@@ -50,22 +39,7 @@ Kata packages are provided by official distribution repositories for:
 | Distribution (link to installation guide)                | Minimum versions                                                               |
 |----------------------------------------------------------|--------------------------------------------------------------------------------|
 | [CentOS](centos-installation-guide.md)                   | 8                                                                              |
-| [Fedora](fedora-installation-guide.md)                   | 32, Rawhide                                                                    |
-| [openSUSE](opensuse-installation-guide.md)               | [Leap 15.1](opensuse-leap-15.1-installation-guide.md)<br>Leap 15.2, Tumbleweed |
-| [SUSE Linux Enterprise (SLE)](sle-installation-guide.md) | SLE 15 SP1, 15 SP2                                                             |
-
-> **Note::**
->
-> All users are encouraged to uses the official distribution versions of Kata
-> Containers unless they understand the implications of alternative methods.
-
-### Snap Installation
-
-> **Note:** The snap installation is available for all distributions which support `snapd`.
-
-[![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/kata-containers)
-
-[Use snap](snap-installation-guide.md) to install Kata Containers from https://snapcraft.io.
+| [Fedora](fedora-installation-guide.md)                   | 34                                                                             |
 
 ### Automatic Installation
 
@@ -77,11 +51,9 @@ Follow the [containerd installation guide](container-manager/containerd/containe
 
 ## Build from source installation
 
-> **Notes:**
->
-> - Power users who decide to build from sources should be aware of the
->   implications of using an unpackaged system which will not be automatically
->   updated as new [releases](../Stable-Branch-Strategy.md) are made available.
+> **Note:** Power users who decide to build from sources should be aware of the
+> implications of using an unpackaged system which will not be automatically
+> updated as new [releases](../Stable-Branch-Strategy.md) are made available.
 
 [Building from sources](../Developer-Guide.md#initial-setup)  allows power users
 who are comfortable building software from source to use the latest component
@@ -97,6 +69,9 @@ versions. This is not recommended for normal users.
 
 ## Further information
 
-* The [upgrading document](../Upgrading.md).
-* The [developer guide](../Developer-Guide.md).
-* The [runtime documentation](../../src/runtime/README.md).
+* [upgrading document](../Upgrading.md)
+* [developer guide](../Developer-Guide.md)
+* [runtime documentation](../../src/runtime/README.md)
+
+## Kata Containers 3.0 rust runtime installation
+* [installation guide](../install/kata-containers-3.0-rust-runtime-installation-guide.md)

@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -6,14 +8,15 @@
 package virtcontainers
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"os"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 )
 
 // Long term, this should be made more configurable.  For now matching path
@@ -21,6 +24,8 @@ import (
 // github.com/clearcontainers/ovsdpdk.  The plugins create the socket on the host system
 // using this path.
 const hostSocketSearchPath = "/tmp/vhostuser_%s/vhu.sock"
+
+var vhostuserTrace = getNetworkTrace(VhostUserEndpointType)
 
 // VhostUserEndpoint represents a vhost-user socket based network interface
 type VhostUserEndpoint struct {
@@ -75,7 +80,10 @@ func (endpoint *VhostUserEndpoint) NetworkPair() *NetworkInterfacePair {
 }
 
 // Attach for vhostuser endpoint
-func (endpoint *VhostUserEndpoint) Attach(s *Sandbox) error {
+func (endpoint *VhostUserEndpoint) Attach(ctx context.Context, s *Sandbox) error {
+	span, ctx := vhostuserTrace(ctx, "Attach", endpoint)
+	defer span.End()
+
 	// Generate a unique ID to be used for hypervisor commandline fields
 	randBytes, err := utils.GenerateRandomBytes(8)
 	if err != nil {
@@ -90,21 +98,21 @@ func (endpoint *VhostUserEndpoint) Attach(s *Sandbox) error {
 		Type:       config.VhostUserNet,
 	}
 
-	return s.hypervisor.addDevice(d, vhostuserDev)
+	return s.hypervisor.AddDevice(ctx, d, VhostuserDev)
 }
 
 // Detach for vhostuser endpoint
-func (endpoint *VhostUserEndpoint) Detach(netNsCreated bool, netNsPath string) error {
+func (endpoint *VhostUserEndpoint) Detach(ctx context.Context, netNsCreated bool, netNsPath string) error {
 	return nil
 }
 
 // HotAttach for vhostuser endpoint not supported yet
-func (endpoint *VhostUserEndpoint) HotAttach(h hypervisor) error {
+func (endpoint *VhostUserEndpoint) HotAttach(ctx context.Context, h Hypervisor) error {
 	return fmt.Errorf("VhostUserEndpoint does not support Hot attach")
 }
 
 // HotDetach for vhostuser endpoint not supported yet
-func (endpoint *VhostUserEndpoint) HotDetach(h hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *VhostUserEndpoint) HotDetach(ctx context.Context, h Hypervisor, netNsCreated bool, netNsPath string) error {
 	return fmt.Errorf("VhostUserEndpoint does not support Hot detach")
 }
 
@@ -127,7 +135,7 @@ func findVhostUserNetSocketPath(netInfo NetworkInfo) (string, error) {
 		return "", nil
 	}
 
-	// check for socket file existence at known location.
+	// Check for socket file existence at known location.
 	for _, addr := range netInfo.Addrs {
 		socketPath := fmt.Sprintf(hostSocketSearchPath, addr.IPNet.IP)
 		if _, err := os.Stat(socketPath); err == nil {
@@ -140,7 +148,8 @@ func findVhostUserNetSocketPath(netInfo NetworkInfo) (string, error) {
 
 // vhostUserSocketPath returns the path of the socket discovered.  This discovery
 // will vary depending on the type of vhost-user socket.
-//  Today only VhostUserNetDevice is supported.
+//
+//	Today only VhostUserNetDevice is supported.
 func vhostUserSocketPath(info interface{}) (string, error) {
 
 	switch v := info.(type) {
